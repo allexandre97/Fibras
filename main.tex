@@ -1,0 +1,102 @@
+\documentclass[11pt, a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{bm}
+
+\title{\textbf{Mathematical Framework for the Analysis of Discrete and Sparse Fiber Networks}}
+\author{Pipeline Documentation}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document details the mathematical and algorithmic pipeline utilized for the extraction, topological representation, and geometric analysis of sparse continuous fiber networks rasterized onto discrete multidimensional grids. The methodology addresses critical failure modes inherent to spatial discretization, including sub-voxel fragmentation, threshold starvation in highly skewed spatial distributions, and gradient dilution in macroscopic tensor integration.
+\end{abstract}
+
+\section{Topological Extraction: Scalar Field to Medial Axis}
+The initial phase of the pipeline translates a continuous scalar density field (the rasterized volume) into a contiguous 1D mathematical medial axis (the skeleton).
+
+\subsection{Laplacian Ridge Sharpening}
+Continuous fiber geometries rasterized using multi-variate Gaussian functions inherently possess overlapping probability tails. When thick or adjacent fibers are subjected to global thresholding, their additive tails fuse, creating false topological connections.
+
+To isolate the structural centerlines, the pipeline employs a Laplacian of Gaussian (LoG) pre-filter:
+\begin{equation}
+    I_{\text{sharp}}(\bm{x}) = \max\left( I(\bm{x}) - \nabla^2 \left[ I(\bm{x}) * G_{\sigma_{\text{ridge}}} \right], 0 \right)
+\end{equation}
+The Laplacian acts as a mathematical ridge detector. It produces strong negative responses at the peaks of the density field and near-zero responses in the diffuse overlapping tails. By subtracting the Laplacian, the signal of the medial core is amplified while spatial bloat is suppressed, rendering the subsequent topology invariant to the physical thickness of the input structures.
+
+\subsection{Hysteresis Thresholding in Extreme Sparsity}
+Global thresholding (e.g., standard Otsu's method) fails in large grids (e.g., $256^3$) where fiber bodies occupy $< 0.1\%$ of the spatial volume. The massive zero-peak of the background forces variance-maximizing algorithms to set overly aggressive thresholds, which severs faint density bridges at network junctions and shatters the topology.
+
+To guarantee continuity, the pipeline utilizes dual-threshold hysteresis:
+\begin{enumerate}
+    \item \textbf{High Threshold ($T_{\text{high}}$):} Otsu's method is applied to non-zero voxels to firmly identify the dense, confident tubular cores of the network.
+    \item \textbf{Low Threshold ($T_{\text{low}}$):} Li's Minimum Cross-Entropy threshold is utilized. Li's method minimizes the Kullback-Leibler divergence between the original and thresholded histograms, making it mathematically stable for highly skewed, long-tail distributions. It captures the faintest structural bridges.
+\end{enumerate}
+Hysteresis retains a voxel exceeding $T_{\text{low}}$ \textit{if and only if} it physically connects to a voxel exceeding $T_{\text{high}}$. This perfectly traces continuous paths through sharp corners and bifurcations without incorporating background noise.
+
+\subsection{Morphological Closing and Skeletonization}
+To fuse any remaining diagonal 1-voxel micro-fractures at complex spatial crossings, a morphological binary closing operation (dilation followed by erosion) is applied. Finally, a 3D thinning algorithm reduces the binary mask to its 1D medial axis, resulting in the topological skeleton.
+
+\section{Graph Theory: Spatial Network Assembly}
+The discrete voxel skeleton is abstracted into a fully connected graph $\mathcal{G} = (V, E)$ using a $k$-d tree for spatial queries.
+
+\subsection{Dynamic $N$-Dimensional Adjacency}
+A fundamental constraint of 3D grids is that fully 26-connected diagonal voxels exist at a Euclidean distance of $\sqrt{3} \approx 1.732$, while 2D diagonals exist at $\sqrt{2} \approx 1.414$. Hardcoded search radii artificially sever these connections. The pipeline computes a dynamic adjacency radius $r$ based on the spatial dimensionality $N$:
+\begin{equation}
+    r = \sqrt{N} + 0.05
+\end{equation}
+Edges are assigned between all node pairs $u, v \in V$ satisfying $\| \bm{x}_u - \bm{x}_v \|_2 \le r$.
+
+\subsection{Junction Classification via Valency}
+Biological branching is decoupled from physical entanglement through strict nodal degree (valency) analysis:
+\begin{itemize}
+    \item $\text{Degree} = 1$: Terminal endpoints.
+    \item $\text{Degree} = 2$: Continuous fiber segments.
+    \item $\text{Degree} = 3$: \textbf{Bifurcations.} Mathematically represents a true structural split (a Y-junction).
+    \item $\text{Degree} \ge 4$: \textbf{Crossings.} Represents physical path collisions or entanglements (X-junctions), where independent strands overlap in the same discrete voxel space.
+\end{itemize}
+
+\section{Differential Geometry: Dual-Scale Tensor Analysis}
+Anisotropy (directional variance) is calculated at two distinct mathematical scales to separate local micro-tubularity from global macro-alignment.
+
+\subsection{Micro-Scale: Multi-Resolution Hessian Fractional Anisotropy (HFA)}
+To evaluate local shape regardless of directional orientation, the pipeline evaluates the principal curvatures of the density ridges using the Hessian matrix $H$:
+\begin{equation}
+    H_{\sigma}(\bm{x}) = \sigma^2 \nabla^2 \left[ I(\bm{x}) * G_{\sigma} \right]
+\end{equation}
+Multiplication by $\sigma^2$ provides scale normalization. The eigenvalues $\lambda_1, \lambda_2, \lambda_3$ (where $|\lambda_1| \le |\lambda_2| \le |\lambda_3|$) describe the local geometry. A perfect tube exhibits $\lambda_1 \approx 0$ (no curvature along the axis) and $\lambda_2 \approx \lambda_3 \ll 0$ (sharp cross-sectional curvature).
+
+Because fibers may vary in thickness (e.g., tapering distal branches), $H$ is evaluated across a scale pyramid ($\sigma \in \{1.0, 2.0, 4.0\}$). The maximum Fractional Anisotropy response across all scales at each voxel is retained:
+\begin{equation}
+    \text{HFA} = \sqrt{\frac{3}{2}} \frac{\sqrt{\sum_{i=1}^3 (\lambda_i - \bar{\lambda})^2}}{\sqrt{\sum_{i=1}^3 \lambda_i^2}}
+\end{equation}
+
+\subsection{Macro-Scale: Confidence-Weighted Normalized Convolution}
+To measure the global directional alignment of a bundle, the pipeline uses the Structure Tensor $J$, which evaluates the covariance of first-order spatial gradients over a large integration window $\rho$. 
+
+Standard structure tensors fail in sparse volumes because the Gaussian integration kernel $G_\rho$ averages vast amounts of empty space (zero gradients), isotropically diluting the covariance matrix. The pipeline solves this via \textbf{Normalized Convolution}, utilizing the binary mask $M$ as a confidence map to strictly blind the tensor to the background:
+\begin{equation}
+    J_{\text{macro}} = \frac{G_\rho * \left( M \cdot \nabla I \nabla I^T \right)}{G_\rho * M + \epsilon}
+\end{equation}
+Furthermore, the integration window is dynamically scaled to $15\%$ of the maximum grid dimension ($\rho = \max(\text{shape}) \times 0.15$), ensuring macro-alignment is measured relative to the global bounding box rather than a fixed voxel count. 
+
+\section{Result Interpretation Guidelines}
+When analyzing the output `FiberMetrics`, the variables must be interpreted interdependently:
+
+\begin{enumerate}
+    \item \textbf{Mean Valency:} A continuous, non-branching fiber approaches 2.0. Values closer to 1.0 indicate fragmentation (dominated by endpoints). Values above 2.0 indicate hyper-entanglement.
+    \item \textbf{Bifurcation (\%) vs. Crossing (\%):} The ratio of true ramification to physical entanglement. A high bifurcation with near-zero crossing indicates an organized dendritic tree. A high crossing density with low bifurcations indicates a chaotic, randomized tangle of independent strands.
+    \item \textbf{Mean HFA ($\rightarrow 1.0$):} Confirms the structural elements are strictly tubular arrays, resistant to variations in fiber curvature. A low HFA indicates isotropic, blob-like density artifacts.
+    \item \textbf{Macro FA ($\rightarrow 1.0$):} Confirms the fibers within the bundle share a uniform, parallel global orientation. \textit{Note:} In highly sparse discrete grids, Macro FA is naturally suppressed due to residual radial dispersion; it is best utilized as a relative metric to compare the directional coherence of multiple samples.
+\end{enumerate}
+
+\end{document}
