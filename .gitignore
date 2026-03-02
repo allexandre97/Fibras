@@ -1,3 +1,6 @@
 __pycache__
+runs
+wandb
+weights
 .vscode
 *.npz
