@@ -2,7 +2,7 @@ import numpy as np
 import scipy.ndimage as ndi
 import warnings
 from skimage.morphology import skeletonize, remove_small_objects
-from skimage.filters import apply_hysteresis_threshold
+from skimage.filters import threshold_li, apply_hysteresis_threshold
 from skimage.measure import block_reduce
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -33,13 +33,8 @@ class TopologyAnalyzer:
         self.ridge_sigma = ridge_sharpening_sigma
 
     def extract_vesselness_topology(self, vesselness_map: np.ndarray, nms_ridges: np.ndarray, 
-                                    low_v: float = 0.05, high_v: float = 0.25) -> np.ndarray:
-        """
-        Extracts continuous structures based strictly on local differential geometry.
-        low_v: The geometry collapse floor (traces until the tube dissolves into noise).
-        high_v: The seeding threshold (must strongly resemble a tube to begin a path).
-        """
-        # Restrict the vesselness map strictly to the 1-voxel thin NMS carved ridges
+                                    low_v: float, high_v: float) -> np.ndarray:
+        """Extracts structures using dynamic geometric seeds restricted to 1-voxel ridges."""
         ridge_vesselness = vesselness_map * (nms_ridges > 1e-4)
         return apply_hysteresis_threshold(ridge_vesselness, low_v, high_v)
 
@@ -155,21 +150,18 @@ class HessianAnalyzer:
             sort_idx = np.argsort(abs_evals, axis=-1)
             row_idx = np.arange(len(evals))
             
-            idx1 = sort_idx[:, 0]
-            idx2 = sort_idx[:, 1]
-            idx3 = sort_idx[:, 2]
+            idx1, idx2, idx3 = sort_idx[:, 0], sort_idx[:, 1], sort_idx[:, 2]
+            l1, l2, l3 = evals[row_idx, idx1], evals[row_idx, idx2], evals[row_idx, idx3]
             
-            l1 = evals[row_idx, idx1]
-            l2 = evals[row_idx, idx2]
-            l3 = evals[row_idx, idx3]
-            
-            # Relaxed tolerance (1e-4) to account for numerical discretization errors on the finite grid
-            valid_structure = (l2 < 0) & (l3 < 0)
+            valid_structure = (l2 < -1e-5) & (l3 < -1e-5)
             
             rb = np.abs(l1) / (np.sqrt(np.abs(l2 * l3)) + 1e-10)
+            S = np.sqrt(l1**2 + l2**2 + l3**2)
+            c = 0.5 * np.max(S) if np.max(S) > 0 else 1.0
             
             vesselness = np.zeros_like(hfa_vals)
-            v_vals = hfa_vals[valid_structure] * np.exp(-(rb[valid_structure]**2) / (2 * BETA**2))
+            v_vals = hfa_vals[valid_structure] * np.exp(-(rb[valid_structure]**2) / (2 * BETA**2)) * \
+                     (1.0 - np.exp(-(S[valid_structure]**2) / (2 * c**2)))
             vesselness[valid_structure] = v_vals
             
             current_v = np.zeros_like(volume)
@@ -178,15 +170,9 @@ class HessianAnalyzer:
             update_mask = current_v > max_vesselness_map
             max_vesselness_map[update_mask] = current_v[update_mask]
             
-            cross_full = np.zeros(volume.shape + (volume.ndim,))
-            cross_full[valid_coords] = evecs[row_idx, :, idx3]
-            
-            fiber_full = np.zeros(volume.shape + (volume.ndim,))
-            fiber_full[valid_coords] = evecs[row_idx, :, idx1]
-            
             for dim in range(volume.ndim):
-                cross_evec_map[..., dim][update_mask] = cross_full[..., dim][update_mask]
-                fiber_evec_map[..., dim][update_mask] = fiber_full[..., dim][update_mask]
+                cross_evec_map[..., dim][update_mask] = evecs[row_idx, dim, idx3][update_mask[valid_coords]]
+                fiber_evec_map[..., dim][update_mask] = evecs[row_idx, dim, idx1][update_mask[valid_coords]]
                 
         return max_vesselness_map, cross_evec_map, fiber_evec_map
 
@@ -308,6 +294,20 @@ class DensityVolumeAnalyzer:
             out[nz, ny, nx_] = True
         return out
 
+    def _get_bounding_box(self, volume: np.ndarray, pad: int = 5) -> tuple:
+        coords = np.argwhere(volume > 1e-6)
+        if len(coords) == 0: return None
+        z0, y0, x0 = coords.min(axis=0) - pad
+        z1, y1, x1 = coords.max(axis=0) + 1 + pad
+        return (slice(max(0, z0), min(volume.shape[0], z1)), 
+                slice(max(0, y0), min(volume.shape[1], y1)), 
+                slice(max(0, x0), min(volume.shape[2], x1)))
+
+    def _empty_result(self, volume: np.ndarray):
+        m = FiberMetrics(0,0,0,0,0,0,0)
+        return AnalysisResult(m, np.zeros_like(volume), np.zeros_like(volume), 
+                              np.zeros_like(volume, dtype=bool), np.zeros_like(volume, dtype=bool), nx.Graph())
+
     def analyze(self, volume: np.ndarray, voxel_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0)) -> AnalysisResult:
         bbox = self._get_bounding_box(volume)
         if bbox is None: return self._empty_result(volume)
@@ -321,23 +321,23 @@ class DensityVolumeAnalyzer:
             laplacian += ndi.gaussian_filter1d(denoised, s_scaled[i], axis=i, order=2)
             
         sharpened = np.clip(denoised - laplacian, 0, None)
-        
-        # Lowered structural zero-gate to process fainter signal bounds
         base_mask = sharpened > 1e-5
         if not np.any(base_mask): return self._empty_result(volume)
             
         v_map, cross_ev, fiber_ev = self.hessian_analyzer.compute_multiscale(denoised, base_mask, voxel_spacing)
-        
         nms_vol = self._apply_directional_nms(sharpened, cross_ev, base_mask)
         
-        # SENSITIVITY FIX: Geometric extraction driven entirely by normalized vesselness
-        # low_v=0.05 guarantees tracing until the tube structurally dissipates into noise
-        mask_crop = self.topology_analyzer.extract_vesselness_topology(v_map, nms_vol, low_v=0.05, high_v=0.25)
-        
+        valid_v = v_map[v_map > 1e-3]
+        if len(valid_v) > 0:
+            high_v = threshold_li(valid_v)
+            low_v = high_v * 0.2
+        else:
+            low_v, high_v = 0.05, 0.25
+
+        mask_crop = self.topology_analyzer.extract_vesselness_topology(v_map, nms_vol, low_v=low_v, high_v=high_v)
         mask_crop = self._directional_gap_bridging(mask_crop, fiber_ev)
         
         min_vol = max(32, int((self.expected_fiber_radius ** 3) * 100))
-        
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
@@ -384,17 +384,3 @@ class DensityVolumeAnalyzer:
             crossing_density=net_m["crossing_density"]
         )
         return AnalysisResult(metrics, hfa_map, fa_macro_map, skeleton, mask, graph)
-
-    def _get_bounding_box(self, volume: np.ndarray, pad: int = 5) -> tuple:
-        coords = np.argwhere(volume > 1e-6)
-        if len(coords) == 0: return None
-        z0, y0, x0 = coords.min(axis=0) - pad
-        z1, y1, x1 = coords.max(axis=0) + 1 + pad
-        return (slice(max(0, z0), min(volume.shape[0], z1)), 
-                slice(max(0, y0), min(volume.shape[1], y1)), 
-                slice(max(0, x0), min(volume.shape[2], x1)))
-
-    def _empty_result(self, volume: np.ndarray):
-        m = FiberMetrics(0,0,0,0,0,0,0)
-        return AnalysisResult(m, np.zeros_like(volume), np.zeros_like(volume), 
-                              np.zeros_like(volume, dtype=bool), np.zeros_like(volume, dtype=bool), nx.Graph())
