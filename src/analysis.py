@@ -1,7 +1,7 @@
 import numpy as np
 import scipy.ndimage as ndi
+import warnings
 from skimage.morphology import skeletonize, remove_small_objects
-from scipy.ndimage import binary_fill_holes
 from skimage.filters import threshold_otsu, threshold_li, apply_hysteresis_threshold
 from skimage.measure import block_reduce
 from dataclasses import dataclass
@@ -38,9 +38,8 @@ class TopologyAnalyzer:
             return np.zeros_like(sharpened_volume, dtype=bool)
 
         high_thresh = threshold_otsu(valid_voxels)
-        # Intensity-based floor to prevent noise from seeding topological paths
-        dynamic_floor = sharpened_volume.max() * 0.20
-        high_thresh = max(high_thresh, dynamic_floor)
+        # Bounded floor to prevent noise from dragging the threshold too low
+        high_thresh = np.clip(high_thresh, sharpened_volume.max() * 0.05, sharpened_volume.max() * 0.5)
         
         try:
             low_thresh = threshold_li(valid_voxels)
@@ -50,7 +49,6 @@ class TopologyAnalyzer:
         return apply_hysteresis_threshold(sharpened_volume, low_thresh, high_thresh)
 
     def build_network_coherence_gated(self, skeleton: np.ndarray, spacing: Tuple[float, float, float], fiber_evecs: np.ndarray) -> nx.Graph:
-        """Constructs a graph where edges are gated by local orientational coherence."""
         G = nx.Graph()
         coords = np.argwhere(skeleton)
         if len(coords) == 0: return G
@@ -61,11 +59,9 @@ class TopologyAnalyzer:
         search_radius = np.linalg.norm(spacing) + 0.1
         pairs = list(tree.query_pairs(r=search_radius))
         
-        # Fast bulk node assignment
         for i, coord in enumerate(coords):
             G.add_node(i, pos=tuple(coord), vec=fiber_evecs[tuple(coord)])
             
-        # Coherence gate check
         for i, j in pairs:
             p1, p2 = physical_coords[i], physical_coords[j]
             edge_vec = p2 - p1
@@ -73,13 +69,11 @@ class TopologyAnalyzer:
             
             v1, v2 = G.nodes[i]['vec'], G.nodes[j]['vec']
             
-            # Prevent 'short-circuits' between parallel fibers
             if abs(np.dot(edge_vec, v1)) > 0.7 and abs(np.dot(edge_vec, v2)) > 0.7:
                 G.add_edge(i, j)
         return G
 
     def filter_by_path_persistence(self, G: nx.Graph, min_path_len: float) -> nx.Graph:
-        """O(N) component filtering using bounding-box span."""
         components = list(nx.connected_components(G))
         to_remove = []
         for comp in components:
@@ -91,7 +85,6 @@ class TopologyAnalyzer:
             pos = nx.get_node_attributes(sub, 'pos')
             p_arr = np.array([pos[n] for n in comp])
             
-            # Diagonal of the bounding box as a fast O(N) proxy for length
             span = np.linalg.norm(np.max(p_arr, axis=0) - np.min(p_arr, axis=0))
             if span < min_path_len:
                 to_remove.extend(comp)
@@ -100,57 +93,44 @@ class TopologyAnalyzer:
         return G
 
     def prune_skeleton_graph(self, G: nx.Graph, min_length: float) -> nx.Graph:
-        """Iteratively removes short terminal branches (spurs) cleanly without infinite looping."""
         if len(G) == 0: return G
         while True:
             leaves = [n for n, d in G.degree() if d == 1]
             to_remove = set()
             
             for leaf in leaves:
-                if leaf in to_remove: 
-                    continue
+                if leaf in to_remove: continue
                     
                 path = [leaf]
                 current = leaf
                 prev = None
                 
-                # Trace the branch until a junction or an end is met
                 while True:
                     neighbors = list(G.neighbors(current))
-                    # Prevent backtracking up the chain
-                    if prev in neighbors:
-                        neighbors.remove(prev)
+                    if prev in neighbors: neighbors.remove(prev)
                         
-                    if not neighbors:
-                        break  # Isolated path end
-                    if len(neighbors) > 1:
-                        break  # Junction reached
+                    if not neighbors: break
+                    if len(neighbors) > 1: break
                         
                     next_node = neighbors[0]
                     path.append(next_node)
                     prev = current
                     current = next_node
                     
-                # Calculate path's macroscopic physical length
                 pos = nx.get_node_attributes(G, 'pos')
                 length = sum(np.linalg.norm(np.array(pos[path[i]]) - np.array(pos[path[i+1]])) for i in range(len(path)-1))
                 
                 if length < min_length:
-                    # If it's a completely isolated short line, remove all of it
                     if G.degree(current) <= 1:
                         to_remove.update(path)
                     else:
-                        # Otherwise, remove the branch but keep the core junction node intact
                         to_remove.update(path[:-1])
                         
-            if not to_remove:
-                break
-                
+            if not to_remove: break
             G.remove_nodes_from(to_remove)
         return G
-    
+
     def compute_network_metrics(self, G: nx.Graph) -> Dict[str, float]:
-        """Calculates topological statistics from the extracted graph."""
         num_nodes = len(G)
         if num_nodes == 0: 
             return {"mean_valency": 0.0, "bifurcation_density": 0.0, "crossing_density": 0.0}
@@ -176,22 +156,31 @@ class HessianAnalyzer:
             hfa_vals, evals, evecs, valid_coords = self._compute_single_scale_full(volume, mask, sigma, spacing)
             if len(valid_coords[0]) == 0: continue
             
-            # VECTORIZED: Identify eigenvalue orientations without Python loops
+            # Sort eigenvalues by magnitude
             abs_evals = np.abs(evals)
-            along_idx = np.argmin(abs_evals, axis=-1)
-            cross_idx = np.argmax(abs_evals, axis=-1)
+            sort_idx = np.argsort(abs_evals, axis=-1)
+            row_idx = np.arange(len(evals))
             
-            # VECTORIZED: Extract cross-sectional curvatures (L2, L3)
-            row_idx = np.arange(len(along_idx))
-            l2_idx = (along_idx + 1) % 3
-            l3_idx = (along_idx + 2) % 3
+            idx1 = sort_idx[:, 0]
+            idx2 = sort_idx[:, 1]
+            idx3 = sort_idx[:, 2]
             
-            l1 = evals[row_idx, along_idx]
-            l2_l3_prod = evals[row_idx, l2_idx] * evals[row_idx, l3_idx]
+            l1 = evals[row_idx, idx1]
+            l2 = evals[row_idx, idx2]
+            l3 = evals[row_idx, idx3]
             
-            # Vesselness / Blobness suppression
-            rb = np.abs(l1) / (np.sqrt(np.abs(l2_l3_prod)) + 1e-10)
-            vesselness = hfa_vals * np.exp(-(rb**2) / (2 * BETA**2))
+            # STRICT FRANGI RULE: Cross-sectional curvatures must be negative for bright tubes
+            # This completely eliminates dark noise, valleys, and saddle points
+            valid_structure = (l2 < 0) & (l3 < 0)
+            
+            rb = np.abs(l1) / (np.sqrt(np.abs(l2 * l3)) + 1e-10)
+            S = np.sqrt(l1**2 + l2**2 + l3**2)
+            c = 0.25 * np.max(S) if np.max(S) > 0 else 1.0
+            
+            # HFA attenuated by Blobness (rb) and Background Structureness (S)
+            vesselness = np.zeros_like(hfa_vals)
+            v_vals = hfa_vals[valid_structure] * np.exp(-(rb[valid_structure]**2) / (2 * BETA**2)) * (1.0 - np.exp(-(S[valid_structure]**2) / (2 * c**2)))
+            vesselness[valid_structure] = v_vals
             
             current_v = np.zeros_like(volume)
             current_v[valid_coords] = vesselness
@@ -199,14 +188,12 @@ class HessianAnalyzer:
             update_mask = current_v > max_vesselness_map
             max_vesselness_map[update_mask] = current_v[update_mask]
             
-            # VECTORIZED: Extract orientation vectors
             cross_full = np.zeros(volume.shape + (volume.ndim,))
-            cross_full[valid_coords] = evecs[row_idx, :, cross_idx]
+            cross_full[valid_coords] = evecs[row_idx, :, idx3]
             
             fiber_full = np.zeros(volume.shape + (volume.ndim,))
-            fiber_full[valid_coords] = evecs[row_idx, :, along_idx]
+            fiber_full[valid_coords] = evecs[row_idx, :, idx1]
             
-            # Selective update of vectors based on best HFA response
             for dim in range(volume.ndim):
                 cross_evec_map[..., dim][update_mask] = cross_full[..., dim][update_mask]
                 fiber_evec_map[..., dim][update_mask] = fiber_full[..., dim][update_mask]
@@ -301,15 +288,7 @@ class DensityVolumeAnalyzer:
         self.tensor_macro = StructureTensorAnalyzer(inner_sigma=expected_fiber_radius)
         self.topology_analyzer = TopologyAnalyzer(ridge_sharpening_sigma=expected_fiber_radius)
 
-    def _linear_deconvolution(self, volume: np.ndarray, spacing: Tuple[float, float, float]) -> np.ndarray:
-        sharp = volume.copy()
-        for i, sp in enumerate(spacing):
-            grad_2 = ndi.gaussian_filter1d(volume, 0.5/sp, axis=i, order=2)
-            sharp -= grad_2 * (0.5 * sp)
-        return np.clip(sharp, 0, volume.max())
-
     def _apply_directional_nms(self, sharpened: np.ndarray, evecs: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Optimized NMS using Tri-linear sampling on masked voxels."""
         out = np.zeros_like(sharpened)
         coords = np.argwhere(mask)
         if len(coords) == 0: return out
@@ -318,7 +297,6 @@ class DensityVolumeAnalyzer:
         dz, dy, dx = evecs[z, y, x, 0], evecs[z, y, x, 1], evecs[z, y, x, 2]
         
         val_center = sharpened[z, y, x]
-        # order=1 provides tri-linear interpolation for sub-voxel accuracy
         val_p = ndi.map_coordinates(sharpened, [z+dz, y+dy, x+dx], order=1, mode='constant', cval=0.0)
         val_m = ndi.map_coordinates(sharpened, [z-dz, y-dy, x-dx], order=1, mode='constant', cval=0.0)
         
@@ -327,25 +305,25 @@ class DensityVolumeAnalyzer:
         return out
 
     def _directional_gap_bridging(self, mask: np.ndarray, fiber_evecs: np.ndarray) -> np.ndarray:
-        """Vectorized gap bridging along orientational vectors."""
         out = mask.copy()
         coords = np.argwhere(mask)
         if len(coords) == 0: return out
         z, y, x = coords.T
         dz, dy, dx = fiber_evecs[z, y, x, 0], fiber_evecs[z, y, x, 1], fiber_evecs[z, y, x, 2]
-        for step in [1.0, 1.5]:
-            for sign in [1, -1]:
-                nz = np.clip(np.round(z + sign * dz * step).astype(int), 0, mask.shape[0]-1)
-                ny = np.clip(np.round(y + sign * dy * step).astype(int), 0, mask.shape[1]-1)
-                nx_ = np.clip(np.round(x + sign * dx * step).astype(int), 0, mask.shape[2]-1)
-                out[nz, ny, nx_] = True
+        
+        # Reduced to a single step bridge to prevent noise chaining
+        for sign in [1, -1]:
+            nz = np.clip(np.round(z + sign * dz).astype(int), 0, mask.shape[0]-1)
+            ny = np.clip(np.round(y + sign * dy).astype(int), 0, mask.shape[1]-1)
+            nx_ = np.clip(np.round(x + sign * dx).astype(int), 0, mask.shape[2]-1)
+            out[nz, ny, nx_] = True
         return out
 
     def analyze(self, volume: np.ndarray, voxel_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0)) -> AnalysisResult:
         bbox = self._get_bounding_box(volume)
         if bbox is None: return self._empty_result(volume)
         
-        crop_vol = self._linear_deconvolution(volume[bbox], voxel_spacing)
+        crop_vol = volume[bbox]
         denoised = ndi.gaussian_filter(crop_vol, sigma=0.5)
         
         laplacian = np.zeros_like(denoised)
@@ -354,26 +332,34 @@ class DensityVolumeAnalyzer:
             laplacian += ndi.gaussian_filter1d(denoised, s_scaled[i], axis=i, order=2)
             
         sharpened = np.clip(denoised - laplacian, 0, None)
-        v_map, cross_ev, fiber_ev = self.hessian_analyzer.compute_multiscale(denoised, sharpened > 1e-4, voxel_spacing)
         
-        nms_vol = self._apply_directional_nms(sharpened, cross_ev, sharpened > 1e-4)
+        base_mask = sharpened > 1e-4
+        if not np.any(base_mask): return self._empty_result(volume)
+            
+        v_map, cross_ev, fiber_ev = self.hessian_analyzer.compute_multiscale(denoised, base_mask, voxel_spacing)
+        
+        nms_vol = self._apply_directional_nms(sharpened, cross_ev, base_mask)
         mask_crop = self.topology_analyzer.extract_rough_mask_from_sharpened(nms_vol)
-        mask_crop &= (v_map > 0.65)
+        
+        # Enforce vesselness gate to strip debris
+        mask_crop &= (v_map > 0.15)
         mask_crop = self._directional_gap_bridging(mask_crop, fiber_ev)
         
-        # FIX: API Deprecation Handled Correctly. Removes artifacts safely.
-        min_vol = max(64, int((self.expected_fiber_radius ** 3) * 150))
-        try:
-            mask_crop = remove_small_objects(mask_crop.astype(bool), max_size=min_vol)
-        except TypeError:
-            mask_crop = remove_small_objects(mask_crop.astype(bool), min_size=min_vol)
+        min_vol = max(32, int((self.expected_fiber_radius ** 3) * 100))
+        
+        # Cleanly suppress API deprecation warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                mask_crop = remove_small_objects(mask_crop.astype(bool), max_size=min_vol)
+            except TypeError:
+                mask_crop = remove_small_objects(mask_crop.astype(bool), min_size=min_vol)
         
         skeleton_raw = skeletonize(mask_crop)
         graph = self.topology_analyzer.build_network_coherence_gated(skeleton_raw, voxel_spacing, fiber_ev)
         graph = self.topology_analyzer.filter_by_path_persistence(graph, self.expected_fiber_radius * 10.0)
         graph = self.topology_analyzer.prune_skeleton_graph(graph, self.expected_fiber_radius * 3.0)
         
-        # Reconstruct results
         skeleton = np.zeros_like(volume, dtype=bool)
         mask = np.zeros_like(volume, dtype=bool)
         hfa_map = np.zeros_like(volume)
@@ -387,7 +373,6 @@ class DensityVolumeAnalyzer:
         mask[bbox] = mask_crop
         hfa_map[bbox] = v_map
         
-        # Macro Alignment Anisotropy
         ds = 4
         vol_ds = block_reduce(volume[bbox], (ds,)*3, np.mean)
         mask_ds = block_reduce(mask_crop.astype(float), (ds,)*3, np.max) > 0.5
