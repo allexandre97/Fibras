@@ -3,6 +3,7 @@ import scipy.ndimage as ndi
 import warnings
 from skimage.morphology import skeletonize, remove_small_objects
 from skimage.measure import block_reduce
+from skimage.filters import apply_hysteresis_threshold, threshold_multiotsu
 from dataclasses import dataclass
 from typing import Dict, Tuple
 import networkx as nx
@@ -32,7 +33,6 @@ class TopologyAnalyzer:
         self.ridge_sigma = ridge_sharpening_sigma
 
     def build_network_coherence_gated(self, skeleton: np.ndarray, spacing: Tuple[float, float, float], fiber_evecs: np.ndarray) -> nx.Graph:
-        """Graph construction with Tensor Coherence. Destroys orthogonal lattice fusions in dense bundles."""
         G = nx.Graph()
         coords = np.argwhere(skeleton)
         if len(coords) == 0: return G
@@ -53,7 +53,6 @@ class TopologyAnalyzer:
             
             v1, v2 = G.nodes[i]['vec'], G.nodes[j]['vec']
             
-            # Relaxed to 0.3 (~72 degrees) to allow sharp biological curves, but reject 90-degree bundle fusions
             if abs(np.dot(edge_vec, v1)) > 0.30 and abs(np.dot(edge_vec, v2)) > 0.30:
                 G.add_edge(i, j)
         return G
@@ -71,7 +70,10 @@ class TopologyAnalyzer:
             p_arr = np.array([pos[n] for n in comp])
             
             span = np.linalg.norm(np.max(p_arr, axis=0) - np.min(p_arr, axis=0))
-            if span < min_path_len:
+            node_count = len(comp)
+            density_ratio = node_count / (span + 1e-5)
+            
+            if span < min_path_len or density_ratio > 3.0:
                 to_remove.extend(comp)
                 
         G.remove_nodes_from(to_remove)
@@ -135,6 +137,7 @@ class HessianAnalyzer:
         max_vesselness_map = np.zeros_like(volume)
         cross_evec_map = np.zeros(volume.shape + (volume.ndim,))
         fiber_evec_map = np.zeros(volume.shape + (volume.ndim,))
+        
         BETA = 0.5 
         
         for sigma in self.sigmas:
@@ -148,14 +151,26 @@ class HessianAnalyzer:
             idx1, idx2, idx3 = sort_idx[:, 0], sort_idx[:, 1], sort_idx[:, 2]
             l1, l2, l3 = evals[row_idx, idx1], evals[row_idx, idx2], evals[row_idx, idx3]
             
-            # Geometric tolerance relaxed to 0.01 to prevent topological breakage directly at bifurcations
             valid_structure = (l2 < 1e-2) & (l3 < 1e-2)
             
             rb = np.abs(l1) / (np.sqrt(np.abs(l2 * l3)) + 1e-10)
+            p_blob = np.exp(-(rb**2) / (2 * BETA**2))
             
-            # Absolute Shape Probability: Removes global intensity penalty (S-term) to save fiber tails
+            S = np.sqrt(l1**2 + l2**2 + l3**2)
+            valid_S = S[valid_structure]
+            
+            if len(valid_S) > 0:
+                # Pre-Analysis: Calculate robust statistical spread of curvature magnitudes
+                median_S = np.median(valid_S)
+                mad_S = np.median(np.abs(valid_S - median_S))
+                # Scale dynamically to the empirical noise floor of the specific phenotype
+                c = median_S + (1.4826 * mad_S) + 1e-6
+                p_structure = 1.0 - np.exp(-(S**2) / (2 * c**2))
+            else:
+                p_structure = np.zeros_like(S)
+            
             vesselness = np.zeros_like(hfa_vals)
-            v_vals = hfa_vals[valid_structure] * np.exp(-(rb[valid_structure]**2) / (2 * BETA**2))
+            v_vals = hfa_vals[valid_structure] * p_blob[valid_structure] * p_structure[valid_structure]
             vesselness[valid_structure] = v_vals
             
             current_v = np.zeros_like(volume)
@@ -250,9 +265,9 @@ class DensityVolumeAnalyzer:
         self.expected_fiber_radius = expected_fiber_radius
         self.macro_scale_fraction = macro_scale_fraction
         
-        s1 = max(0.5, expected_fiber_radius * 0.8)
-        s2 = max(1.0, expected_fiber_radius * 1.5)
-        s3 = max(2.0, expected_fiber_radius * 2.5)
+        s1 = max(0.5, expected_fiber_radius * 0.5)
+        s2 = max(1.0, expected_fiber_radius * 1.0)
+        s3 = max(1.5, expected_fiber_radius * 1.5) 
         
         self.hessian_analyzer = HessianAnalyzer(sigmas=(s1, s2, s3))
         self.tensor_macro = StructureTensorAnalyzer(inner_sigma=expected_fiber_radius)
@@ -267,7 +282,6 @@ class DensityVolumeAnalyzer:
         dz, dy, dx = evecs[z, y, x, 0], evecs[z, y, x, 1], evecs[z, y, x, 2]
         
         val_center = field[z, y, x]
-        # Tri-linear sub-voxel sampling
         val_p = ndi.map_coordinates(field, [z+dz, y+dy, x+dx], order=1, mode='constant', cval=0.0)
         val_m = ndi.map_coordinates(field, [z-dz, y-dy, x-dx], order=1, mode='constant', cval=0.0)
         
@@ -310,7 +324,6 @@ class DensityVolumeAnalyzer:
         crop_vol = volume[bbox]
         denoised = ndi.gaussian_filter(crop_vol, sigma=0.5)
         
-        # 1. Rigorous MAD Noise Floor Formulation
         bg_median = np.median(denoised)
         mad = np.median(np.abs(denoised - bg_median))
         signal_floor = max(bg_median + 3 * mad, 1e-4)
@@ -318,14 +331,25 @@ class DensityVolumeAnalyzer:
         
         if not np.any(base_mask): return self._empty_result(volume)
             
-        # 2. Geometric Shape Extraction
         v_map, cross_ev, fiber_ev = self.hessian_analyzer.compute_multiscale(denoised, base_mask, voxel_spacing)
-        
-        # 3. VESSELNESS-NMS: Thinning the geometric probability directly guarantees intensity invariance.
         nms_v = self._apply_directional_nms(v_map, cross_ev, base_mask)
         
-        # 4. Universal shape gate. 0.05 maintains connectivity deep into the noise floor.
-        mask_crop = nms_v > 0.05
+        # Pre-Analysis: Unsupervised 3-class separation via Multi-Otsu
+        active_v = nms_v[nms_v > 1e-5]
+        if len(active_v) > 100:
+            try:
+                # Partitions field into: Background Noise, Faint Fibers, Dense Cores
+                thresholds = threshold_multiotsu(active_v, classes=3)
+                low_thresh = thresholds[0]
+                high_thresh = thresholds[1]
+            except ValueError:
+                # Fallback for highly homogeneous density spaces
+                low_thresh = np.percentile(active_v, 40)
+                high_thresh = np.percentile(active_v, 85)
+        else:
+            low_thresh, high_thresh = 0.05, 0.15
+            
+        mask_crop = apply_hysteresis_threshold(nms_v, low=low_thresh, high=high_thresh)
         mask_crop = self._directional_gap_bridging(mask_crop, fiber_ev)
         
         min_vol = max(32, int((self.expected_fiber_radius ** 3) * 100))
@@ -338,7 +362,6 @@ class DensityVolumeAnalyzer:
         
         skeleton_raw = skeletonize(mask_crop)
         
-        # 5. Top-Down Filtering
         graph = self.topology_analyzer.build_network_coherence_gated(skeleton_raw, voxel_spacing, fiber_ev)
         graph = self.topology_analyzer.filter_by_path_persistence(graph, self.expected_fiber_radius * 10.0)
         graph = self.topology_analyzer.prune_skeleton_graph(graph, self.expected_fiber_radius * 3.0)
