@@ -2,7 +2,6 @@ import numpy as np
 import scipy.ndimage as ndi
 import warnings
 from skimage.morphology import skeletonize, remove_small_objects
-from skimage.filters import threshold_li, apply_hysteresis_threshold
 from skimage.measure import block_reduce
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -32,13 +31,8 @@ class TopologyAnalyzer:
     def __init__(self, ridge_sharpening_sigma: float = 1.0):
         self.ridge_sigma = ridge_sharpening_sigma
 
-    def extract_vesselness_topology(self, vesselness_map: np.ndarray, nms_ridges: np.ndarray, 
-                                    low_v: float, high_v: float) -> np.ndarray:
-        """Extracts structures using dynamic geometric seeds restricted to 1-voxel ridges."""
-        ridge_vesselness = vesselness_map * (nms_ridges > 1e-4)
-        return apply_hysteresis_threshold(ridge_vesselness, low_v, high_v)
-
     def build_network_coherence_gated(self, skeleton: np.ndarray, spacing: Tuple[float, float, float], fiber_evecs: np.ndarray) -> nx.Graph:
+        """Graph construction with Tensor Coherence. Destroys orthogonal lattice fusions in dense bundles."""
         G = nx.Graph()
         coords = np.argwhere(skeleton)
         if len(coords) == 0: return G
@@ -59,7 +53,8 @@ class TopologyAnalyzer:
             
             v1, v2 = G.nodes[i]['vec'], G.nodes[j]['vec']
             
-            if abs(np.dot(edge_vec, v1)) > 0.45 and abs(np.dot(edge_vec, v2)) > 0.45:
+            # Relaxed to 0.3 (~72 degrees) to allow sharp biological curves, but reject 90-degree bundle fusions
+            if abs(np.dot(edge_vec, v1)) > 0.30 and abs(np.dot(edge_vec, v2)) > 0.30:
                 G.add_edge(i, j)
         return G
 
@@ -153,15 +148,14 @@ class HessianAnalyzer:
             idx1, idx2, idx3 = sort_idx[:, 0], sort_idx[:, 1], sort_idx[:, 2]
             l1, l2, l3 = evals[row_idx, idx1], evals[row_idx, idx2], evals[row_idx, idx3]
             
-            valid_structure = (l2 < -1e-5) & (l3 < -1e-5)
+            # Geometric tolerance relaxed to 0.01 to prevent topological breakage directly at bifurcations
+            valid_structure = (l2 < 1e-2) & (l3 < 1e-2)
             
             rb = np.abs(l1) / (np.sqrt(np.abs(l2 * l3)) + 1e-10)
-            S = np.sqrt(l1**2 + l2**2 + l3**2)
-            c = 0.5 * np.max(S) if np.max(S) > 0 else 1.0
             
+            # Absolute Shape Probability: Removes global intensity penalty (S-term) to save fiber tails
             vesselness = np.zeros_like(hfa_vals)
-            v_vals = hfa_vals[valid_structure] * np.exp(-(rb[valid_structure]**2) / (2 * BETA**2)) * \
-                     (1.0 - np.exp(-(S[valid_structure]**2) / (2 * c**2)))
+            v_vals = hfa_vals[valid_structure] * np.exp(-(rb[valid_structure]**2) / (2 * BETA**2))
             vesselness[valid_structure] = v_vals
             
             current_v = np.zeros_like(volume)
@@ -264,19 +258,20 @@ class DensityVolumeAnalyzer:
         self.tensor_macro = StructureTensorAnalyzer(inner_sigma=expected_fiber_radius)
         self.topology_analyzer = TopologyAnalyzer(ridge_sharpening_sigma=expected_fiber_radius)
 
-    def _apply_directional_nms(self, sharpened: np.ndarray, evecs: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        out = np.zeros_like(sharpened)
+    def _apply_directional_nms(self, field: np.ndarray, evecs: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        out = np.zeros_like(field)
         coords = np.argwhere(mask)
         if len(coords) == 0: return out
         
         z, y, x = coords.T
         dz, dy, dx = evecs[z, y, x, 0], evecs[z, y, x, 1], evecs[z, y, x, 2]
         
-        val_center = sharpened[z, y, x]
-        val_p = ndi.map_coordinates(sharpened, [z+dz, y+dy, x+dx], order=1, mode='constant', cval=0.0)
-        val_m = ndi.map_coordinates(sharpened, [z-dz, y-dy, x-dx], order=1, mode='constant', cval=0.0)
+        val_center = field[z, y, x]
+        # Tri-linear sub-voxel sampling
+        val_p = ndi.map_coordinates(field, [z+dz, y+dy, x+dx], order=1, mode='constant', cval=0.0)
+        val_m = ndi.map_coordinates(field, [z-dz, y-dy, x-dx], order=1, mode='constant', cval=0.0)
         
-        is_max = (val_center >= val_p) & (val_center >= val_m)
+        is_max = (val_center > val_p) & (val_center >= val_m)
         out[z[is_max], y[is_max], x[is_max]] = val_center[is_max]
         return out
 
@@ -315,26 +310,22 @@ class DensityVolumeAnalyzer:
         crop_vol = volume[bbox]
         denoised = ndi.gaussian_filter(crop_vol, sigma=0.5)
         
-        laplacian = np.zeros_like(denoised)
-        s_scaled = [self.topology_analyzer.ridge_sigma / sp for sp in voxel_spacing]
-        for i in range(denoised.ndim):
-            laplacian += ndi.gaussian_filter1d(denoised, s_scaled[i], axis=i, order=2)
-            
-        sharpened = np.clip(denoised - laplacian, 0, None)
-        base_mask = sharpened > 1e-5
+        # 1. Rigorous MAD Noise Floor Formulation
+        bg_median = np.median(denoised)
+        mad = np.median(np.abs(denoised - bg_median))
+        signal_floor = max(bg_median + 3 * mad, 1e-4)
+        base_mask = denoised > signal_floor
+        
         if not np.any(base_mask): return self._empty_result(volume)
             
+        # 2. Geometric Shape Extraction
         v_map, cross_ev, fiber_ev = self.hessian_analyzer.compute_multiscale(denoised, base_mask, voxel_spacing)
-        nms_vol = self._apply_directional_nms(sharpened, cross_ev, base_mask)
         
-        valid_v = v_map[v_map > 1e-3]
-        if len(valid_v) > 0:
-            high_v = threshold_li(valid_v)
-            low_v = high_v * 0.2
-        else:
-            low_v, high_v = 0.05, 0.25
-
-        mask_crop = self.topology_analyzer.extract_vesselness_topology(v_map, nms_vol, low_v=low_v, high_v=high_v)
+        # 3. VESSELNESS-NMS: Thinning the geometric probability directly guarantees intensity invariance.
+        nms_v = self._apply_directional_nms(v_map, cross_ev, base_mask)
+        
+        # 4. Universal shape gate. 0.05 maintains connectivity deep into the noise floor.
+        mask_crop = nms_v > 0.05
         mask_crop = self._directional_gap_bridging(mask_crop, fiber_ev)
         
         min_vol = max(32, int((self.expected_fiber_radius ** 3) * 100))
@@ -346,6 +337,8 @@ class DensityVolumeAnalyzer:
                 mask_crop = remove_small_objects(mask_crop.astype(bool), min_size=min_vol)
         
         skeleton_raw = skeletonize(mask_crop)
+        
+        # 5. Top-Down Filtering
         graph = self.topology_analyzer.build_network_coherence_gated(skeleton_raw, voxel_spacing, fiber_ev)
         graph = self.topology_analyzer.filter_by_path_persistence(graph, self.expected_fiber_radius * 10.0)
         graph = self.topology_analyzer.prune_skeleton_graph(graph, self.expected_fiber_radius * 3.0)
