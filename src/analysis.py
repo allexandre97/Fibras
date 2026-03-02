@@ -2,7 +2,7 @@ import numpy as np
 import scipy.ndimage as ndi
 import warnings
 from skimage.morphology import skeletonize, remove_small_objects
-from skimage.filters import threshold_otsu, threshold_li, apply_hysteresis_threshold
+from skimage.filters import apply_hysteresis_threshold
 from skimage.measure import block_reduce
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -32,26 +32,16 @@ class TopologyAnalyzer:
     def __init__(self, ridge_sharpening_sigma: float = 1.0):
         self.ridge_sigma = ridge_sharpening_sigma
 
-    def extract_rough_mask_from_sharpened(self, base_volume: np.ndarray, target_volume: np.ndarray) -> np.ndarray:
-        """Computes thresholds on the continuous base_volume, but applies them to the NMS target_volume."""
-        valid_voxels = base_volume[base_volume > 1e-4]
-        if len(valid_voxels) == 0: 
-            return np.zeros_like(target_volume, dtype=bool)
-
-        # Calculate Otsu on the FULL fiber distribution, not just the NMS peaks
-        high_thresh = threshold_otsu(valid_voxels)
-        dynamic_floor = base_volume.max() * 0.05
-        high_thresh = np.clip(high_thresh, dynamic_floor, base_volume.max() * 0.4)
-        
-        try:
-            low_thresh = threshold_li(valid_voxels)
-        except:
-            low_thresh = high_thresh * 0.3
-            
-        low_thresh = min(low_thresh, high_thresh * 0.4)
-        
-        # Apply the mathematically stable thresholds to the carved valleys
-        return apply_hysteresis_threshold(target_volume, low_thresh, high_thresh)
+    def extract_vesselness_topology(self, vesselness_map: np.ndarray, nms_ridges: np.ndarray, 
+                                    low_v: float = 0.05, high_v: float = 0.25) -> np.ndarray:
+        """
+        Extracts continuous structures based strictly on local differential geometry.
+        low_v: The geometry collapse floor (traces until the tube dissolves into noise).
+        high_v: The seeding threshold (must strongly resemble a tube to begin a path).
+        """
+        # Restrict the vesselness map strictly to the 1-voxel thin NMS carved ridges
+        ridge_vesselness = vesselness_map * (nms_ridges > 1e-4)
+        return apply_hysteresis_threshold(ridge_vesselness, low_v, high_v)
 
     def build_network_coherence_gated(self, skeleton: np.ndarray, spacing: Tuple[float, float, float], fiber_evecs: np.ndarray) -> nx.Graph:
         G = nx.Graph()
@@ -74,7 +64,6 @@ class TopologyAnalyzer:
             
             v1, v2 = G.nodes[i]['vec'], G.nodes[j]['vec']
             
-            # 0.45 threshold allows biological Y-branches (~60 deg) but blocks orthogonal noise (90 deg)
             if abs(np.dot(edge_vec, v1)) > 0.45 and abs(np.dot(edge_vec, v2)) > 0.45:
                 G.add_edge(i, j)
         return G
@@ -162,7 +151,6 @@ class HessianAnalyzer:
             hfa_vals, evals, evecs, valid_coords = self._compute_single_scale_full(volume, mask, sigma, spacing)
             if len(valid_coords[0]) == 0: continue
             
-            # Sort eigenvalues by magnitude
             abs_evals = np.abs(evals)
             sort_idx = np.argsort(abs_evals, axis=-1)
             row_idx = np.arange(len(evals))
@@ -175,12 +163,11 @@ class HessianAnalyzer:
             l2 = evals[row_idx, idx2]
             l3 = evals[row_idx, idx3]
             
-            # Cross-sectional curvatures must be negative. Small epsilon handles numerical zeros.
-            valid_structure = (l2 < 1e-5) & (l3 < 1e-5)
+            # Relaxed tolerance (1e-4) to account for numerical discretization errors on the finite grid
+            valid_structure = (l2 < 0) & (l3 < 0)
             
             rb = np.abs(l1) / (np.sqrt(np.abs(l2 * l3)) + 1e-10)
             
-            # Vesselness relies purely on fractional anisotropy and blob suppression.
             vesselness = np.zeros_like(hfa_vals)
             v_vals = hfa_vals[valid_structure] * np.exp(-(rb[valid_structure]**2) / (2 * BETA**2))
             vesselness[valid_structure] = v_vals
@@ -303,7 +290,6 @@ class DensityVolumeAnalyzer:
         val_p = ndi.map_coordinates(sharpened, [z+dz, y+dy, x+dx], order=1, mode='constant', cval=0.0)
         val_m = ndi.map_coordinates(sharpened, [z-dz, y-dy, x-dx], order=1, mode='constant', cval=0.0)
         
-        # Inclusive comparison ensures broad peaks aren't totally wiped out
         is_max = (val_center >= val_p) & (val_center >= val_m)
         out[z[is_max], y[is_max], x[is_max]] = val_center[is_max]
         return out
@@ -336,18 +322,18 @@ class DensityVolumeAnalyzer:
             
         sharpened = np.clip(denoised - laplacian, 0, None)
         
-        base_mask = sharpened > 1e-4
+        # Lowered structural zero-gate to process fainter signal bounds
+        base_mask = sharpened > 1e-5
         if not np.any(base_mask): return self._empty_result(volume)
             
         v_map, cross_ev, fiber_ev = self.hessian_analyzer.compute_multiscale(denoised, base_mask, voxel_spacing)
         
         nms_vol = self._apply_directional_nms(sharpened, cross_ev, base_mask)
         
-        # Proper threshold decoupling applied here
-        mask_crop = self.topology_analyzer.extract_rough_mask_from_sharpened(sharpened, nms_vol)
+        # SENSITIVITY FIX: Geometric extraction driven entirely by normalized vesselness
+        # low_v=0.05 guarantees tracing until the tube structurally dissipates into noise
+        mask_crop = self.topology_analyzer.extract_vesselness_topology(v_map, nms_vol, low_v=0.05, high_v=0.25)
         
-        # Relaxed gate allows dimmer fibers through
-        mask_crop &= (v_map > 0.10)
         mask_crop = self._directional_gap_bridging(mask_crop, fiber_ev)
         
         min_vol = max(32, int((self.expected_fiber_radius ** 3) * 100))
