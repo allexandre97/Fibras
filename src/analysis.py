@@ -32,21 +32,26 @@ class TopologyAnalyzer:
     def __init__(self, ridge_sharpening_sigma: float = 1.0):
         self.ridge_sigma = ridge_sharpening_sigma
 
-    def extract_rough_mask_from_sharpened(self, sharpened_volume: np.ndarray) -> np.ndarray:
-        valid_voxels = sharpened_volume[sharpened_volume > 1e-4]
+    def extract_rough_mask_from_sharpened(self, base_volume: np.ndarray, target_volume: np.ndarray) -> np.ndarray:
+        """Computes thresholds on the continuous base_volume, but applies them to the NMS target_volume."""
+        valid_voxels = base_volume[base_volume > 1e-4]
         if len(valid_voxels) == 0: 
-            return np.zeros_like(sharpened_volume, dtype=bool)
+            return np.zeros_like(target_volume, dtype=bool)
 
+        # Calculate Otsu on the FULL fiber distribution, not just the NMS peaks
         high_thresh = threshold_otsu(valid_voxels)
-        # Bounded floor to prevent noise from dragging the threshold too low
-        high_thresh = np.clip(high_thresh, sharpened_volume.max() * 0.05, sharpened_volume.max() * 0.5)
+        dynamic_floor = base_volume.max() * 0.05
+        high_thresh = np.clip(high_thresh, dynamic_floor, base_volume.max() * 0.4)
         
         try:
             low_thresh = threshold_li(valid_voxels)
         except:
-            low_thresh = high_thresh * 0.4
+            low_thresh = high_thresh * 0.3
             
-        return apply_hysteresis_threshold(sharpened_volume, low_thresh, high_thresh)
+        low_thresh = min(low_thresh, high_thresh * 0.4)
+        
+        # Apply the mathematically stable thresholds to the carved valleys
+        return apply_hysteresis_threshold(target_volume, low_thresh, high_thresh)
 
     def build_network_coherence_gated(self, skeleton: np.ndarray, spacing: Tuple[float, float, float], fiber_evecs: np.ndarray) -> nx.Graph:
         G = nx.Graph()
@@ -69,7 +74,8 @@ class TopologyAnalyzer:
             
             v1, v2 = G.nodes[i]['vec'], G.nodes[j]['vec']
             
-            if abs(np.dot(edge_vec, v1)) > 0.7 and abs(np.dot(edge_vec, v2)) > 0.7:
+            # 0.45 threshold allows biological Y-branches (~60 deg) but blocks orthogonal noise (90 deg)
+            if abs(np.dot(edge_vec, v1)) > 0.45 and abs(np.dot(edge_vec, v2)) > 0.45:
                 G.add_edge(i, j)
         return G
 
@@ -169,17 +175,14 @@ class HessianAnalyzer:
             l2 = evals[row_idx, idx2]
             l3 = evals[row_idx, idx3]
             
-            # STRICT FRANGI RULE: Cross-sectional curvatures must be negative for bright tubes
-            # This completely eliminates dark noise, valleys, and saddle points
-            valid_structure = (l2 < 0) & (l3 < 0)
+            # Cross-sectional curvatures must be negative. Small epsilon handles numerical zeros.
+            valid_structure = (l2 < 1e-5) & (l3 < 1e-5)
             
             rb = np.abs(l1) / (np.sqrt(np.abs(l2 * l3)) + 1e-10)
-            S = np.sqrt(l1**2 + l2**2 + l3**2)
-            c = 0.25 * np.max(S) if np.max(S) > 0 else 1.0
             
-            # HFA attenuated by Blobness (rb) and Background Structureness (S)
+            # Vesselness relies purely on fractional anisotropy and blob suppression.
             vesselness = np.zeros_like(hfa_vals)
-            v_vals = hfa_vals[valid_structure] * np.exp(-(rb[valid_structure]**2) / (2 * BETA**2)) * (1.0 - np.exp(-(S[valid_structure]**2) / (2 * c**2)))
+            v_vals = hfa_vals[valid_structure] * np.exp(-(rb[valid_structure]**2) / (2 * BETA**2))
             vesselness[valid_structure] = v_vals
             
             current_v = np.zeros_like(volume)
@@ -300,7 +303,8 @@ class DensityVolumeAnalyzer:
         val_p = ndi.map_coordinates(sharpened, [z+dz, y+dy, x+dx], order=1, mode='constant', cval=0.0)
         val_m = ndi.map_coordinates(sharpened, [z-dz, y-dy, x-dx], order=1, mode='constant', cval=0.0)
         
-        is_max = (val_center > val_p) & (val_center > val_m)
+        # Inclusive comparison ensures broad peaks aren't totally wiped out
+        is_max = (val_center >= val_p) & (val_center >= val_m)
         out[z[is_max], y[is_max], x[is_max]] = val_center[is_max]
         return out
 
@@ -311,7 +315,6 @@ class DensityVolumeAnalyzer:
         z, y, x = coords.T
         dz, dy, dx = fiber_evecs[z, y, x, 0], fiber_evecs[z, y, x, 1], fiber_evecs[z, y, x, 2]
         
-        # Reduced to a single step bridge to prevent noise chaining
         for sign in [1, -1]:
             nz = np.clip(np.round(z + sign * dz).astype(int), 0, mask.shape[0]-1)
             ny = np.clip(np.round(y + sign * dy).astype(int), 0, mask.shape[1]-1)
@@ -339,15 +342,16 @@ class DensityVolumeAnalyzer:
         v_map, cross_ev, fiber_ev = self.hessian_analyzer.compute_multiscale(denoised, base_mask, voxel_spacing)
         
         nms_vol = self._apply_directional_nms(sharpened, cross_ev, base_mask)
-        mask_crop = self.topology_analyzer.extract_rough_mask_from_sharpened(nms_vol)
         
-        # Enforce vesselness gate to strip debris
-        mask_crop &= (v_map > 0.15)
+        # Proper threshold decoupling applied here
+        mask_crop = self.topology_analyzer.extract_rough_mask_from_sharpened(sharpened, nms_vol)
+        
+        # Relaxed gate allows dimmer fibers through
+        mask_crop &= (v_map > 0.10)
         mask_crop = self._directional_gap_bridging(mask_crop, fiber_ev)
         
         min_vol = max(32, int((self.expected_fiber_radius ** 3) * 100))
         
-        # Cleanly suppress API deprecation warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
