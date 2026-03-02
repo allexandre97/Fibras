@@ -6,79 +6,25 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-import wandb  # <-- W&B Import
+import wandb
 
-from src.synthesis import SpaceColonizationGenerator, RandomWalkGenerator
-from src.core import ReflectiveBoundary
-from src.rasterization import NDimRasterizer
-from src.targets import TargetFieldGenerator
 from src.model import CVFUNet
 
-class SyntheticFiberDataset(Dataset):
-    def __init__(self, size: int, grid_size: int, seed_offset: int, mode: str = 'train'):
-        self.size = size
-        self.grid_size = grid_size
-        self.seed_offset = seed_offset
-        self.phenotypes = ["Highly Branched", "Directional", "Random Tangle"]
-        self.rasterizer = NDimRasterizer((grid_size, grid_size, grid_size), base_sigma=1.0)
-        self.target_gen = TargetFieldGenerator((grid_size, grid_size, grid_size), max_distance=5.0)
+class PrecomputedFiberDataset(Dataset):
+    def __init__(self, data_dir: str):
+        self.data_dir = data_dir
+        self.files = [f for f in os.listdir(data_dir) if f.endswith('.pt')]
+        if len(self.files) == 0:
+            raise FileNotFoundError(f"No .pt files found in {data_dir}")
 
     def __len__(self):
-        return self.size
-
-    def _generate_segments(self, phenotype: str, seed: int, N: int):
-        np.random.seed(seed)
-        grid_bounds = (N, N, N)
-        
-        dynamic_step = max(1.0, N * 0.012)
-        dynamic_kill = max(2.0, N * 0.015)
-        
-        if phenotype == "Highly Branched":
-            attractors = np.random.uniform(N * 0.1, N * 0.9, size=(int(N**3 * 0.0015), 3))
-            gen = SpaceColonizationGenerator(
-                attractors, root_pos=(N//2, N//2, N//2), step_length=dynamic_step,
-                attraction_distance=max(20.0, N * 0.25), kill_distance=dynamic_kill, 
-                bounds=grid_bounds, max_iterations=int(N * 75), thickness_decay=0.99
-            )
-            return gen.generate()
-
-        elif phenotype == "Directional":
-            num_attractors = int(N**2 * 0.15)
-            cyl_radius = max(10, N * 0.12)
-            attractors = np.zeros((num_attractors, 3))
-            attractors[:, 0] = np.random.uniform(N//2 - cyl_radius, N//2 + cyl_radius, num_attractors)
-            attractors[:, 1] = np.random.uniform(N//2 - cyl_radius, N//2 + cyl_radius, num_attractors)
-            attractors[:, 2] = np.random.uniform(N * 0.2, N * 0.9, num_attractors)
-            gen = SpaceColonizationGenerator(
-                attractors, root_pos=(N//2, N//2, N*0.1), step_length=dynamic_step,
-                attraction_distance=max(30.0, N * 0.35), kill_distance=dynamic_kill, 
-                bounds=grid_bounds, max_iterations=int(N * 75), thickness_decay=0.99
-            )
-            return gen.generate()
-
-        elif phenotype == "Random Tangle":
-            boundary = ReflectiveBoundary(grid_bounds)
-            gen = RandomWalkGenerator(
-                start_pos=(N//2, N//2, N//2), num_steps=int(N * 25), step_length=dynamic_step,
-                max_turn_angle=1.0, boundary=boundary
-            )
-            return gen.generate()
+        return len(self.files)
 
     def __getitem__(self, idx):
-        seed = self.seed_offset + idx
-        np.random.seed(seed)
-        phenotype = np.random.choice(self.phenotypes)
-        
-        segments = self._generate_segments(phenotype, seed, self.grid_size)
-        
-        volume = self.rasterizer.render(segments)
-        edt_target, vector_target = self.target_gen.generate(segments)
-        
-        volume = np.expand_dims(volume, axis=0)
-        edt_target = np.expand_dims(edt_target, axis=0)
-        targets = np.concatenate([edt_target, vector_target], axis=0)
-        
-        return torch.tensor(volume, dtype=torch.float32), torch.tensor(targets, dtype=torch.float32)
+        # Directly load the pre-computed mathematical tensors from disk
+        file_path = os.path.join(self.data_dir, self.files[idx])
+        data = torch.load(file_path, weights_only=True)
+        return data['volume'], data['targets']
 
 class MaskedVectorLoss(nn.Module):
     def __init__(self, vector_weight: float = 1.0):
@@ -100,7 +46,7 @@ class MaskedVectorLoss(nn.Module):
 
         return loss_edt + self.vector_weight * loss_vec
 
-def train_model(gpus: str):
+def train_model(gpus: str, data_dir: str):
     if gpus:
         os.environ["CUDA_VISIBLE_DEVICES"] = gpus
     else:
@@ -113,7 +59,6 @@ def train_model(gpus: str):
     if device.type == 'cuda':
         print(f"Allocated GPUs: {num_gpus_available} (Logical IDs: {list(range(num_gpus_available))})")
 
-    grid_size = 64 
     base_batch_size_per_gpu = 4
     batch_size = base_batch_size_per_gpu * max(1, num_gpus_available)
     epochs = 50
@@ -124,21 +69,43 @@ def train_model(gpus: str):
     wandb.init(
         project="fibras-cvfunet",
         config={
-            "grid_size": grid_size,
             "global_batch_size": batch_size,
             "base_batch_size_per_gpu": base_batch_size_per_gpu,
             "epochs": epochs,
             "learning_rate": lr,
             "vector_loss_weight": vector_loss_weight,
-            "num_gpus": num_gpus_available
+            "num_gpus": num_gpus_available,
+            "data_dir": data_dir
         }
     )
 
-    train_ds = SyntheticFiberDataset(size=2000, grid_size=grid_size, seed_offset=0, mode='train')
-    val_ds   = SyntheticFiberDataset(size=400, grid_size=grid_size, seed_offset=2000, mode='val')
+    # Point to the isolated splits generated by the offline script
+    train_dir = os.path.join(data_dir, "train")
+    val_dir = os.path.join(data_dir, "val")
+    
+    train_ds = PrecomputedFiberDataset(train_dir)
+    val_ds   = PrecomputedFiberDataset(val_dir)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4)
+    # High-Throughput DataLoader setup
+    train_loader = DataLoader(
+        train_ds, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=8,           # Parallel file reads
+        pin_memory=True,         # Locks RAM pages for fast async GPU transfer
+        prefetch_factor=4,       # Queues 4 batches per worker ahead of time
+        persistent_workers=True  # Avoids process teardown/spinup overhead per epoch
+    )
+    
+    val_loader = DataLoader(
+        val_ds, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=8,
+        pin_memory=True,
+        prefetch_factor=4,
+        persistent_workers=True
+    )
 
     model = CVFUNet(in_channels=1, base_filters=16)
 
@@ -150,7 +117,9 @@ def train_model(gpus: str):
     criterion = MaskedVectorLoss(vector_weight=vector_loss_weight)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     
-    # Watch model gradients and parameters with wandb
+    # Initialize Mixed Precision Scaler
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+
     wandb.watch(model, criterion, log="all", log_freq=20)
     
     best_val_loss = float('inf')
@@ -163,17 +132,30 @@ def train_model(gpus: str):
         t0 = time.time()
         
         for batch_idx, (inputs, targets) in enumerate(train_loader):
-            inputs, targets = inputs.to(device), targets.to(device)
+            # non_blocking=True allows the transfer to overlap with compute
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
             
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            optimizer.zero_grad(set_to_none=True)
             
-            if num_gpus_available > 1:
-                loss = loss.mean()
+            if scaler:
+                # AMP Block: Casts forward pass to bfloat16 for double throughput
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                    if num_gpus_available > 1:
+                        loss = loss.mean()
                 
-            loss.backward()
-            optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                if num_gpus_available > 1:
+                    loss = loss.mean()
+                loss.backward()
+                optimizer.step()
             
             train_loss += loss.item()
             
@@ -186,19 +168,26 @@ def train_model(gpus: str):
         val_loss = 0.0
         with torch.no_grad():
             for inputs, targets in val_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
+                inputs = inputs.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
                 
-                if num_gpus_available > 1:
-                    loss = loss.mean()
-                    
+                if scaler:
+                    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                        outputs = model(inputs)
+                        loss = criterion(outputs, targets)
+                        if num_gpus_available > 1:
+                            loss = loss.mean()
+                else:
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                    if num_gpus_available > 1:
+                        loss = loss.mean()
+                        
                 val_loss += loss.item()
                 
         val_loss /= len(val_loader)
         t_elapsed = time.time() - t0
         
-        # <-- W&B Metric Logging -->
         wandb.log({
             "epoch": epoch + 1,
             "train_loss": train_loss,
@@ -214,7 +203,6 @@ def train_model(gpus: str):
             save_path = f"weights/cvfunet_best.pth"
             torch.save(state_dict, save_path)
             
-            # <-- W&B Model Artifact Saving -->
             wandb.save(save_path)
             print("   [Model Checkpoint Saved & Synced to W&B]")
 
@@ -222,9 +210,11 @@ def train_model(gpus: str):
     print("Training Complete.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train CVFUNet on Synthetic Fibers")
+    parser = argparse.ArgumentParser(description="Train CVFUNet on Precomputed Synthetic Fibers")
     parser.add_argument('--gpus', type=str, default="0", 
-                        help='Comma-separated string of GPU IDs (e.g., "0,1" or "1,3"). Pass an empty string "" to run on CPU.')
+                        help='Comma-separated string of GPU IDs (e.g., "0,1"). Pass "" to run on CPU.')
+    parser.add_argument('--data_dir', type=str, required=True, 
+                        help='Path to the directory containing the precomputed dataset (should contain train and val subfolders).')
     args = parser.parse_args()
     
-    train_model(args.gpus)
+    train_model(args.gpus, args.data_dir)
