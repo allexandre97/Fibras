@@ -147,7 +147,6 @@ class EmpiricalRasterizer:
         self.gap_prob = gap_prob          
 
     def render(self, segments):
-        np.random.seed(42)
         valid_idx = np.random.rand(len(segments)) > self.gap_prob
         valid_segments = [seg for i, seg in enumerate(segments) if valid_idx[i]]
 
