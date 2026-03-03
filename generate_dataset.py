@@ -13,17 +13,13 @@ from src.targets import TargetFieldGenerator
 PHENOTYPES = ["Highly Branched", "Directional", "Random Tangle"]
 
 def _generate_flexible_segments(phenotype: str, seed: int, bounds: tuple):
-    """
-    Dimension-agnostic synthesis logic.
-    bounds is expected in (Z, Y, X) format.
-    """
     np.random.seed(seed)
     
-    Z, Y, X = bounds
+    # Mathematical boundaries map strictly to X, Y, Z
+    X, Y, Z = bounds
     is_2d = (Z == 1)
     max_dim = max(bounds)
     
-    # Scale dynamics dynamically to the largest spatial dimension
     dynamic_step = max(1.0, max_dim * 0.012)
     dynamic_kill = max(2.0, max_dim * 0.015)
     
@@ -77,13 +73,11 @@ def process_single_sample(idx: int, seed_offset: int, bounds: tuple, output_dir:
     np.random.seed(seed)
     phenotype = np.random.choice(PHENOTYPES)
     
-    # 1. Synthesize exact mathematical geometry constrained to dimensions
     segments = _generate_flexible_segments(phenotype, seed, bounds)
     
-    # 2. Domain Randomization (Sim2Real mapping)
-    is_2d = (bounds[0] == 1)
+    is_2d = (bounds[2] == 1)
     
-    # 2D STED has no Z-anisotropy. 3D Confocal suffers from elongated PSFs.
+    # Isolate Z-anisotropy to 3D networks only
     sim_z_aniso = 1.0 if is_2d else np.random.uniform(1.0, 4.0)
     sim_noise = np.random.uniform(0.01, 0.15)
     sim_debris = np.random.randint(5, 45)
@@ -100,11 +94,17 @@ def process_single_sample(idx: int, seed_offset: int, bounds: tuple, output_dir:
     
     target_gen = TargetFieldGenerator(bounds, max_distance=5.0)
     
-    # 3. Render
+    # 1. Arrays synthesized in (X, Y, Z) structure
     volume = rasterizer.render(segments)
     edt_target, vector_target = target_gen.generate(segments)
     
-    # 4. Tensor formatting
+    # 2. PyTorch Standardizing Transposition: (X, Y, Z) -> (Z, Y, X)
+    volume = volume.transpose(2, 1, 0)
+    edt_target = edt_target.transpose(2, 1, 0)
+    # Vector maps have shape (3, X, Y, Z). Transpose spatial dims to (3, Z, Y, X)
+    vector_target = vector_target.transpose(0, 3, 2, 1)
+    
+    # 3. Serialize
     volume_tensor = torch.tensor(np.expand_dims(volume, axis=0), dtype=torch.float32)
     edt_tensor = torch.tensor(np.expand_dims(edt_target, axis=0), dtype=torch.float32)
     vec_tensor = torch.tensor(vector_target, dtype=torch.float32)
@@ -141,37 +141,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Offline Generator for Flexible Synthetic Fiber Datasets")
     parser.add_argument('--output_dir', type=str, required=True, help="Base directory to save the dataset")
     parser.add_argument('--bounds', type=int, nargs='+', default=[64, 64, 64], 
-                        help="Spatial resolution: '64 64 64' for 3D, '1 256 256' for 2D STED.")
-    parser.add_argument('--train_size', type=int, default=2000, help="Number of training samples")
-    parser.add_argument('--val_size', type=int, default=400, help="Number of validation samples")
-    parser.add_argument('--test_size', type=int, default=400, help="Number of test samples")
-    parser.add_argument('--workers', type=int, default=os.cpu_count(), help="Number of CPU cores to utilize")
+                        help="Spatial resolution: '64 64 64' for 3D, '256 256 1' for 2D STED.")
+    parser.add_argument('--train_size', type=int, default=2000)
+    parser.add_argument('--val_size', type=int, default=400)
+    parser.add_argument('--test_size', type=int, default=400)
+    parser.add_argument('--workers', type=int, default=os.cpu_count())
     args = parser.parse_args()
 
-    # 1. Dimensionality Standardization
     dims = len(args.bounds)
     if dims == 2:
-        args.bounds = [1, args.bounds[0], args.bounds[1]]
+        args.bounds = [args.bounds[0], args.bounds[1], 1]
     elif dims != 3:
-        raise ValueError("Bounds must be either 2 (Y, X) or 3 (Z, Y, X) integers.")
+        raise ValueError("Bounds must be either 2 (X, Y) or 3 (X, Y, Z) integers.")
         
     bounds_tuple = tuple(args.bounds)
 
-    # 2. Striding Validation (U-Net Max Pooling constraints)
-    for b in bounds_tuple:
-        if b > 1 and b % 4 != 0:
-            raise ValueError(f"Spatial boundaries > 1 must be divisible by 4. Got {bounds_tuple}")
-
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # 3. Deterministic Splitting
     build_dataset_split("train", args.train_size, seed_offset=0, 
                         bounds=bounds_tuple, base_dir=args.output_dir, workers=args.workers)
-    
     build_dataset_split("val", args.val_size, seed_offset=args.train_size, 
                         bounds=bounds_tuple, base_dir=args.output_dir, workers=args.workers)
-    
-    build_dataset_split("test", args.test_size, seed_offset=(args.train_size + args.val_size), 
-                        bounds=bounds_tuple, base_dir=args.output_dir, workers=args.workers)
-    
-    print(f"\nDataset fully synthesized at: {args.output_dir}")

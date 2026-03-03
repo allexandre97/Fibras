@@ -137,9 +137,9 @@ class NDimRasterizer:
     
 
 class EmpiricalRasterizer:
-    """Synthesizes empirical microscopy artifacts: Anisotropy, Noise, Debris, and Gaps."""
     def __init__(self, bounds, base_sigma=1.0, z_anisotropy=3.0, noise_level=0.1, debris_count=30, gap_prob=0.08):
-        self.bounds = bounds
+        # bounds expected strictly as (X, Y, Z)
+        self.bounds = bounds 
         self.base_sigma = base_sigma
         self.z_anisotropy = z_anisotropy  
         self.noise_level = noise_level    
@@ -153,21 +153,20 @@ class EmpiricalRasterizer:
         base_rasterizer = NDimRasterizer(self.bounds, self.base_sigma)
         volume = base_rasterizer.render(valid_segments)
 
-        # CORRECTED: Only stretch the Z-axis. Leave the already-rendered XY plane sharp.
-        psf_sigma = (self.base_sigma * self.z_anisotropy, 
+        # Mapping PSF sigma to the (X, Y, Z) array layout
+        psf_sigma = (self.base_sigma * 0.1, 
                      self.base_sigma * 0.1, 
-                     self.base_sigma * 0.1)
+                     self.base_sigma * self.z_anisotropy)
         
         volume = ndi.gaussian_filter(volume, sigma=psf_sigma)
         if volume.max() > 0:
             volume /= volume.max()
 
-        # CORRECTED: Debris is constrained to a realistic 2.5x multiplier of the base fiber
         debris_sigma = self.base_sigma * 2.5
         for _ in range(self.debris_count):
-            z, y, x = [np.random.randint(0, b) for b in self.bounds]
+            x, y, z = [np.random.randint(0, b) for b in self.bounds]
             blob = np.zeros(self.bounds)
-            blob[z, y, x] = 1.0
+            blob[x, y, z] = 1.0
             blob = ndi.gaussian_filter(blob, sigma=debris_sigma)
             if blob.max() > 0:
                 volume += (blob / blob.max()) * 0.85 
