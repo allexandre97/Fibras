@@ -1,33 +1,59 @@
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 import math
 import numpy as np
-from typing import List
 from scipy.spatial import cKDTree
 from src.core import BaseGenerator, FiberSegment, BoundaryCondition
 
 
 class RandomWalkGenerator(BaseGenerator):
-    def __init__(self, start_pos: Tuple[float, ...], num_steps: int, 
-                 step_length: float, max_turn_angle: float, boundary: BoundaryCondition):
+    def __init__(
+        self,
+        start_pos: Tuple[float, ...],
+        num_steps: int,
+        step_length: float,
+        max_turn_angle: float,
+        boundary: BoundaryCondition,
+        initial_direction: Optional[np.ndarray] = None,
+        orthogonal_scale: Optional[np.ndarray] = None,
+    ):
         self.start_pos = np.array(start_pos, dtype=float)
         self.dims = self.start_pos.shape[0]
         self.num_steps = num_steps
         self.step_length = step_length
         self.max_turn_angle = max_turn_angle
         self.boundary = boundary
+        self.initial_direction = None if initial_direction is None else np.array(initial_direction, dtype=float)
+        self.orthogonal_scale = None if orthogonal_scale is None else np.array(orthogonal_scale, dtype=float)
 
     def _get_random_orthogonal_vector(self, v: np.ndarray) -> np.ndarray:
         r = np.random.normal(size=self.dims)
+        if self.orthogonal_scale is not None:
+            r *= self.orthogonal_scale
         u = r - (np.dot(r, v) / np.dot(v, v)) * v
         norm = np.linalg.norm(u)
-        return u / norm if norm > 1e-8 else np.random.normal(size=self.dims)
+        if norm > 1e-8:
+            return u / norm
+
+        fallback = np.random.normal(size=self.dims)
+        if self.orthogonal_scale is not None:
+            fallback *= self.orthogonal_scale
+        fallback = fallback - (np.dot(fallback, v) / np.dot(v, v)) * v
+        fallback_norm = np.linalg.norm(fallback)
+        return fallback / fallback_norm if fallback_norm > 1e-8 else v.copy()
 
     def generate(self) -> List[FiberSegment]:
         segments = []
         current_pos = self.start_pos.copy()
         
-        current_dir = np.random.normal(size=self.dims)
-        current_dir /= np.linalg.norm(current_dir)
+        if self.initial_direction is None:
+            current_dir = np.random.normal(size=self.dims)
+        else:
+            current_dir = self.initial_direction.copy()
+        current_dir_norm = np.linalg.norm(current_dir)
+        if current_dir_norm < 1e-8:
+            current_dir = np.random.normal(size=self.dims)
+            current_dir_norm = np.linalg.norm(current_dir)
+        current_dir /= current_dir_norm
 
         is_alive = True
         steps_taken = 0
