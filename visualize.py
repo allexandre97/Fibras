@@ -1,9 +1,9 @@
-import os
 import argparse
-import torch
-import numpy as np
+import os
 
 def show_synthetic_data(pt_path: str):
+    import torch
+
     try:
         import napari
     except ImportError:
@@ -11,56 +11,97 @@ def show_synthetic_data(pt_path: str):
         return
 
     print(f"Loading tensor from: {pt_path}")
-    
-    # Force CPU mapping to prevent unnecessary VRAM allocation during visualization
-    data = torch.load(pt_path, map_location='cpu', weights_only=True)
-    
-    # Extract the synthetic microscopy volume (Shape: 1, Z, Y, X)
-    volume = data['volume'].squeeze(0).numpy()
-    
-    # Extract the EDT target to act as a ground-truth centerline overlay
-    edt = data['targets'][0].numpy()
-    
-    # Dimension resolution
+
+    data = torch.load(pt_path, map_location="cpu", weights_only=True)
+    volume = data["volume"].squeeze(0).numpy()
+    edt = data["targets"][0].numpy()
+
     is_2d = volume.shape[0] == 1
     dim_str = "2D STED" if is_2d else "3D Confocal"
-    
+
     if is_2d:
-        # Strip the Z-axis for strict 2D planar rendering in Napari
         volume = volume.squeeze(0)
         edt = edt.squeeze(0)
-        
+
     print(f"Render Mode: {dim_str} | Array Shape: {volume.shape}")
 
-    # Initialize the Viewer
     viewer = napari.Viewer(title=f"Fibras Dataset Viewer - {dim_str}")
-    
-    # 1. Main Synthetic Microscopy Layer
     viewer.add_image(
-        volume, 
-        name='Synthetic Microscopy Data', 
-        colormap='magma', 
-        blending='additive'
+        volume,
+        name="Synthetic Microscopy Data",
+        colormap="magma",
+        blending="additive",
     )
-    
-    # 2. Ground Truth Centerline Layer (Hidden by default)
-    # The EDT is normalized to [0, 1] where 1.0 is the exact core of the fiber.
+
     centerline_mask = edt > 0.85
     viewer.add_labels(
-        centerline_mask.astype(int), 
-        name='Ground Truth Centerlines', 
+        centerline_mask.astype(int),
+        name="Ground Truth Centerlines",
         visible=False,
-        opacity=0.7
+        opacity=0.7,
     )
 
     napari.run()
 
+
+def show_sted_debug(bounds, synth_depth, label_slab_thickness, seed=None, save_path=None, show=True):
+    from generate_dataset import build_sted_debug_sample
+    from src.visualization import StedSynthesisVisualizer
+
+    debug_data = build_sted_debug_sample(
+        tuple(bounds),
+        synth_depth=synth_depth,
+        label_slab_thickness=label_slab_thickness,
+        seed=seed,
+    )
+    StedSynthesisVisualizer.show_sted_debug_summary(
+        debug_data,
+        save_path=save_path,
+        show=show,
+    )
+
+    print(
+        "Generated STED debug sample "
+        f"(bounds={debug_data['bounds']}, slice_center={debug_data['slice_center']:.2f}, "
+        f"projected_segments={debug_data['projected_segment_count']})."
+    )
+    if save_path is not None:
+        print(f"Saved debug summary to: {save_path}")
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Visualize Synthetic Microscopy Datasets")
-    parser.add_argument('--file', type=str, required=True, help="Path to a specific .pt dataset file")
+    parser = argparse.ArgumentParser(description="Visualize saved samples or inspect STED synthesis internals")
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument("--file", type=str, help="Path to a specific .pt dataset file")
+    mode_group.add_argument(
+        "--sted-debug",
+        action="store_true",
+        help="Synthesize one 2D STED sample and show the intermediate 3D-to-2D formation stages.",
+    )
+
+    parser.add_argument("--bounds", type=int, nargs=2, default=[64, 64], help="XY bounds for --sted-debug mode")
+    parser.add_argument("--synth_depth", type=int, default=16, help="Internal z depth for --sted-debug mode")
+    parser.add_argument(
+        "--label_slab_thickness",
+        type=float,
+        default=1.5,
+        help="Label slab thickness in voxels for --sted-debug mode",
+    )
+    parser.add_argument("--seed", type=int, default=None, help="Optional RNG seed for --sted-debug mode")
+    parser.add_argument("--save", type=str, default=None, help="Optional path to save the STED debug summary figure")
+    parser.add_argument("--no-show", action="store_true", help="Do not open the STED debug figure interactively")
     args = parser.parse_args()
-    
-    if not os.path.exists(args.file):
-        raise FileNotFoundError(f"Dataset file not found: {args.file}")
-        
-    show_synthetic_data(args.file)
+
+    if args.file:
+        if not os.path.exists(args.file):
+            raise FileNotFoundError(f"Dataset file not found: {args.file}")
+        show_synthetic_data(args.file)
+    else:
+        show_sted_debug(
+            bounds=args.bounds,
+            synth_depth=args.synth_depth,
+            label_slab_thickness=args.label_slab_thickness,
+            seed=args.seed,
+            save_path=args.save,
+            show=not args.no_show,
+        )

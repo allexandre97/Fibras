@@ -1,5 +1,5 @@
 import numpy as np
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numba as nb
 import scipy.ndimage as ndi
@@ -135,6 +135,19 @@ class EmpiricalRasterizer:
         self.debris_count = debris_count
         self.gap_prob = gap_prob
 
+    def _sted_optical_section_params(self) -> Tuple[float, float, float]:
+        depth_of_field = max(0.75, self.base_sigma * self.z_anisotropy)
+        focus_sigma = max(0.20, self.base_sigma * 0.35)
+        defocus_slope = self.base_sigma / depth_of_field
+        return depth_of_field, focus_sigma, defocus_slope
+
+    def _sted_defocus_response(self, defocus_distance: float) -> Tuple[float, float]:
+        depth_of_field, focus_sigma, defocus_slope = self._sted_optical_section_params()
+        abs_defocus = abs(defocus_distance)
+        lateral_sigma = np.hypot(focus_sigma, defocus_slope * abs_defocus)
+        axial_weight = 1.0 / (1.0 + (abs_defocus / depth_of_field) ** 2)
+        return lateral_sigma, axial_weight
+
     def _rasterize_signal_volume(self, list_of_segment_lists, dynamic_range):
         volume = np.zeros(self.bounds, dtype=np.float64)
         base_rasterizer = NDimRasterizer(self.bounds, self.base_sigma)
@@ -220,29 +233,62 @@ class EmpiricalRasterizer:
         vignette = edge_brightness + (1.0 - edge_brightness) * (vignette / vignette.max())
         return volume * vignette
 
-    def _collapse_volume_to_slice(self, volume, slice_center):
-        slice_image = np.zeros(self.bounds[:2], dtype=np.float64)
-        axial_sigma = max(1.25, self.z_anisotropy * 0.8)
+    def _collapse_volume_to_slice_components(self, volume, slice_center):
+        weighted_slice = np.zeros(self.bounds[:2], dtype=np.float64)
+        defocus_only_slice = np.zeros(self.bounds[:2], dtype=np.float64)
         weight_sum = 0.0
+        defocus_weight_sum = 0.0
+        axial_weights = np.zeros(self.bounds[2], dtype=np.float64)
+        axial_signal_profile = np.zeros(self.bounds[2], dtype=np.float64)
+        lateral_sigmas = np.zeros(self.bounds[2], dtype=np.float64)
+        depth_of_field, focus_sigma, _ = self._sted_optical_section_params()
+        focus_index = int(np.clip(round(slice_center), 0, self.bounds[2] - 1))
 
         for z_index in range(self.bounds[2]):
-            dz = abs(z_index - slice_center)
-            weight = np.exp(-0.5 * (dz / axial_sigma) ** 2)
-            blur_sigma = self.base_sigma * (0.30 + 0.55 * dz)
+            dz = z_index - slice_center
+            blur_sigma, weight = self._sted_defocus_response(dz)
 
             plane = volume[:, :, z_index]
             if blur_sigma > 1e-6:
                 plane = ndi.gaussian_filter(plane, sigma=blur_sigma)
 
-            slice_image += plane * weight
+            contribution = plane * weight
+            weighted_slice += contribution
             weight_sum += weight
 
-        if weight_sum > 0:
-            slice_image /= weight_sum
+            if z_index != focus_index:
+                defocus_only_slice += contribution
+                defocus_weight_sum += weight
 
-        focus_index = int(np.clip(round(slice_center), 0, self.bounds[2] - 1))
-        slice_image = (0.85 * slice_image) + (0.15 * volume[:, :, focus_index])
-        return np.clip(slice_image, 0, 1)
+            axial_weights[z_index] = weight
+            axial_signal_profile[z_index] = volume[:, :, z_index].sum()
+            lateral_sigmas[z_index] = blur_sigma
+
+        if weight_sum > 0:
+            weighted_slice /= weight_sum
+
+        if defocus_weight_sum > 0:
+            defocus_only_slice /= defocus_weight_sum
+
+        focus_plane = np.clip(volume[:, :, focus_index], 0, 1)
+        blended_slice = np.clip(weighted_slice, 0, 1)
+
+        return {
+            "weighted_slice": np.clip(weighted_slice, 0, 1),
+            "defocus_only_slice": np.clip(defocus_only_slice, 0, 1),
+            "focus_plane": focus_plane,
+            "blended_slice": blended_slice,
+            "axial_weights": axial_weights,
+            "axial_signal_profile": axial_signal_profile,
+            "lateral_sigmas": lateral_sigmas,
+            "focus_index": focus_index,
+            "slice_center": slice_center,
+            "depth_of_field": depth_of_field,
+            "focus_sigma": focus_sigma,
+        }
+
+    def _collapse_volume_to_slice(self, volume, slice_center):
+        return self._collapse_volume_to_slice_components(volume, slice_center)["blended_slice"]
 
     def _add_2d_debris(self, image, dynamic_range):
         debris_count = max(1, self.debris_count // 4)
@@ -310,6 +356,19 @@ class EmpiricalRasterizer:
         slice_image = self._apply_2d_vignette(slice_image)
         slice_image = self._add_noise(slice_image)
         return np.clip(slice_image, 0, 1)
+
+    def render_sted_slice_debug(self, list_of_segment_lists, slice_center, dynamic_range=(0.2, 1.0)) -> Dict[str, np.ndarray]:
+        signal_volume = self._rasterize_signal_volume(list_of_segment_lists, dynamic_range)
+        slice_components = self._collapse_volume_to_slice_components(signal_volume, slice_center)
+        final_slice = self._add_2d_debris(slice_components["blended_slice"].copy(), dynamic_range)
+        final_slice = self._apply_2d_striping(final_slice)
+        final_slice = self._apply_2d_vignette(final_slice)
+        final_slice = self._add_noise(final_slice)
+
+        debug_data = dict(slice_components)
+        debug_data["signal_volume"] = signal_volume
+        debug_data["final_slice"] = np.clip(final_slice, 0, 1)
+        return debug_data
 
     def render(self, list_of_segment_lists, dynamic_range=(0.2, 1.0)):
         return self.render_volume(list_of_segment_lists, dynamic_range=dynamic_range, add_haze=True)

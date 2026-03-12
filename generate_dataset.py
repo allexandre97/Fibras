@@ -4,7 +4,6 @@ import os
 from functools import partial
 
 import numpy as np
-import torch
 
 from src.core import FiberSegment, ReflectiveBoundary
 from src.rasterization import EmpiricalRasterizer
@@ -286,7 +285,7 @@ def _project_segments_to_label_slab(core_segments, slice_center, slab_thickness)
     return projected_segments
 
 
-def _build_2d_sample(bounds: tuple, label_slab_thickness: float):
+def _prepare_2d_sted_scene(bounds: tuple, label_slab_thickness: float):
     x_size, y_size, z_size = bounds
 
     optical_bundle_lists = []
@@ -338,9 +337,61 @@ def _build_2d_sample(bounds: tuple, label_slab_thickness: float):
     )
     target_gen = TargetFieldGenerator((x_size, y_size), max_distance=TARGET_MAX_DISTANCE)
 
-    image = rasterizer.render_sted_slice(optical_bundle_lists, slice_center=slice_center, dynamic_range=(img_min, img_max))
-    edt_target, vector_target = target_gen.generate(projected_segments)
+    return {
+        "bounds": bounds,
+        "optical_bundle_lists": optical_bundle_lists,
+        "core_segments": core_segments_flat,
+        "projected_segments": projected_segments,
+        "slice_center": slice_center,
+        "label_slab_thickness": label_slab_thickness,
+        "dynamic_range": (img_min, img_max),
+        "rasterizer": rasterizer,
+        "target_gen": target_gen,
+    }
+
+
+def _build_2d_sample(bounds: tuple, label_slab_thickness: float):
+    scene = _prepare_2d_sted_scene(bounds, label_slab_thickness)
+    image = scene["rasterizer"].render_sted_slice(
+        scene["optical_bundle_lists"],
+        slice_center=scene["slice_center"],
+        dynamic_range=scene["dynamic_range"],
+    )
+    edt_target, vector_target = scene["target_gen"].generate(scene["projected_segments"])
     return image, edt_target, vector_target
+
+
+def build_sted_debug_sample(bounds: tuple, synth_depth: int = 16, label_slab_thickness: float = 1.5, seed: int = None):
+    if len(bounds) == 2:
+        synth_bounds = (bounds[0], bounds[1], synth_depth)
+    elif len(bounds) == 3:
+        synth_bounds = bounds
+    else:
+        raise ValueError("Bounds must contain either 2 or 3 integers.")
+
+    if synth_bounds[2] < 2:
+        raise ValueError("STED debug samples require a synth depth of at least 2.")
+
+    if seed is not None:
+        np.random.seed(seed)
+
+    scene = _prepare_2d_sted_scene(synth_bounds, label_slab_thickness)
+    debug_render = scene["rasterizer"].render_sted_slice_debug(
+        scene["optical_bundle_lists"],
+        slice_center=scene["slice_center"],
+        dynamic_range=scene["dynamic_range"],
+    )
+    edt_target, vector_target = scene["target_gen"].generate(scene["projected_segments"])
+
+    debug_render["bounds"] = synth_bounds
+    debug_render["label_slab_thickness"] = label_slab_thickness
+    debug_render["edt_target"] = edt_target
+    debug_render["vector_target"] = vector_target
+    debug_render["projected_segments"] = scene["projected_segments"]
+    debug_render["core_segments"] = scene["core_segments"]
+    debug_render["fiber_count"] = len(scene["optical_bundle_lists"])
+    debug_render["projected_segment_count"] = len(scene["projected_segments"])
+    return debug_render
 
 
 def _build_3d_sample(bounds: tuple):
@@ -390,6 +441,8 @@ def _build_3d_sample(bounds: tuple):
 
 
 def _to_2d_tensors(image, edt_target, vector_target):
+    import torch
+
     image = image.transpose(1, 0)
     edt_target = edt_target.transpose(1, 0)
     vector_target = vector_target.transpose(0, 2, 1)
@@ -405,6 +458,8 @@ def _to_2d_tensors(image, edt_target, vector_target):
 
 
 def _to_3d_tensors(volume, edt_target, vector_target):
+    import torch
+
     volume = volume.transpose(2, 1, 0)
     edt_target = edt_target.transpose(2, 1, 0)
     vector_target = vector_target.transpose(0, 3, 2, 1)
@@ -417,6 +472,8 @@ def _to_3d_tensors(volume, edt_target, vector_target):
 
 
 def process_single_sample(idx: int, file_offset: int, bounds: tuple, output_dir: str, emit_2d: bool, label_slab_thickness: float):
+    import torch
+
     np.random.seed(None)
 
     if emit_2d:
