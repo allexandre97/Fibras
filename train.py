@@ -4,6 +4,7 @@ import argparse
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import wandb
@@ -28,18 +29,19 @@ class PrecomputedFiberDataset(Dataset):
         
         if self.dim == 2:
             vol = vol.squeeze(1)
-            targets = targets[[0, 1, 2], 0, :, :]
+            targets = targets[:, 0, :, :]
             
         return vol, targets
 
 class MaskedVectorLoss(nn.Module):
-    def __init__(self, vector_weight: float = 1.0, dim: int = 3):
+    def __init__(self, vector_weight: float = 1.0, visibility_weight: float = 0.35, dim: int = 3):
         super().__init__()
         self.mse = nn.MSELoss(reduction='none')
         self.vector_weight = vector_weight
+        self.visibility_weight = visibility_weight
         self.dim = dim
 
-    def forward(self, pred, target):
+    def compute_components(self, pred, target):
         pred_edt, pred_vec = pred[:, 0:1], pred[:, 1:1+self.dim]
         targ_edt, targ_vec = target[:, 0:1], target[:, 1:1+self.dim]
 
@@ -59,7 +61,24 @@ class MaskedVectorLoss(nn.Module):
         mask_sum = mask.sum() + 1e-8 
         loss_vec = loss_vec_raw.sum() / mask_sum
 
-        return loss_edt + self.vector_weight * loss_vec
+        components = {
+            "edt": loss_edt,
+            "vector": loss_vec,
+        }
+
+        if self.dim == 2:
+            pred_visibility = pred[:, 3:4]
+            targ_visibility = target[:, 3:4]
+            components["visibility"] = F.binary_cross_entropy_with_logits(pred_visibility, targ_visibility)
+
+        return components
+
+    def forward(self, pred, target):
+        components = self.compute_components(pred, target)
+        total_loss = components["edt"] + self.vector_weight * components["vector"]
+        if self.dim == 2:
+            total_loss = total_loss + self.visibility_weight * components["visibility"]
+        return total_loss
 
 def train_model(args):
     if args.gpus:
@@ -95,7 +114,11 @@ def train_model(args):
         
     model = model.to(device)
     
-    criterion = MaskedVectorLoss(vector_weight=args.vector_loss_weight, dim=args.dim)
+    criterion = MaskedVectorLoss(
+        vector_weight=args.vector_loss_weight,
+        visibility_weight=args.visibility_loss_weight,
+        dim=args.dim,
+    )
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
@@ -178,6 +201,7 @@ if __name__ == "__main__":
     parser.add_argument('--learning_rate', type=float, required=True)
     parser.add_argument('--weight_decay', type=float, required=True)
     parser.add_argument('--vector_loss_weight', type=float, required=True)
+    parser.add_argument('--visibility_loss_weight', type=float, default=0.35)
     
     args = parser.parse_args()
     train_model(args)

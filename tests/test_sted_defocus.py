@@ -39,6 +39,7 @@ class StedDefocusModelTests(unittest.TestCase):
         self.assertGreater(components["defocus_only_slice"][off_focus_xy], 0.0)
         self.assertGreater(components["lateral_sigmas"][1], components["lateral_sigmas"][4])
         self.assertLess(components["axial_weights"][1], components["axial_weights"][4])
+        self.assertAlmostEqual(components["axial_fwhm"], 2.0 * components["depth_of_field"])
 
 
 if __name__ == "__main__":

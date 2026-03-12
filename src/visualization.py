@@ -103,7 +103,16 @@ class StedSynthesisVisualizer:
         return canvas
 
     @staticmethod
-    def _make_pil_profile_panel(axial_signal, axial_weights, lateral_sigmas, slice_center, slab_thickness, depth, tile_size=256):
+    def _make_pil_profile_panel(
+        axial_signal,
+        axial_weights,
+        lateral_sigmas,
+        slice_center,
+        slab_thickness,
+        axial_fwhm,
+        depth,
+        tile_size=256,
+    ):
         from PIL import Image, ImageDraw
 
         panel = Image.new("RGB", (tile_size, tile_size + 28), color=(18, 18, 18))
@@ -129,6 +138,10 @@ class StedSynthesisVisualizer:
 
         slab_left = left + ((slice_center - (slab_thickness / 2.0)) / max(depth - 1, 1)) * width
         slab_right = left + ((slice_center + (slab_thickness / 2.0)) / max(depth - 1, 1)) * width
+        fwhm_left = left + ((slice_center - (axial_fwhm / 2.0)) / max(depth - 1, 1)) * width
+        fwhm_right = left + ((slice_center + (axial_fwhm / 2.0)) / max(depth - 1, 1)) * width
+
+        draw.rectangle((fwhm_left, top, fwhm_right, top + height), outline=(220, 200, 90), width=1)
         draw.rectangle((slab_left, top, slab_right, top + height), fill=(40, 90, 40), outline=None)
 
         draw.line(to_canvas_points(signal_norm), fill=(255, 160, 40), width=2)
@@ -139,7 +152,7 @@ class StedSynthesisVisualizer:
         draw.line((slice_x, top, slice_x, top + height), fill=(255, 255, 255), width=1)
 
         legend_y = tile_size + 4
-        draw.text((6, legend_y), "orange=signal  blue=weight  red=blur  white=slice", fill=(235, 235, 235))
+        draw.text((6, legend_y), "orange=signal blue=weight red=blur yellow=fwhm green=slab", fill=(235, 235, 235))
         return panel
 
     @staticmethod
@@ -148,6 +161,7 @@ class StedSynthesisVisualizer:
 
         signal_volume = debug_data["signal_volume"]
         edt_target = debug_data["edt_target"]
+        visibility_target = debug_data["visibility_target"]
         panels = [
             StedSynthesisVisualizer._make_pil_image_panel(
                 signal_volume.max(axis=2),
@@ -167,8 +181,8 @@ class StedSynthesisVisualizer:
                 segments=debug_data["projected_segments"],
             ),
             StedSynthesisVisualizer._make_pil_image_panel(
-                edt_target,
-                f"EDT Target | slab={debug_data['label_slab_thickness']:.2f}",
+                visibility_target,
+                f"Visibility Target | slab={debug_data['label_slab_thickness']:.2f}",
                 mask=edt_target > 0.85,
             ),
             StedSynthesisVisualizer._make_pil_profile_panel(
@@ -177,6 +191,7 @@ class StedSynthesisVisualizer:
                 debug_data["lateral_sigmas"],
                 debug_data["slice_center"],
                 debug_data["label_slab_thickness"],
+                debug_data["axial_fwhm"],
                 signal_volume.shape[2],
             ),
         ]
@@ -209,12 +224,14 @@ class StedSynthesisVisualizer:
         focus_plane = debug_data["focus_plane"]
         final_slice = debug_data["final_slice"]
         edt_target = debug_data["edt_target"]
+        visibility_target = debug_data["visibility_target"]
         axial_weights = debug_data["axial_weights"]
         axial_signal = debug_data["axial_signal_profile"]
         lateral_sigmas = debug_data["lateral_sigmas"]
         slice_center = debug_data["slice_center"]
         focus_index = debug_data["focus_index"]
         slab_thickness = debug_data["label_slab_thickness"]
+        axial_fwhm = debug_data["axial_fwhm"]
         projected_segments = debug_data["projected_segments"]
 
         mip_xy = signal_volume.max(axis=2)
@@ -256,8 +273,8 @@ class StedSynthesisVisualizer:
 
         StedSynthesisVisualizer._show_xy(
             axes[4],
-            edt_target,
-            f"2D EDT Target\nslab={slab_thickness:.2f} px, projected={debug_data['projected_segment_count']}",
+            visibility_target,
+            f"Visibility Target\nslab={slab_thickness:.2f} px, visible={debug_data['visibility_segment_count']}",
             cmap="viridis",
             vmin=0.0,
             vmax=1.0,
@@ -274,11 +291,18 @@ class StedSynthesisVisualizer:
         axes[5].plot(z_axis, normalized_blur, label="relative blur", color="tab:red", linewidth=2.0)
         axes[5].axvline(slice_center, color="black", linestyle="--", linewidth=1.0, label="slice center")
         axes[5].axvspan(
+            slice_center - (axial_fwhm / 2.0),
+            slice_center + (axial_fwhm / 2.0),
+            color="gold",
+            alpha=0.15,
+            label="axial FWHM",
+        )
+        axes[5].axvspan(
             slice_center - (slab_thickness / 2.0),
             slice_center + (slab_thickness / 2.0),
             color="tab:green",
             alpha=0.2,
-            label="label slab",
+            label="focus slab",
         )
         axes[5].set_title("Axial Profile")
         axes[5].set_xlabel("z")

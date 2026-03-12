@@ -73,19 +73,24 @@ def main(args):
     pred = pred.squeeze(0).cpu().float().numpy()
     
     # 5. Pad Cropping
+    visibility_map = None
     if args.dim == 2:
         H, W = orig_spatial_dims
         edt_map = pred[0, :H, :W]
-        vector_map = pred[1:, :H, :W]
+        vector_map = pred[1:3, :H, :W]
+        visibility_logits = np.clip(pred[3, :H, :W], -20.0, 20.0)
+        visibility_map = 1.0 / (1.0 + np.exp(-visibility_logits))
+        edt_for_tracking = edt_map * np.clip(visibility_map, args.visibility_floor, 1.0)
     else:
         Z, Y, X = orig_spatial_dims
         edt_map = pred[0, :Z, :Y, :X]
         vector_map = pred[1:, :Z, :Y, :X]
+        edt_for_tracking = edt_map
         
     # 6. Tractography in Downsampled Space
     print("Initiating structural tractography...")
     tracker = StreamlineTracker(step_size=0.5, min_edt=args.min_edt)
-    streamlines = tracker.track(edt_map, vector_map)
+    streamlines = tracker.track(edt_for_tracking, vector_map)
     print(f"Successfully traced {len(streamlines)} fiber segments.")
     
     # 7. Coordinate Rescaling & High-Res Burning
@@ -102,7 +107,7 @@ def main(args):
     # 8. Visualization
     if args.visualize:
         # Scale EDT mask up for visualization overlay matching
-        vis_mask = (edt_map > args.min_edt).astype(np.float32)
+        vis_mask = (edt_for_tracking > args.min_edt).astype(np.float32)
         vis_mask_tensor = torch.tensor(vis_mask).unsqueeze(0).unsqueeze(0)
         mode = 'bilinear' if args.dim == 2 else 'nearest'
         vis_mask_up = F.interpolate(vis_mask_tensor, size=original_shape, mode=mode).squeeze().numpy()
@@ -124,6 +129,7 @@ if __name__ == "__main__":
     parser.add_argument('--dim', type=int, choices=[2, 3], required=True)
     parser.add_argument('--base_filters', type=int, default=16)
     parser.add_argument('--min_edt', type=float, default=0.15)
+    parser.add_argument('--visibility_floor', type=float, default=0.25)
     parser.add_argument('--downsample', type=float, default=1.0, help="Factor to downsample the image before FCN.")
     parser.add_argument('--visualize', action='store_true')
     args = parser.parse_args()

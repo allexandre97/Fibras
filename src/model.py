@@ -39,8 +39,8 @@ class FlexibleCVFUNet(nn.Module):
         self.up1 = trans_cls(base_filters*2, base_filters, kernel_size=2, stride=2)
         self.d1 = ConvBlockND(base_filters*2, base_filters, dim)
         
-        # Output Channels: 3 for 2D (EDT, Vx, Vy), 4 for 3D (EDT, Vx, Vy, Vz)
-        out_channels = 1 + dim 
+        # Output Channels: 4 for 2D (EDT, Vx, Vy, visibility), 4 for 3D (EDT, Vx, Vy, Vz)
+        out_channels = 4 if dim == 2 else 1 + dim
         self.out = conv_cls(base_filters, out_channels, kernel_size=1)
 
     def forward(self, x):

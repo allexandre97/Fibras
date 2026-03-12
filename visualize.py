@@ -15,6 +15,7 @@ def show_synthetic_data(pt_path: str):
     data = torch.load(pt_path, map_location="cpu", weights_only=True)
     volume = data["volume"].squeeze(0).numpy()
     edt = data["targets"][0].numpy()
+    visibility = data["targets"][3].numpy() if data["targets"].shape[0] > 3 else None
 
     is_2d = volume.shape[0] == 1
     dim_str = "2D STED" if is_2d else "3D Confocal"
@@ -22,6 +23,8 @@ def show_synthetic_data(pt_path: str):
     if is_2d:
         volume = volume.squeeze(0)
         edt = edt.squeeze(0)
+        if visibility is not None:
+            visibility = visibility.squeeze(0)
 
     print(f"Render Mode: {dim_str} | Array Shape: {volume.shape}")
 
@@ -40,6 +43,15 @@ def show_synthetic_data(pt_path: str):
         visible=False,
         opacity=0.7,
     )
+
+    if is_2d and visibility is not None:
+        viewer.add_image(
+            visibility,
+            name="Visibility Target",
+            colormap="viridis",
+            visible=False,
+            opacity=0.65,
+        )
 
     napari.run()
 
@@ -84,8 +96,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--label_slab_thickness",
         type=float,
-        default=1.5,
-        help="Label slab thickness in voxels for --sted-debug mode",
+        default=None,
+        help="Optional override for the focus-localization slab in voxels for --sted-debug mode",
     )
     parser.add_argument("--seed", type=int, default=None, help="Optional RNG seed for --sted-debug mode")
     parser.add_argument("--save", type=str, default=None, help="Optional path to save the STED debug summary figure")

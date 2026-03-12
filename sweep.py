@@ -39,7 +39,11 @@ def train_sweep():
         
     model = model.to(device)
     
-    criterion = MaskedVectorLoss(vector_weight=config.vector_loss_weight, dim=GLOBAL_DIM)
+    criterion = MaskedVectorLoss(
+        vector_weight=config.vector_loss_weight,
+        visibility_weight=getattr(config, "visibility_loss_weight", 0.35),
+        dim=GLOBAL_DIM,
+    )
     optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
 

@@ -1,6 +1,7 @@
 import os
 import argparse
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from src.model import FlexibleCVFUNet
@@ -30,6 +31,7 @@ def evaluate_model(args):
     total_loss = 0.0
     total_edt_loss = 0.0
     total_vec_loss = 0.0
+    total_visibility_loss = 0.0
     
     with torch.no_grad():
         for inputs, targets in test_loader:
@@ -59,7 +61,16 @@ def evaluate_model(args):
             
             total_edt_loss += loss_edt
             total_vec_loss += loss_vec
-            total_loss += loss_edt + (args.vector_loss_weight * loss_vec)
+            total_batch_loss = loss_edt + (args.vector_loss_weight * loss_vec)
+
+            if args.dim == 2:
+                pred_visibility = pred[:, 3:4]
+                targ_visibility = targets[:, 3:4]
+                loss_visibility = F.binary_cross_entropy_with_logits(pred_visibility, targ_visibility).item()
+                total_visibility_loss += loss_visibility
+                total_batch_loss += args.visibility_loss_weight * loss_visibility
+
+            total_loss += total_batch_loss
 
     n_batches = len(test_loader)
     print(f"\n--- Unseen Test Set Evaluation ({args.dim}D Model) ---")
@@ -67,6 +78,8 @@ def evaluate_model(args):
     print(f"Average Total Loss: {total_loss / n_batches:.4f}")
     print(f"Average EDT MSE:    {total_edt_loss / n_batches:.4f}")
     print(f"Average Vector MSE: {total_vec_loss / n_batches:.4f}")
+    if args.dim == 2:
+        print(f"Average Visibility: {total_visibility_loss / n_batches:.4f}")
     print("---------------------------------------------")
 
 if __name__ == "__main__":
@@ -76,6 +89,7 @@ if __name__ == "__main__":
     parser.add_argument('--dim', type=int, required=True)
     parser.add_argument('--base_filters', type=int, required=True)
     parser.add_argument('--vector_loss_weight', type=float, default=1.175) # Updated to your sweep optimal
+    parser.add_argument('--visibility_loss_weight', type=float, default=0.35)
     
     args = parser.parse_args()
     evaluate_model(args)

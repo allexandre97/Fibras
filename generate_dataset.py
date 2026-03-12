@@ -2,13 +2,14 @@ import argparse
 import concurrent.futures
 import os
 from functools import partial
+from typing import Optional
 
 import numpy as np
 
 from src.core import FiberSegment, ReflectiveBoundary
 from src.rasterization import EmpiricalRasterizer
 from src.synthesis import CompositeGenerator, RandomWalkGenerator, SpaceColonizationGenerator
-from src.targets import TargetFieldGenerator
+from src.targets import TargetFieldGenerator, WeightedVisibilityTargetGenerator
 
 
 PHENOTYPES = ["Highly Branched", "Directional", "Random Tangle", "Cloudy Bundle", "Heterogeneous Mixed"]
@@ -285,13 +286,92 @@ def _project_segments_to_label_slab(core_segments, slice_center, slab_thickness)
     return projected_segments
 
 
-def _prepare_2d_sted_scene(bounds: tuple, label_slab_thickness: float):
+def _project_segment_to_xy(segment: FiberSegment):
+    start_xy = np.array([segment.start[0], segment.start[1]], dtype=np.float64)
+    end_xy = np.array([segment.end[0], segment.end[1]], dtype=np.float64)
+    if np.linalg.norm(end_xy - start_xy) < 1e-6:
+        return None
+    return FiberSegment(start=start_xy, end=end_xy, thickness_mult=segment.thickness_mult)
+
+
+def _project_segments_to_visibility(core_segments, slice_center, rasterizer, min_weight: float = 0.03):
+    projected_segments = []
+    visibility_weights = []
+
+    for segment in core_segments:
+        projected = _project_segment_to_xy(segment)
+        if projected is None:
+            continue
+
+        midpoint_z = 0.5 * (segment.start[2] + segment.end[2])
+        _, axial_weight = rasterizer._sted_defocus_response(midpoint_z - slice_center)
+        if axial_weight <= min_weight:
+            continue
+
+        projected_segments.append(projected)
+        visibility_weights.append(axial_weight)
+
+    return projected_segments, np.asarray(visibility_weights, dtype=np.float64)
+
+
+def _resolve_localization_slab_thickness(rasterizer, label_slab_thickness: Optional[float]) -> float:
+    if label_slab_thickness is not None:
+        return float(label_slab_thickness)
+
+    depth_of_field, _, _ = rasterizer._sted_optical_section_params()
+    return depth_of_field
+
+
+def _build_2d_focus_and_visibility_targets(
+    core_segments,
+    slice_center,
+    localization_slab_thickness,
+    rasterizer,
+    target_gen,
+    visibility_target_gen,
+):
+    focus_segments = _project_segments_to_label_slab(core_segments, slice_center, localization_slab_thickness)
+    edt_target, vector_target = target_gen.generate(focus_segments)
+
+    visibility_segments, visibility_weights = _project_segments_to_visibility(core_segments, slice_center, rasterizer)
+    visibility_target = visibility_target_gen.generate(visibility_segments, visibility_weights)
+
+    return {
+        "focus_segments": focus_segments,
+        "edt_target": edt_target,
+        "vector_target": vector_target,
+        "visibility_target": visibility_target,
+        "visibility_segments": visibility_segments,
+        "visibility_weights": visibility_weights,
+    }
+
+
+def _prepare_2d_sted_scene(bounds: tuple, label_slab_thickness: Optional[float]):
     x_size, y_size, z_size = bounds
 
     optical_bundle_lists = []
     core_segments_flat = []
     projected_segments = []
+    visibility_segments = []
+    visibility_weights = np.zeros(0, dtype=np.float64)
+    edt_target = np.zeros((x_size, y_size), dtype=np.float64)
+    vector_target = np.zeros((2, x_size, y_size), dtype=np.float64)
+    visibility_target = np.zeros((x_size, y_size), dtype=np.float64)
     slice_center = np.random.uniform(z_size * 0.2, z_size * 0.8)
+
+    rasterizer = EmpiricalRasterizer(
+        bounds=bounds,
+        base_sigma=1.0,
+        z_anisotropy=np.random.uniform(1.6, 2.8),
+        noise_level=np.random.uniform(0.01, 0.08),
+        debris_count=np.random.randint(4, 16),
+        gap_prob=np.random.uniform(0.0, 0.08),
+    )
+    target_gen = TargetFieldGenerator((x_size, y_size), max_distance=TARGET_MAX_DISTANCE)
+    visibility_target_gen = WeightedVisibilityTargetGenerator((x_size, y_size), base_sigma=rasterizer.base_sigma)
+    localization_slab_thickness = _resolve_localization_slab_thickness(rasterizer, label_slab_thickness)
+    depth_of_field, _, _ = rasterizer._sted_optical_section_params()
+    axial_fwhm = rasterizer._sted_axial_fwhm(depth_of_field)
 
     for _ in range(6):
         optical_bundle_lists = []
@@ -320,48 +400,55 @@ def _prepare_2d_sted_scene(bounds: tuple, label_slab_thickness: float):
             optical_bundle_lists.append(optical_segments)
 
         slice_center = np.random.uniform(z_size * 0.2, z_size * 0.8)
-        projected_segments = _project_segments_to_label_slab(core_segments_flat, slice_center, label_slab_thickness)
+        target_data = _build_2d_focus_and_visibility_targets(
+            core_segments_flat,
+            slice_center,
+            localization_slab_thickness,
+            rasterizer,
+            target_gen,
+            visibility_target_gen,
+        )
+        projected_segments = target_data["focus_segments"]
+        edt_target = target_data["edt_target"]
+        vector_target = target_data["vector_target"]
+        visibility_target = target_data["visibility_target"]
+        visibility_segments = target_data["visibility_segments"]
+        visibility_weights = target_data["visibility_weights"]
         if core_segments_flat and projected_segments:
             break
 
     img_min = np.random.uniform(0.18, 0.45)
     img_max = np.random.uniform(img_min + 0.15, 1.0)
 
-    rasterizer = EmpiricalRasterizer(
-        bounds=bounds,
-        base_sigma=1.0,
-        z_anisotropy=np.random.uniform(1.6, 2.8),
-        noise_level=np.random.uniform(0.01, 0.08),
-        debris_count=np.random.randint(4, 16),
-        gap_prob=np.random.uniform(0.0, 0.08),
-    )
-    target_gen = TargetFieldGenerator((x_size, y_size), max_distance=TARGET_MAX_DISTANCE)
-
     return {
         "bounds": bounds,
         "optical_bundle_lists": optical_bundle_lists,
         "core_segments": core_segments_flat,
         "projected_segments": projected_segments,
+        "visibility_segments": visibility_segments,
+        "visibility_weights": visibility_weights,
         "slice_center": slice_center,
-        "label_slab_thickness": label_slab_thickness,
+        "label_slab_thickness": localization_slab_thickness,
+        "axial_fwhm": axial_fwhm,
         "dynamic_range": (img_min, img_max),
         "rasterizer": rasterizer,
-        "target_gen": target_gen,
+        "edt_target": edt_target,
+        "vector_target": vector_target,
+        "visibility_target": visibility_target,
     }
 
 
-def _build_2d_sample(bounds: tuple, label_slab_thickness: float):
+def _build_2d_sample(bounds: tuple, label_slab_thickness: Optional[float]):
     scene = _prepare_2d_sted_scene(bounds, label_slab_thickness)
     image = scene["rasterizer"].render_sted_slice(
         scene["optical_bundle_lists"],
         slice_center=scene["slice_center"],
         dynamic_range=scene["dynamic_range"],
     )
-    edt_target, vector_target = scene["target_gen"].generate(scene["projected_segments"])
-    return image, edt_target, vector_target
+    return image, scene["edt_target"], scene["vector_target"], scene["visibility_target"]
 
 
-def build_sted_debug_sample(bounds: tuple, synth_depth: int = 16, label_slab_thickness: float = 1.5, seed: int = None):
+def build_sted_debug_sample(bounds: tuple, synth_depth: int = 16, label_slab_thickness: Optional[float] = None, seed: int = None):
     if len(bounds) == 2:
         synth_bounds = (bounds[0], bounds[1], synth_depth)
     elif len(bounds) == 3:
@@ -381,16 +468,20 @@ def build_sted_debug_sample(bounds: tuple, synth_depth: int = 16, label_slab_thi
         slice_center=scene["slice_center"],
         dynamic_range=scene["dynamic_range"],
     )
-    edt_target, vector_target = scene["target_gen"].generate(scene["projected_segments"])
 
     debug_render["bounds"] = synth_bounds
-    debug_render["label_slab_thickness"] = label_slab_thickness
-    debug_render["edt_target"] = edt_target
-    debug_render["vector_target"] = vector_target
+    debug_render["label_slab_thickness"] = scene["label_slab_thickness"]
+    debug_render["axial_fwhm"] = scene["axial_fwhm"]
+    debug_render["edt_target"] = scene["edt_target"]
+    debug_render["vector_target"] = scene["vector_target"]
+    debug_render["visibility_target"] = scene["visibility_target"]
     debug_render["projected_segments"] = scene["projected_segments"]
+    debug_render["visibility_segments"] = scene["visibility_segments"]
+    debug_render["visibility_weights"] = scene["visibility_weights"]
     debug_render["core_segments"] = scene["core_segments"]
     debug_render["fiber_count"] = len(scene["optical_bundle_lists"])
     debug_render["projected_segment_count"] = len(scene["projected_segments"])
+    debug_render["visibility_segment_count"] = len(scene["visibility_segments"])
     return debug_render
 
 
@@ -440,18 +531,20 @@ def _build_3d_sample(bounds: tuple):
     return volume, edt_target, vector_target
 
 
-def _to_2d_tensors(image, edt_target, vector_target):
+def _to_2d_tensors(image, edt_target, vector_target, visibility_target):
     import torch
 
     image = image.transpose(1, 0)
     edt_target = edt_target.transpose(1, 0)
     vector_target = vector_target.transpose(0, 2, 1)
+    visibility_target = visibility_target.transpose(1, 0)
 
     volume_tensor = torch.tensor(image[np.newaxis, np.newaxis, :, :], dtype=torch.float32)
     targets = np.zeros((4, 1, image.shape[0], image.shape[1]), dtype=np.float32)
     targets[0, 0, :, :] = edt_target.astype(np.float32)
     targets[1, 0, :, :] = vector_target[0].astype(np.float32)
     targets[2, 0, :, :] = vector_target[1].astype(np.float32)
+    targets[3, 0, :, :] = visibility_target.astype(np.float32)
 
     targets_tensor = torch.tensor(targets, dtype=torch.float32)
     return volume_tensor, targets_tensor
@@ -471,14 +564,14 @@ def _to_3d_tensors(volume, edt_target, vector_target):
     return volume_tensor, targets_tensor
 
 
-def process_single_sample(idx: int, file_offset: int, bounds: tuple, output_dir: str, emit_2d: bool, label_slab_thickness: float):
+def process_single_sample(idx: int, file_offset: int, bounds: tuple, output_dir: str, emit_2d: bool, label_slab_thickness: Optional[float]):
     import torch
 
     np.random.seed(None)
 
     if emit_2d:
-        image, edt_target, vector_target = _build_2d_sample(bounds, label_slab_thickness)
-        volume_tensor, targets_tensor = _to_2d_tensors(image, edt_target, vector_target)
+        image, edt_target, vector_target, visibility_target = _build_2d_sample(bounds, label_slab_thickness)
+        volume_tensor, targets_tensor = _to_2d_tensors(image, edt_target, vector_target, visibility_target)
     else:
         volume, edt_target, vector_target = _build_3d_sample(bounds)
         volume_tensor, targets_tensor = _to_3d_tensors(volume, edt_target, vector_target)
@@ -497,7 +590,7 @@ def build_dataset_split(
     base_dir: str,
     workers: int,
     emit_2d: bool,
-    label_slab_thickness: float,
+    label_slab_thickness: Optional[float],
 ):
     split_dir = os.path.join(base_dir, split_name)
     os.makedirs(split_dir, exist_ok=True)
@@ -537,7 +630,12 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--bounds", type=int, nargs="+", default=[64, 64, 64])
     parser.add_argument("--synth_depth", type=int, default=16)
-    parser.add_argument("--label_slab_thickness", type=float, default=1.5)
+    parser.add_argument(
+        "--label_slab_thickness",
+        type=float,
+        default=None,
+        help="Optional override for the narrow focus-localization slab in 2D mode. Defaults to the optical depth of field.",
+    )
     parser.add_argument("--train_size", type=int, default=2000)
     parser.add_argument("--val_size", type=int, default=400)
     parser.add_argument("--test_size", type=int, default=400)

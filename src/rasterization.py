@@ -136,10 +136,15 @@ class EmpiricalRasterizer:
         self.gap_prob = gap_prob
 
     def _sted_optical_section_params(self) -> Tuple[float, float, float]:
-        depth_of_field = max(0.75, self.base_sigma * self.z_anisotropy)
+        # Keep the optical section broader than the localization slab so
+        # defocused fibers remain visible without becoming the localization target.
+        depth_of_field = max(1.0, self.base_sigma * self.z_anisotropy * 1.5)
         focus_sigma = max(0.20, self.base_sigma * 0.35)
         defocus_slope = self.base_sigma / depth_of_field
         return depth_of_field, focus_sigma, defocus_slope
+
+    def _sted_axial_fwhm(self, depth_of_field: float) -> float:
+        return 2.0 * depth_of_field
 
     def _sted_defocus_response(self, defocus_distance: float) -> Tuple[float, float]:
         depth_of_field, focus_sigma, defocus_slope = self._sted_optical_section_params()
@@ -242,6 +247,7 @@ class EmpiricalRasterizer:
         axial_signal_profile = np.zeros(self.bounds[2], dtype=np.float64)
         lateral_sigmas = np.zeros(self.bounds[2], dtype=np.float64)
         depth_of_field, focus_sigma, _ = self._sted_optical_section_params()
+        axial_fwhm = self._sted_axial_fwhm(depth_of_field)
         focus_index = int(np.clip(round(slice_center), 0, self.bounds[2] - 1))
 
         for z_index in range(self.bounds[2]):
@@ -284,6 +290,7 @@ class EmpiricalRasterizer:
             "focus_index": focus_index,
             "slice_center": slice_center,
             "depth_of_field": depth_of_field,
+            "axial_fwhm": axial_fwhm,
             "focus_sigma": focus_sigma,
         }
 
