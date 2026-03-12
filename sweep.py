@@ -173,13 +173,19 @@ if __name__ == "__main__":
                 'max': 10.0
             },
             'visibility_loss_weight': {
-                'value': 0.35
+                'distribution': 'uniform',
+                'min': 0.10,
+                'max': 0.70
             },
             'vector_mask_floor': {
-                'value': 0.05
+                'distribution': 'uniform',
+                'min': 0.00,
+                'max': 0.20
             },
             'loss_visibility_floor': {
-                'value': 0.25
+                'distribution': 'uniform',
+                'min': 0.05,
+                'max': 0.45
             },
             'base_filters': {
                 'values': [8, 16, 32]
