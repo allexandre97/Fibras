@@ -4,9 +4,11 @@ from unittest.mock import patch
 import numpy as np
 
 from generate_dataset import (
+    _build_2d_sample,
     _build_2d_focus_and_visibility_targets,
     _prepare_2d_sted_scene,
     _project_segments_to_label_slab,
+    _to_2d_tensors,
     build_sted_debug_sample,
 )
 from src.rasterization import EmpiricalRasterizer
@@ -368,8 +370,11 @@ class StedNoiseModelTests(unittest.TestCase):
         self.assertIn("monomer_volume", debug_data)
         self.assertIn("monomer_regime", debug_data)
         self.assertIn("monomer_amplitude", debug_data)
-        self.assertIn(debug_data["monomer_regime"], {"subtle", "moderate", "strong"})
-        self.assertGreater(debug_data["monomer_amplitude"], 0.0)
+        self.assertIn(debug_data["monomer_regime"], {"disabled", "subtle", "moderate", "strong"})
+        if debug_data["monomer_regime"] == "disabled":
+            self.assertAlmostEqual(debug_data["monomer_amplitude"], 0.0, places=10)
+        else:
+            self.assertGreater(debug_data["monomer_amplitude"], 0.0)
         self.assertEqual(debug_data["signal_volume"].shape, debug_data["monomer_volume"].shape)
         self.assertTrue(np.all(debug_data["monomer_volume"] >= 0.0))
         self.assertTrue(np.all(debug_data["monomer_volume"] <= 1.0))
@@ -395,6 +400,55 @@ class StedNoiseModelTests(unittest.TestCase):
         debug_data = build_sted_debug_sample((64, 64), synth_depth=16, soft_skeleton_alpha=0.35, seed=6)
         self.assertIn("soft_skeleton_alpha", debug_data)
         self.assertGreaterEqual(debug_data["soft_skeleton_alpha"], 0.0)
+
+    def test_no_haze_regime_frequency_is_within_expected_band(self):
+        disabled_count = 0
+        sample_count = 120
+        for seed in range(sample_count):
+            np.random.seed(seed)
+            scene = _prepare_2d_sted_scene((64, 64, 16), None)
+            if scene["haze_regime"] == "none":
+                disabled_count += 1
+
+        disabled_fraction = disabled_count / sample_count
+        self.assertGreaterEqual(disabled_fraction, 0.20)
+        self.assertLessEqual(disabled_fraction, 0.40)
+
+    def test_2d_walk_and_fiber_constraints_match_realism_ranges(self):
+        max_xy = 64.0
+        lower_step = max(0.8, max_xy * 0.018)
+        upper_step = max(0.8, max_xy * 0.030)
+
+        for seed in range(40):
+            np.random.seed(seed)
+            scene = _prepare_2d_sted_scene((64, 64, 16), None)
+            self.assertGreaterEqual(scene["requested_fiber_count"], 10)
+            self.assertLessEqual(scene["requested_fiber_count"], 24)
+            self.assertTrue(all(size in {1, 2, 3} for size in scene["bundle_sizes"]))
+
+            for walk_cfg in scene["walk_parameter_samples"]:
+                self.assertGreaterEqual(walk_cfg["num_steps"], 4)
+                self.assertLessEqual(walk_cfg["num_steps"], 14)
+                self.assertGreaterEqual(walk_cfg["max_turn_degrees"], 2.0)
+                self.assertLessEqual(walk_cfg["max_turn_degrees"], 12.0)
+                self.assertGreaterEqual(walk_cfg["step_length"], lower_step)
+                self.assertLessEqual(walk_cfg["step_length"], upper_step)
+
+    def test_deterministic_2d_smoke_preserves_target_channels(self):
+        seen_haze_regimes = set()
+
+        for seed in range(18):
+            np.random.seed(seed)
+            scene = _prepare_2d_sted_scene((40, 40, 14), None)
+            seen_haze_regimes.add(scene["haze_regime"])
+            self.assertGreaterEqual(scene["requested_fiber_count"], 10)
+            self.assertLessEqual(scene["requested_fiber_count"], 24)
+
+            image, edt_target, vector_target, visibility_target = _build_2d_sample((40, 40, 14), None)
+            _, targets_tensor = _to_2d_tensors(image, edt_target, vector_target, visibility_target)
+            self.assertEqual(targets_tensor.shape[0], 4)
+
+        self.assertIn("none", seen_haze_regimes)
 
 
 if __name__ == "__main__":
