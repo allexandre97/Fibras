@@ -1,0 +1,18 @@
+name: fibras
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - scipy
+  - scikit-image
+  - networkx
+  - numba
+  - pytorch>=2.2
+  - cpuonly
+  - tifffile
+  - matplotlib
+  - pillow
+  - wandb

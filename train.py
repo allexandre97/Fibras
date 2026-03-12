@@ -34,12 +34,21 @@ class PrecomputedFiberDataset(Dataset):
         return vol, targets
 
 class MaskedVectorLoss(nn.Module):
-    def __init__(self, vector_weight: float = 1.0, visibility_weight: float = 0.35, dim: int = 3):
+    def __init__(
+        self,
+        vector_weight: float = 1.0,
+        visibility_weight: float = 0.35,
+        dim: int = 3,
+        vector_mask_floor: float = 0.05,
+    ):
         super().__init__()
         self.mse = nn.MSELoss(reduction='none')
         self.vector_weight = vector_weight
         self.visibility_weight = visibility_weight
         self.dim = dim
+        if vector_mask_floor < 0.0:
+            raise ValueError("vector_mask_floor must be non-negative.")
+        self.vector_mask_floor = vector_mask_floor
 
     def compute_components(self, pred, target):
         pred_edt, pred_vec = pred[:, 0:1], pred[:, 1:1+self.dim]
@@ -49,7 +58,8 @@ class MaskedVectorLoss(nn.Module):
         loss_edt = self.mse(pred_edt, targ_edt).mean()
 
         # 2. Sign-Agnostic Vector Regression (Symmetric MSE)
-        mask = (targ_edt > 0.0).float()
+        mask_conf = torch.clamp(targ_edt, 0.0, 1.0)
+        mask = (mask_conf > self.vector_mask_floor).float() * mask_conf
         
         # Calculate squared errors for both orientations, averaged across channels to maintain scale
         err_pos = torch.sum((pred_vec - targ_vec)**2, dim=1, keepdim=True) / self.dim
@@ -118,6 +128,7 @@ def train_model(args):
         vector_weight=args.vector_loss_weight,
         visibility_weight=args.visibility_loss_weight,
         dim=args.dim,
+        vector_mask_floor=args.vector_mask_floor,
     )
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     
@@ -202,6 +213,7 @@ if __name__ == "__main__":
     parser.add_argument('--weight_decay', type=float, required=True)
     parser.add_argument('--vector_loss_weight', type=float, required=True)
     parser.add_argument('--visibility_loss_weight', type=float, default=0.35)
+    parser.add_argument('--vector_mask_floor', type=float, default=0.05)
     
     args = parser.parse_args()
     train_model(args)

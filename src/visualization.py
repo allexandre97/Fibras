@@ -64,6 +64,22 @@ class StedSynthesisVisualizer:
             )
 
     @staticmethod
+    def _mask_outline(mask):
+        mask = np.asarray(mask, dtype=bool)
+        if mask.size == 0:
+            return mask
+
+        padded = np.pad(mask, 1, mode="constant", constant_values=False)
+        eroded = mask.copy()
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                eroded &= padded[
+                    1 + dx : 1 + dx + mask.shape[0],
+                    1 + dy : 1 + dy + mask.shape[1],
+                ]
+        return mask & ~eroded
+
+    @staticmethod
     def _normalize_to_uint8(image):
         image = np.asarray(image, dtype=np.float64)
         image = image - image.min()
@@ -73,7 +89,7 @@ class StedSynthesisVisualizer:
         return np.clip(image * 255.0, 0, 255).astype(np.uint8)
 
     @staticmethod
-    def _make_pil_image_panel(image, title, segments=None, mask=None, tile_size=256):
+    def _make_pil_image_panel(image, title, segments=None, mask=None, mask_overlays=None, tile_size=256):
         from PIL import Image, ImageDraw
 
         display = np.flipud(np.asarray(image).T)
@@ -82,6 +98,12 @@ class StedSynthesisVisualizer:
         if mask is not None:
             display_mask = np.flipud(np.asarray(mask).T.astype(bool))
             rgb[display_mask] = np.array([255, 255, 255], dtype=np.uint8)
+
+        if mask_overlays:
+            for overlay_mask, color in mask_overlays:
+                display_mask = np.flipud(np.asarray(overlay_mask).T.astype(bool))
+                outline = StedSynthesisVisualizer._mask_outline(display_mask)
+                rgb[outline] = np.asarray(color, dtype=np.uint8)
 
         panel_image = Image.fromarray(rgb, mode="RGB").resize((tile_size, tile_size), resample=Image.Resampling.NEAREST)
         canvas = Image.new("RGB", (tile_size, tile_size + 28), color=(18, 18, 18))
@@ -160,30 +182,50 @@ class StedSynthesisVisualizer:
         from PIL import Image
 
         signal_volume = debug_data["signal_volume"]
+        fiber_signal_volume = debug_data.get("fiber_signal_volume", signal_volume)
+        monomer_volume = debug_data.get("monomer_volume", np.zeros_like(signal_volume))
+        monomer_regime = debug_data.get("monomer_regime", "n/a")
+        monomer_amplitude = float(debug_data.get("monomer_amplitude", 0.0))
+        slab_scale = float(debug_data.get("label_slab_scale", 1.0))
+        annotation_weight_floor = float(debug_data.get("annotation_weight_floor", 0.25))
+        soft_alpha = float(debug_data.get("soft_skeleton_alpha", 0.0))
+        edt_focus = debug_data.get("edt_focus", debug_data["edt_target"])
         edt_target = debug_data["edt_target"]
         visibility_target = debug_data["visibility_target"]
+        focus_core_mask = edt_focus > 0.85
+        annotation_mask = edt_target > 0.15
         panels = [
             StedSynthesisVisualizer._make_pil_image_panel(
-                signal_volume.max(axis=2),
-                f"3D Signal MIP | fibers={debug_data['fiber_count']}",
+                fiber_signal_volume.max(axis=2),
+                f"Fiber-Only MIP | fibers={debug_data['fiber_count']}",
             ),
             StedSynthesisVisualizer._make_pil_image_panel(
-                debug_data["focus_plane"],
-                f"Focus Plane z={debug_data['focus_index']}",
+                monomer_volume.max(axis=2),
+                f"Monomer MIP | {monomer_regime} | amp={monomer_amplitude:.4f}",
             ),
             StedSynthesisVisualizer._make_pil_image_panel(
                 debug_data["weighted_slice"],
-                "Defocus-Aware Section",
+                "Defocus-Aware Section (Fiber + Monomer)",
             ),
             StedSynthesisVisualizer._make_pil_image_panel(
                 debug_data["final_slice"],
-                "Final STED Slice",
-                segments=debug_data["projected_segments"],
+                "Final STED Slice | cyan=core white=ann",
+                mask_overlays=[
+                    (annotation_mask, (255, 255, 255)),
+                    (focus_core_mask, (0, 255, 255)),
+                ],
             ),
             StedSynthesisVisualizer._make_pil_image_panel(
                 visibility_target,
-                f"Visibility Target | slab={debug_data['label_slab_thickness']:.2f}",
-                mask=edt_target > 0.85,
+                (
+                    "Visibility Target | "
+                    f"slab={debug_data['label_slab_thickness']:.2f} | "
+                    f"ann_w>={annotation_weight_floor:.2f} | a={soft_alpha:.2f}"
+                ),
+                mask_overlays=[
+                    (annotation_mask, (255, 255, 255)),
+                    (focus_core_mask, (0, 255, 255)),
+                ],
             ),
             StedSynthesisVisualizer._make_pil_profile_panel(
                 debug_data["axial_signal_profile"],
@@ -220,66 +262,85 @@ class StedSynthesisVisualizer:
             return
 
         signal_volume = debug_data["signal_volume"]
+        fiber_signal_volume = debug_data.get("fiber_signal_volume", signal_volume)
+        monomer_volume = debug_data.get("monomer_volume", np.zeros_like(signal_volume))
+        monomer_regime = debug_data.get("monomer_regime", "n/a")
+        monomer_amplitude = float(debug_data.get("monomer_amplitude", 0.0))
+        slab_scale = float(debug_data.get("label_slab_scale", 1.0))
+        annotation_weight_floor = float(debug_data.get("annotation_weight_floor", 0.25))
+        soft_alpha = float(debug_data.get("soft_skeleton_alpha", 0.0))
         weighted_slice = debug_data["weighted_slice"]
-        focus_plane = debug_data["focus_plane"]
         final_slice = debug_data["final_slice"]
+        edt_focus = debug_data.get("edt_focus", debug_data["edt_target"])
         edt_target = debug_data["edt_target"]
         visibility_target = debug_data["visibility_target"]
         axial_weights = debug_data["axial_weights"]
         axial_signal = debug_data["axial_signal_profile"]
         lateral_sigmas = debug_data["lateral_sigmas"]
         slice_center = debug_data["slice_center"]
-        focus_index = debug_data["focus_index"]
         slab_thickness = debug_data["label_slab_thickness"]
         axial_fwhm = debug_data["axial_fwhm"]
-        projected_segments = debug_data["projected_segments"]
 
-        mip_xy = signal_volume.max(axis=2)
-        centerline_mask = edt_target > 0.85
+        fiber_mip_xy = fiber_signal_volume.max(axis=2)
+        monomer_mip_xy = monomer_volume.max(axis=2)
+        focus_core_mask = edt_focus > 0.85
+        annotation_mask = edt_target > 0.15
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 9), constrained_layout=True)
         axes = axes.ravel()
 
         StedSynthesisVisualizer._show_xy(
             axes[0],
-            mip_xy,
-            f"3D Signal MIP\n{debug_data['fiber_count']} fibers, z={signal_volume.shape[2]}",
+            fiber_mip_xy,
+            f"Fiber-Only MIP\n{debug_data['fiber_count']} fibers, z={signal_volume.shape[2]}",
         )
 
         StedSynthesisVisualizer._show_xy(
             axes[1],
-            focus_plane,
-            f"Focus Plane z={focus_index}",
+            monomer_mip_xy,
+            f"Monomer Cloud MIP\nregime={monomer_regime}, amp={monomer_amplitude:.4f}",
         )
 
         StedSynthesisVisualizer._show_xy(
             axes[2],
             weighted_slice,
-            "Defocus-Aware Section\nPre-artifact",
+            "Defocus-Aware Section\nFiber + Monomer (Pre-2D Artifacts)",
         )
 
         StedSynthesisVisualizer._show_xy(
             axes[3],
             final_slice,
-            "Final STED Slice",
+            "Final STED Slice\ncyan=focus core, white=visible annotation",
         )
-        StedSynthesisVisualizer._overlay_segments(
-            axes[3],
-            projected_segments,
-            color="cyan",
-            linewidth=1.2,
-            alpha=0.75,
+        axes[3].contour(
+            annotation_mask.T.astype(float),
+            levels=[0.5],
+            colors="white",
+            linewidths=1.0,
+            linestyles="dashed",
         )
+        axes[3].contour(focus_core_mask.T.astype(float), levels=[0.5], colors="cyan", linewidths=1.2)
 
         StedSynthesisVisualizer._show_xy(
             axes[4],
             visibility_target,
-            f"Visibility Target\nslab={slab_thickness:.2f} px, visible={debug_data['visibility_segment_count']}",
+            (
+                "Visibility Target\n"
+                f"slab={slab_thickness:.2f} px (x{slab_scale:.2f}), "
+                f"ann_w>={annotation_weight_floor:.2f}, a={soft_alpha:.2f}"
+            ),
             cmap="viridis",
             vmin=0.0,
             vmax=1.0,
         )
-        axes[4].contour(centerline_mask.T.astype(float), levels=[0.5], colors="white", linewidths=0.8)
+        axes[4].contour(
+            annotation_mask.T.astype(float),
+            levels=[0.5],
+            colors="white",
+            linewidths=1.0,
+            linestyles="dashed",
+        )
+        axes[4].contour(focus_core_mask.T.astype(float), levels=[0.5], colors="cyan", linewidths=1.2)
 
         z_axis = np.arange(signal_volume.shape[2], dtype=float)
         normalized_signal = axial_signal / max(axial_signal.max(), 1e-8)

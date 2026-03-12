@@ -16,6 +16,10 @@ PHENOTYPES = ["Highly Branched", "Directional", "Random Tangle", "Cloudy Bundle"
 SHORT_FIBER_STEPS = (6, 20)
 SHORT_TURN_DEGREES = (5.0, 20.0)
 TARGET_MAX_DISTANCE = 5.0
+DEFAULT_LABEL_SLAB_SCALE = 1.3
+DEFAULT_SOFT_SKELETON_ALPHA = 0.35
+DEFAULT_ANNOTATION_WEIGHT_FLOOR = 0.25
+DEFAULT_VISIBILITY_WEIGHT_FLOOR = 0.03
 
 
 def apply_optical_jitter(core_segments, bundle_size=3, jitter_amount=1.5, lock_z=False):
@@ -263,10 +267,15 @@ def _clip_segment_to_z_slab(segment: FiberSegment, lower_z: float, upper_z: floa
     return clipped_start, clipped_end
 
 
-def _project_segments_to_label_slab(core_segments, slice_center, slab_thickness):
-    lower_z = slice_center - (slab_thickness / 2.0)
-    upper_z = slice_center + (slab_thickness / 2.0)
+def _resolve_axial_weight_band_half_width(depth_of_field: float, weight_floor: float) -> float:
+    if weight_floor <= 0.0 or weight_floor > 1.0:
+        raise ValueError("weight_floor must be in the interval (0, 1].")
+    return float(depth_of_field * np.sqrt((1.0 / float(weight_floor)) - 1.0))
+
+
+def _project_segments_to_z_band(core_segments, lower_z: float, upper_z: float):
     projected_segments = []
+    clipped_segments = []
 
     for segment in core_segments:
         clipped = _clip_segment_to_z_slab(segment, lower_z, upper_z)
@@ -274,15 +283,25 @@ def _project_segments_to_label_slab(core_segments, slice_center, slab_thickness)
             continue
 
         clipped_start, clipped_end = clipped
-        start_xy = np.array([clipped_start[0], clipped_start[1]], dtype=np.float64)
-        end_xy = np.array([clipped_end[0], clipped_end[1]], dtype=np.float64)
-        if np.linalg.norm(end_xy - start_xy) < 1e-6:
+        clipped_segment = FiberSegment(
+            start=np.asarray(clipped_start, dtype=np.float64),
+            end=np.asarray(clipped_end, dtype=np.float64),
+            thickness_mult=segment.thickness_mult,
+        )
+        projected = _project_segment_to_xy(clipped_segment)
+        if projected is None:
             continue
 
-        projected_segments.append(
-            FiberSegment(start=start_xy, end=end_xy, thickness_mult=segment.thickness_mult)
-        )
+        projected_segments.append(projected)
+        clipped_segments.append(clipped_segment)
 
+    return projected_segments, clipped_segments
+
+
+def _project_segments_to_label_slab(core_segments, slice_center, slab_thickness):
+    lower_z = slice_center - (slab_thickness / 2.0)
+    upper_z = slice_center + (slab_thickness / 2.0)
+    projected_segments, _ = _project_segments_to_z_band(core_segments, lower_z, upper_z)
     return projected_segments
 
 
@@ -294,32 +313,72 @@ def _project_segment_to_xy(segment: FiberSegment):
     return FiberSegment(start=start_xy, end=end_xy, thickness_mult=segment.thickness_mult)
 
 
-def _project_segments_to_visibility(core_segments, slice_center, rasterizer, min_weight: float = 0.03):
-    projected_segments = []
-    visibility_weights = []
+def _mean_axial_weight_over_segment(
+    clipped_segment: FiberSegment,
+    slice_center: float,
+    depth_of_field: float,
+) -> float:
+    z0 = float(clipped_segment.start[2])
+    z1 = float(clipped_segment.end[2])
+    dz = z1 - z0
 
-    for segment in core_segments:
-        projected = _project_segment_to_xy(segment)
-        if projected is None:
-            continue
+    if abs(dz) < 1e-8:
+        relative_z = (z0 - slice_center) / max(depth_of_field, 1e-8)
+        return float(np.clip(1.0 / (1.0 + (relative_z ** 2)), 0.0, 1.0))
 
-        midpoint_z = 0.5 * (segment.start[2] + segment.end[2])
-        _, axial_weight = rasterizer._sted_defocus_response(midpoint_z - slice_center)
-        if axial_weight <= min_weight:
-            continue
+    rel0 = (z0 - slice_center) / max(depth_of_field, 1e-8)
+    rel1 = (z1 - slice_center) / max(depth_of_field, 1e-8)
+    integral = depth_of_field * (np.arctan(rel1) - np.arctan(rel0))
+    mean_weight = abs(integral / dz)
+    return float(np.clip(mean_weight, 0.0, 1.0))
 
-        projected_segments.append(projected)
-        visibility_weights.append(axial_weight)
 
+def _project_segments_to_annotation(
+    core_segments,
+    slice_center,
+    rasterizer,
+    annotation_weight_floor: float = DEFAULT_ANNOTATION_WEIGHT_FLOOR,
+):
+    depth_of_field, _, _ = rasterizer._sted_optical_section_params()
+    half_width = _resolve_axial_weight_band_half_width(depth_of_field, annotation_weight_floor)
+    lower_z = slice_center - half_width
+    upper_z = slice_center + half_width
+    projected_segments, _ = _project_segments_to_z_band(core_segments, lower_z, upper_z)
+    return projected_segments
+
+
+def _project_segments_to_visibility(
+    core_segments,
+    slice_center,
+    rasterizer,
+    min_weight: float = DEFAULT_VISIBILITY_WEIGHT_FLOOR,
+):
+    depth_of_field, _, _ = rasterizer._sted_optical_section_params()
+    half_width = _resolve_axial_weight_band_half_width(depth_of_field, min_weight)
+    lower_z = slice_center - half_width
+    upper_z = slice_center + half_width
+
+    projected_segments, clipped_segments = _project_segments_to_z_band(core_segments, lower_z, upper_z)
+    visibility_weights = [
+        _mean_axial_weight_over_segment(clipped_segment, slice_center, depth_of_field)
+        for clipped_segment in clipped_segments
+    ]
     return projected_segments, np.asarray(visibility_weights, dtype=np.float64)
 
 
-def _resolve_localization_slab_thickness(rasterizer, label_slab_thickness: Optional[float]) -> float:
+def _resolve_localization_slab_thickness(
+    rasterizer,
+    label_slab_thickness: Optional[float],
+    label_slab_scale: float = DEFAULT_LABEL_SLAB_SCALE,
+) -> float:
+    if label_slab_scale <= 0.0:
+        raise ValueError("label_slab_scale must be greater than 0.")
+
     if label_slab_thickness is not None:
         return float(label_slab_thickness)
 
     depth_of_field, _, _ = rasterizer._sted_optical_section_params()
-    return depth_of_field
+    return depth_of_field * float(label_slab_scale)
 
 
 def _build_2d_focus_and_visibility_targets(
@@ -329,31 +388,73 @@ def _build_2d_focus_and_visibility_targets(
     rasterizer,
     target_gen,
     visibility_target_gen,
+    annotation_weight_floor: float = DEFAULT_ANNOTATION_WEIGHT_FLOOR,
+    soft_skeleton_alpha: float = DEFAULT_SOFT_SKELETON_ALPHA,
 ):
+    if soft_skeleton_alpha < 0.0:
+        raise ValueError("soft_skeleton_alpha must be greater than or equal to 0.")
+    if annotation_weight_floor <= 0.0 or annotation_weight_floor > 1.0:
+        raise ValueError("annotation_weight_floor must be in the interval (0, 1].")
+
     focus_segments = _project_segments_to_label_slab(core_segments, slice_center, localization_slab_thickness)
-    edt_target, vector_target = target_gen.generate(focus_segments)
+    edt_focus, vector_focus = target_gen.generate(focus_segments)
+    annotation_segments = _project_segments_to_annotation(
+        core_segments,
+        slice_center,
+        rasterizer,
+        annotation_weight_floor=annotation_weight_floor,
+    )
+    edt_annotation, vector_annotation = target_gen.generate(annotation_segments)
 
     visibility_segments, visibility_weights = _project_segments_to_visibility(core_segments, slice_center, rasterizer)
     visibility_target = visibility_target_gen.generate(visibility_segments, visibility_weights)
 
+    edt_soft = np.clip(edt_annotation * float(soft_skeleton_alpha), 0.0, 1.0)
+    edt_target = np.maximum(edt_focus, edt_soft)
+    vector_target = np.array(vector_focus, copy=True)
+    soft_overwrite_mask = edt_soft > edt_focus
+    if np.any(soft_overwrite_mask):
+        vector_target[:, soft_overwrite_mask] = vector_annotation[:, soft_overwrite_mask]
+
     return {
         "focus_segments": focus_segments,
+        "annotation_segments": annotation_segments,
+        "edt_focus": edt_focus,
+        "vector_focus": vector_focus,
+        "edt_annotation": edt_annotation,
+        "vector_annotation": vector_annotation,
+        "edt_soft": edt_soft,
         "edt_target": edt_target,
         "vector_target": vector_target,
         "visibility_target": visibility_target,
         "visibility_segments": visibility_segments,
         "visibility_weights": visibility_weights,
+        "annotation_weight_floor": float(annotation_weight_floor),
     }
 
 
-def _prepare_2d_sted_scene(bounds: tuple, label_slab_thickness: Optional[float]):
+def _prepare_2d_sted_scene(
+    bounds: tuple,
+    label_slab_thickness: Optional[float],
+    label_slab_scale: float = DEFAULT_LABEL_SLAB_SCALE,
+    annotation_weight_floor: float = DEFAULT_ANNOTATION_WEIGHT_FLOOR,
+    soft_skeleton_alpha: float = DEFAULT_SOFT_SKELETON_ALPHA,
+):
+    if soft_skeleton_alpha < 0.0:
+        raise ValueError("soft_skeleton_alpha must be greater than or equal to 0.")
+    if annotation_weight_floor <= 0.0 or annotation_weight_floor > 1.0:
+        raise ValueError("annotation_weight_floor must be in the interval (0, 1].")
+
     x_size, y_size, z_size = bounds
 
     optical_bundle_lists = []
     core_segments_flat = []
     projected_segments = []
+    annotation_segments = []
     visibility_segments = []
     visibility_weights = np.zeros(0, dtype=np.float64)
+    edt_focus = np.zeros((x_size, y_size), dtype=np.float64)
+    edt_soft = np.zeros((x_size, y_size), dtype=np.float64)
     edt_target = np.zeros((x_size, y_size), dtype=np.float64)
     vector_target = np.zeros((2, x_size, y_size), dtype=np.float64)
     visibility_target = np.zeros((x_size, y_size), dtype=np.float64)
@@ -363,13 +464,19 @@ def _prepare_2d_sted_scene(bounds: tuple, label_slab_thickness: Optional[float])
         bounds=bounds,
         base_sigma=1.0,
         z_anisotropy=np.random.uniform(1.6, 2.8),
-        noise_level=np.random.uniform(0.01, 0.08),
+        noise_level=np.random.uniform(0.005, 0.045),
         debris_count=np.random.randint(4, 16),
         gap_prob=np.random.uniform(0.0, 0.08),
+        enable_sted_monomer_cloud=True,
+        sted_monomer_mix=(0.70, 0.20, 0.10),
     )
     target_gen = TargetFieldGenerator((x_size, y_size), max_distance=TARGET_MAX_DISTANCE)
     visibility_target_gen = WeightedVisibilityTargetGenerator((x_size, y_size), base_sigma=rasterizer.base_sigma)
-    localization_slab_thickness = _resolve_localization_slab_thickness(rasterizer, label_slab_thickness)
+    localization_slab_thickness = _resolve_localization_slab_thickness(
+        rasterizer,
+        label_slab_thickness,
+        label_slab_scale=label_slab_scale,
+    )
     depth_of_field, _, _ = rasterizer._sted_optical_section_params()
     axial_fwhm = rasterizer._sted_axial_fwhm(depth_of_field)
 
@@ -407,8 +514,13 @@ def _prepare_2d_sted_scene(bounds: tuple, label_slab_thickness: Optional[float])
             rasterizer,
             target_gen,
             visibility_target_gen,
+            annotation_weight_floor=annotation_weight_floor,
+            soft_skeleton_alpha=soft_skeleton_alpha,
         )
         projected_segments = target_data["focus_segments"]
+        annotation_segments = target_data["annotation_segments"]
+        edt_focus = target_data["edt_focus"]
+        edt_soft = target_data["edt_soft"]
         edt_target = target_data["edt_target"]
         vector_target = target_data["vector_target"]
         visibility_target = target_data["visibility_target"]
@@ -425,21 +537,39 @@ def _prepare_2d_sted_scene(bounds: tuple, label_slab_thickness: Optional[float])
         "optical_bundle_lists": optical_bundle_lists,
         "core_segments": core_segments_flat,
         "projected_segments": projected_segments,
+        "annotation_segments": annotation_segments,
         "visibility_segments": visibility_segments,
         "visibility_weights": visibility_weights,
         "slice_center": slice_center,
+        "label_slab_scale": float(label_slab_scale),
         "label_slab_thickness": localization_slab_thickness,
+        "annotation_weight_floor": float(annotation_weight_floor),
+        "soft_skeleton_alpha": float(soft_skeleton_alpha),
         "axial_fwhm": axial_fwhm,
         "dynamic_range": (img_min, img_max),
         "rasterizer": rasterizer,
+        "edt_focus": edt_focus,
+        "edt_soft": edt_soft,
         "edt_target": edt_target,
         "vector_target": vector_target,
         "visibility_target": visibility_target,
     }
 
 
-def _build_2d_sample(bounds: tuple, label_slab_thickness: Optional[float]):
-    scene = _prepare_2d_sted_scene(bounds, label_slab_thickness)
+def _build_2d_sample(
+    bounds: tuple,
+    label_slab_thickness: Optional[float],
+    label_slab_scale: float = DEFAULT_LABEL_SLAB_SCALE,
+    annotation_weight_floor: float = DEFAULT_ANNOTATION_WEIGHT_FLOOR,
+    soft_skeleton_alpha: float = DEFAULT_SOFT_SKELETON_ALPHA,
+):
+    scene = _prepare_2d_sted_scene(
+        bounds,
+        label_slab_thickness,
+        label_slab_scale=label_slab_scale,
+        annotation_weight_floor=annotation_weight_floor,
+        soft_skeleton_alpha=soft_skeleton_alpha,
+    )
     image = scene["rasterizer"].render_sted_slice(
         scene["optical_bundle_lists"],
         slice_center=scene["slice_center"],
@@ -448,7 +578,15 @@ def _build_2d_sample(bounds: tuple, label_slab_thickness: Optional[float]):
     return image, scene["edt_target"], scene["vector_target"], scene["visibility_target"]
 
 
-def build_sted_debug_sample(bounds: tuple, synth_depth: int = 16, label_slab_thickness: Optional[float] = None, seed: int = None):
+def build_sted_debug_sample(
+    bounds: tuple,
+    synth_depth: int = 16,
+    label_slab_thickness: Optional[float] = None,
+    label_slab_scale: float = DEFAULT_LABEL_SLAB_SCALE,
+    annotation_weight_floor: float = DEFAULT_ANNOTATION_WEIGHT_FLOOR,
+    soft_skeleton_alpha: float = DEFAULT_SOFT_SKELETON_ALPHA,
+    seed: int = None,
+):
     if len(bounds) == 2:
         synth_bounds = (bounds[0], bounds[1], synth_depth)
     elif len(bounds) == 3:
@@ -462,7 +600,13 @@ def build_sted_debug_sample(bounds: tuple, synth_depth: int = 16, label_slab_thi
     if seed is not None:
         np.random.seed(seed)
 
-    scene = _prepare_2d_sted_scene(synth_bounds, label_slab_thickness)
+    scene = _prepare_2d_sted_scene(
+        synth_bounds,
+        label_slab_thickness,
+        label_slab_scale=label_slab_scale,
+        annotation_weight_floor=annotation_weight_floor,
+        soft_skeleton_alpha=soft_skeleton_alpha,
+    )
     debug_render = scene["rasterizer"].render_sted_slice_debug(
         scene["optical_bundle_lists"],
         slice_center=scene["slice_center"],
@@ -470,17 +614,24 @@ def build_sted_debug_sample(bounds: tuple, synth_depth: int = 16, label_slab_thi
     )
 
     debug_render["bounds"] = synth_bounds
+    debug_render["label_slab_scale"] = scene["label_slab_scale"]
     debug_render["label_slab_thickness"] = scene["label_slab_thickness"]
+    debug_render["annotation_weight_floor"] = scene["annotation_weight_floor"]
+    debug_render["soft_skeleton_alpha"] = scene["soft_skeleton_alpha"]
     debug_render["axial_fwhm"] = scene["axial_fwhm"]
+    debug_render["edt_focus"] = scene["edt_focus"]
+    debug_render["edt_soft"] = scene["edt_soft"]
     debug_render["edt_target"] = scene["edt_target"]
     debug_render["vector_target"] = scene["vector_target"]
     debug_render["visibility_target"] = scene["visibility_target"]
     debug_render["projected_segments"] = scene["projected_segments"]
+    debug_render["annotation_segments"] = scene["annotation_segments"]
     debug_render["visibility_segments"] = scene["visibility_segments"]
     debug_render["visibility_weights"] = scene["visibility_weights"]
     debug_render["core_segments"] = scene["core_segments"]
     debug_render["fiber_count"] = len(scene["optical_bundle_lists"])
     debug_render["projected_segment_count"] = len(scene["projected_segments"])
+    debug_render["annotation_segment_count"] = len(scene["annotation_segments"])
     debug_render["visibility_segment_count"] = len(scene["visibility_segments"])
     return debug_render
 
@@ -564,13 +715,29 @@ def _to_3d_tensors(volume, edt_target, vector_target):
     return volume_tensor, targets_tensor
 
 
-def process_single_sample(idx: int, file_offset: int, bounds: tuple, output_dir: str, emit_2d: bool, label_slab_thickness: Optional[float]):
+def process_single_sample(
+    idx: int,
+    file_offset: int,
+    bounds: tuple,
+    output_dir: str,
+    emit_2d: bool,
+    label_slab_thickness: Optional[float],
+    label_slab_scale: float,
+    annotation_weight_floor: float,
+    soft_skeleton_alpha: float,
+):
     import torch
 
     np.random.seed(None)
 
     if emit_2d:
-        image, edt_target, vector_target, visibility_target = _build_2d_sample(bounds, label_slab_thickness)
+        image, edt_target, vector_target, visibility_target = _build_2d_sample(
+            bounds,
+            label_slab_thickness,
+            label_slab_scale=label_slab_scale,
+            annotation_weight_floor=annotation_weight_floor,
+            soft_skeleton_alpha=soft_skeleton_alpha,
+        )
         volume_tensor, targets_tensor = _to_2d_tensors(image, edt_target, vector_target, visibility_target)
     else:
         volume, edt_target, vector_target = _build_3d_sample(bounds)
@@ -591,6 +758,9 @@ def build_dataset_split(
     workers: int,
     emit_2d: bool,
     label_slab_thickness: Optional[float],
+    label_slab_scale: float = DEFAULT_LABEL_SLAB_SCALE,
+    annotation_weight_floor: float = DEFAULT_ANNOTATION_WEIGHT_FLOOR,
+    soft_skeleton_alpha: float = DEFAULT_SOFT_SKELETON_ALPHA,
 ):
     split_dir = os.path.join(base_dir, split_name)
     os.makedirs(split_dir, exist_ok=True)
@@ -609,6 +779,9 @@ def build_dataset_split(
         output_dir=split_dir,
         emit_2d=emit_2d,
         label_slab_thickness=label_slab_thickness,
+        label_slab_scale=label_slab_scale,
+        annotation_weight_floor=annotation_weight_floor,
+        soft_skeleton_alpha=soft_skeleton_alpha,
     )
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
@@ -636,6 +809,24 @@ if __name__ == "__main__":
         default=None,
         help="Optional override for the narrow focus-localization slab in 2D mode. Defaults to the optical depth of field.",
     )
+    parser.add_argument(
+        "--label_slab_scale",
+        type=float,
+        default=DEFAULT_LABEL_SLAB_SCALE,
+        help="Scale factor applied to depth of field when --label_slab_thickness is not provided.",
+    )
+    parser.add_argument(
+        "--soft_skeleton_alpha",
+        type=float,
+        default=DEFAULT_SOFT_SKELETON_ALPHA,
+        help="Soft out-of-focus blend strength for EDT/vector targets in 2D STED generation.",
+    )
+    parser.add_argument(
+        "--annotation_weight_floor",
+        type=float,
+        default=DEFAULT_ANNOTATION_WEIGHT_FLOOR,
+        help="Axial-weight floor that defines the broader soft-annotation band in 2D STED generation.",
+    )
     parser.add_argument("--train_size", type=int, default=2000)
     parser.add_argument("--val_size", type=int, default=400)
     parser.add_argument("--test_size", type=int, default=400)
@@ -643,6 +834,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     dims = len(args.bounds)
+    if args.label_slab_scale <= 0.0:
+        raise ValueError("--label_slab_scale must be greater than 0.")
+    if args.annotation_weight_floor <= 0.0 or args.annotation_weight_floor > 1.0:
+        raise ValueError("--annotation_weight_floor must be in the interval (0, 1].")
+    if args.soft_skeleton_alpha < 0.0:
+        raise ValueError("--soft_skeleton_alpha must be greater than or equal to 0.")
+
     if dims == 2:
         if args.synth_depth < 2:
             raise ValueError("--synth_depth must be at least 2 when generating 2D slices.")
@@ -665,6 +863,9 @@ if __name__ == "__main__":
         workers=args.workers,
         emit_2d=emit_2d,
         label_slab_thickness=args.label_slab_thickness,
+        label_slab_scale=args.label_slab_scale,
+        annotation_weight_floor=args.annotation_weight_floor,
+        soft_skeleton_alpha=args.soft_skeleton_alpha,
     )
     build_dataset_split(
         "val",
@@ -675,6 +876,9 @@ if __name__ == "__main__":
         workers=args.workers,
         emit_2d=emit_2d,
         label_slab_thickness=args.label_slab_thickness,
+        label_slab_scale=args.label_slab_scale,
+        annotation_weight_floor=args.annotation_weight_floor,
+        soft_skeleton_alpha=args.soft_skeleton_alpha,
     )
     build_dataset_split(
         "test",
@@ -685,4 +889,7 @@ if __name__ == "__main__":
         workers=args.workers,
         emit_2d=emit_2d,
         label_slab_thickness=args.label_slab_thickness,
+        label_slab_scale=args.label_slab_scale,
+        annotation_weight_floor=args.annotation_weight_floor,
+        soft_skeleton_alpha=args.soft_skeleton_alpha,
     )
