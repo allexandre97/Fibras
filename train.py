@@ -23,14 +23,11 @@ class PrecomputedFiberDataset(Dataset):
 
     def __getitem__(self, idx):
         file_path = os.path.join(self.data_dir, self.files[idx])
-        # Force CPU mapping during IO to avoid cuda context locks
         data = torch.load(file_path, weights_only=True, map_location='cpu')
         vol, targets = data['volume'], data['targets']
         
         if self.dim == 2:
-            # Volume shape is (1, 1, Y, X). Squeeze to (1, Y, X).
             vol = vol.squeeze(1)
-            # Targets shape is (4, 1, Y, X). Extract EDT, Vx, and Vy channels only.
             targets = targets[[0, 1, 2], 0, :, :]
             
         return vol, targets
@@ -46,75 +43,68 @@ class MaskedVectorLoss(nn.Module):
         pred_edt, pred_vec = pred[:, 0:1], pred[:, 1:1+self.dim]
         targ_edt, targ_vec = target[:, 0:1], target[:, 1:1+self.dim]
 
+        # 1. Standard EDT Regression
         loss_edt = self.mse(pred_edt, targ_edt).mean()
 
+        # 2. Sign-Agnostic Vector Regression (Symmetric MSE)
         mask = (targ_edt > 0.0).float()
-        loss_vec_raw = self.mse(pred_vec, targ_vec) * mask
+        
+        # Calculate squared errors for both orientations, averaged across channels to maintain scale
+        err_pos = torch.sum((pred_vec - targ_vec)**2, dim=1, keepdim=True) / self.dim
+        err_neg = torch.sum((pred_vec + targ_vec)**2, dim=1, keepdim=True) / self.dim
+        
+        # Backpropagate strictly through the orientation that yields the lowest error
+        loss_vec_raw = torch.min(err_pos, err_neg) * mask
         
         mask_sum = mask.sum() + 1e-8 
         loss_vec = loss_vec_raw.sum() / mask_sum
 
         return loss_edt + self.vector_weight * loss_vec
 
-def train_model(gpus: str, data_dir: str, dim: int):
-    if gpus:
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpus
+def train_model(args):
+    if args.gpus:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
     else:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     num_gpus_available = torch.cuda.device_count()
 
-    base_batch_size_per_gpu = 4
-    batch_size = base_batch_size_per_gpu * max(1, num_gpus_available)
-    epochs = 50
-    lr = 1e-4
-    vector_loss_weight = 5.0
+    batch_size = args.base_batch_size * max(1, num_gpus_available)
 
     wandb.init(
-        project="fibras-cvfunet",
-        config={
-            "dimensionality": dim,
-            "global_batch_size": batch_size,
-            "base_batch_size_per_gpu": base_batch_size_per_gpu,
-            "epochs": epochs,
-            "learning_rate": lr,
-            "vector_loss_weight": vector_loss_weight,
-            "num_gpus": num_gpus_available,
-            "data_dir": data_dir
-        }
+        project="fibras-cvfunet-final",
+        config=vars(args)
     )
 
-    train_dir = os.path.join(data_dir, "train")
-    val_dir = os.path.join(data_dir, "val")
+    train_dir = os.path.join(args.data_dir, "train")
+    val_dir = os.path.join(args.data_dir, "val")
     
-    train_ds = PrecomputedFiberDataset(train_dir, dim=dim)
-    val_ds   = PrecomputedFiberDataset(val_dir, dim=dim)
+    train_ds = PrecomputedFiberDataset(train_dir, dim=args.dim)
+    val_ds   = PrecomputedFiberDataset(val_dir, dim=args.dim)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, 
                               num_workers=8, pin_memory=True, prefetch_factor=4, persistent_workers=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, 
                             num_workers=8, pin_memory=True, prefetch_factor=4, persistent_workers=True)
 
-    # Initialize requested dimensionality
-    model = FlexibleCVFUNet(in_channels=1, base_filters=16, dim=dim)
+    model = FlexibleCVFUNet(in_channels=1, base_filters=args.base_filters, dim=args.dim)
 
     if num_gpus_available > 1:
         model = nn.DataParallel(model)
         
     model = model.to(device)
     
-    criterion = MaskedVectorLoss(vector_weight=vector_loss_weight, dim=dim)
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    criterion = MaskedVectorLoss(vector_weight=args.vector_loss_weight, dim=args.dim)
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
 
-    wandb.watch(model, criterion, log="all", log_freq=20)
     best_val_loss = float('inf')
     os.makedirs("weights", exist_ok=True)
 
-    print(f"\nStarting {dim}D Training Loop...")
-    for epoch in range(epochs):
+    print(f"\nStarting Final {args.dim}D Training Loop...")
+    for epoch in range(args.epochs):
         model.train()
         train_loss = 0.0
         t0 = time.time()
@@ -142,8 +132,6 @@ def train_model(gpus: str, data_dir: str, dim: int):
                 optimizer.step()
             
             train_loss += loss.item()
-            if batch_idx % max(1, (len(train_loader)//5)) == 0:
-                print(f"Epoch [{epoch+1}/{epochs}] Batch [{batch_idx}/{len(train_loader)}] Loss: {loss.item():.4f}")
 
         train_loss /= len(train_loader)
         
@@ -175,16 +163,21 @@ def train_model(gpus: str, data_dir: str, dim: int):
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             state_dict = model.module.state_dict() if num_gpus_available > 1 else model.state_dict()
-            save_path = f"weights/cvfunet_{dim}d_best.pth"
+            save_path = f"weights/cvfunet_{args.dim}d_final.pth"
             torch.save(state_dict, save_path)
-            wandb.save(save_path)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train CVFUNet")
+    parser = argparse.ArgumentParser(description="Final Training for CVFUNet")
     parser.add_argument('--gpus', type=str, default="0")
     parser.add_argument('--data_dir', type=str, required=True)
-    parser.add_argument('--dim', type=int, choices=[2, 3], required=True, 
-                        help="Specify 2 for STED models or 3 for Confocal models")
-    args = parser.parse_args()
+    parser.add_argument('--dim', type=int, choices=[2, 3], required=True)
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--base_batch_size', type=int, default=4)
+    # Swept Parameters
+    parser.add_argument('--base_filters', type=int, required=True)
+    parser.add_argument('--learning_rate', type=float, required=True)
+    parser.add_argument('--weight_decay', type=float, required=True)
+    parser.add_argument('--vector_loss_weight', type=float, required=True)
     
-    train_model(args.gpus, args.data_dir, args.dim)
+    args = parser.parse_args()
+    train_model(args)

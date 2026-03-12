@@ -1,84 +1,86 @@
 import numpy as np
-import networkx as nx
-from scipy.ndimage import map_coordinates
+import scipy.ndimage as ndi
+from scipy.interpolate import RegularGridInterpolator
 
 class StreamlineTracker:
-    def __init__(self, step_size: float = 0.5, edt_threshold: float = 0.5, max_steps: int = 1000):
+    def __init__(self, step_size=0.5, min_edt=0.15, max_steps=5000):
         self.step_size = step_size
-        self.edt_threshold = edt_threshold
+        self.min_edt = min_edt
         self.max_steps = max_steps
 
-    def _sample_field(self, field, pos):
-        # Sample continuously from the 3D grid
-        return map_coordinates(field, [[pos[0]], [pos[1]], [pos[2]]], order=1, mode='constant', cval=0.0)[0]
-
-    def _track_direction(self, start_pos, edt_map, vx, vy, vz, direction=1):
-        path = [start_pos]
-        curr_pos = np.copy(start_pos)
+    def track(self, edt_map, vector_map):
+        dim = edt_map.ndim
+        is_2d = (dim == 2)
         
-        for _ in range(self.max_steps):
-            v_x = self._sample_field(vx, curr_pos)
-            v_y = self._sample_field(vy, curr_pos)
-            v_z = self._sample_field(vz, curr_pos)
-            
-            vec = np.array([v_x, v_y, v_z])
-            norm = np.linalg.norm(vec)
-            if norm < 1e-5: break
-                
-            vec = (vec / norm) * direction
-            next_pos = curr_pos + vec * self.step_size
-            
-            # Check stopping condition (exited the fiber body)
-            if self._sample_field(edt_map, next_pos) < self.edt_threshold:
-                break
-                
-            path.append(next_pos)
-            curr_pos = next_pos
-            
-        return path
-
-    def extract_graph(self, edt_pred: np.ndarray, vector_pred: np.ndarray) -> nx.Graph:
-        """
-        edt_pred: (Z, Y, X)
-        vector_pred: (3, Z, Y, X)
-        """
-        vx, vy, vz = vector_pred[0], vector_pred[1], vector_pred[2]
+        # 1. Seed Generation: Find local cores (maxima) in the EDT
+        valid_mask = edt_map > self.min_edt
+        local_max = ndi.maximum_filter(edt_map, size=3) == edt_map
+        seeds = np.argwhere(local_max & valid_mask).astype(float)
         
-        # 1. Seeding: Find strong local maxima in the inverted EDT prediction
-        from skimage.feature import peak_local_max
-        seeds = peak_local_max(edt_pred, min_distance=2, threshold_abs=self.edt_threshold)
+        # 2. Setup Continuous Space Interpolators
+        grid_axes = [np.arange(s) for s in edt_map.shape]
+        edt_interp = RegularGridInterpolator(grid_axes, edt_map, bounds_error=False, fill_value=0.0)
         
-        graph = nx.Graph()
-        node_idx = 0
+        # Map channels to the last dimension for SciPy interpolation
+        vec_transposed = np.transpose(vector_map, (1, 2, 0)) if is_2d else np.transpose(vector_map, (1, 2, 3, 0))
+        vec_interp = RegularGridInterpolator(grid_axes, vec_transposed, bounds_error=False, fill_value=0.0)
         
-        # 2. Integration
-        # To avoid redundant tracking, mask out areas already tracked
-        visited_mask = np.zeros_like(edt_pred, dtype=bool)
+        streamlines = []
         
         for seed in seeds:
-            if visited_mask[tuple(seed)]: continue
+            # Integrate in both the positive and negative directions from the seed
+            for direction in [1, -1]:
+                path = [seed.copy()]
+                current_pos = seed.copy()
                 
-            # Track forwards and backwards along the vector flow
-            path_fwd = self._track_direction(seed.astype(float), edt_pred, vx, vy, vz, direction=1)
-            path_bwd = self._track_direction(seed.astype(float), edt_pred, vx, vy, vz, direction=-1)
-            
-            # Combine paths and add to graph
-            full_path = path_bwd[::-1][:-1] + path_fwd
-            
-            prev_node = None
-            for p in full_path:
-                idx_tuple = tuple(np.round(p).astype(int))
-                if not (0 <= idx_tuple[0] < edt_pred.shape[0] and 
-                        0 <= idx_tuple[1] < edt_pred.shape[1] and 
-                        0 <= idx_tuple[2] < edt_pred.shape[2]):
-                    continue
+                v_init = vec_interp(current_pos)[0]
+                norm = np.linalg.norm(v_init)
+                if norm < 1e-6: continue
+                
+                current_vec = (v_init / norm) * direction
+                
+                for _ in range(self.max_steps):
+                    # Map mathematical [Vx, Vy, Vz] arrays to spatial [Z, Y, X] coordinates
+                    if is_2d:
+                        step = np.array([current_vec[1], current_vec[0]]) 
+                    else:
+                        step = np.array([current_vec[2], current_vec[1], current_vec[0]])
+                        
+                    next_pos = current_pos + step * self.step_size
                     
-                visited_mask[idx_tuple] = True
-                
-                graph.add_node(node_idx, pos=p)
-                if prev_node is not None:
-                    graph.add_edge(prev_node, node_idx)
-                prev_node = node_idx
-                node_idx += 1
-                
-        return graph
+                    # Abort if the streamline exits the biological fiber volume
+                    edt_val = edt_interp(next_pos)[0]
+                    if edt_val < self.min_edt: break
+                        
+                    next_vec = vec_interp(next_pos)[0]
+                    norm = np.linalg.norm(next_vec)
+                    if norm < 1e-6: break
+                    next_vec = next_vec / norm
+                    
+                    # Sign-Agnostic Momentum Resolution
+                    # If the network arbitrarily flipped the vector polarity, flip it back to maintain momentum
+                    if np.dot(current_vec, next_vec) < 0:
+                        next_vec = -next_vec
+                        
+                    path.append(next_pos.copy())
+                    current_pos = next_pos
+                    current_vec = next_vec
+                    
+                if len(path) > 1:
+                    streamlines.append(np.array(path))
+                    
+        return streamlines
+
+    def to_binary_skeleton(self, streamlines, shape):
+        """Burns the floating-point streamlines into a discrete binary TIFF mask."""
+        skeleton = np.zeros(shape, dtype=np.uint8)
+        for path in streamlines:
+            coords = np.round(path).astype(int)
+            for i in range(len(shape)):
+                coords[:, i] = np.clip(coords[:, i], 0, shape[i] - 1)
+            
+            if len(shape) == 2:
+                skeleton[coords[:, 0], coords[:, 1]] = 1
+            else:
+                skeleton[coords[:, 0], coords[:, 1], coords[:, 2]] = 1
+        return skeleton
