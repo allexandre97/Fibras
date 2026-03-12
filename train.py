@@ -40,6 +40,7 @@ class MaskedVectorLoss(nn.Module):
         visibility_weight: float = 0.35,
         dim: int = 3,
         vector_mask_floor: float = 0.05,
+        loss_visibility_floor: float = 0.25,
     ):
         super().__init__()
         self.mse = nn.MSELoss(reduction='none')
@@ -48,18 +49,33 @@ class MaskedVectorLoss(nn.Module):
         self.dim = dim
         if vector_mask_floor < 0.0:
             raise ValueError("vector_mask_floor must be non-negative.")
+        if loss_visibility_floor < 0.0 or loss_visibility_floor > 1.0:
+            raise ValueError("loss_visibility_floor must be in the interval [0, 1].")
         self.vector_mask_floor = vector_mask_floor
+        self.loss_visibility_floor = loss_visibility_floor
 
     def compute_components(self, pred, target):
         pred_edt, pred_vec = pred[:, 0:1], pred[:, 1:1+self.dim]
         targ_edt, targ_vec = target[:, 0:1], target[:, 1:1+self.dim]
+        vis_conf = None
 
-        # 1. Standard EDT Regression
-        loss_edt = self.mse(pred_edt, targ_edt).mean()
+        if self.dim == 2:
+            targ_visibility = target[:, 3:4]
+            vis_conf = torch.clamp(targ_visibility, self.loss_visibility_floor, 1.0)
+
+        # 1. EDT Regression (visibility-weighted in 2D STED)
+        edt_err = self.mse(pred_edt, targ_edt)
+        if vis_conf is None:
+            loss_edt = edt_err.mean()
+        else:
+            vis_sum = vis_conf.sum() + 1e-8
+            loss_edt = (edt_err * vis_conf).sum() / vis_sum
 
         # 2. Sign-Agnostic Vector Regression (Symmetric MSE)
         mask_conf = torch.clamp(targ_edt, 0.0, 1.0)
         mask = (mask_conf > self.vector_mask_floor).float() * mask_conf
+        if vis_conf is not None:
+            mask = mask * vis_conf
         
         # Calculate squared errors for both orientations, averaged across channels to maintain scale
         err_pos = torch.sum((pred_vec - targ_vec)**2, dim=1, keepdim=True) / self.dim
@@ -78,7 +94,6 @@ class MaskedVectorLoss(nn.Module):
 
         if self.dim == 2:
             pred_visibility = pred[:, 3:4]
-            targ_visibility = target[:, 3:4]
             components["visibility"] = F.binary_cross_entropy_with_logits(pred_visibility, targ_visibility)
 
         return components
@@ -129,6 +144,7 @@ def train_model(args):
         visibility_weight=args.visibility_loss_weight,
         dim=args.dim,
         vector_mask_floor=args.vector_mask_floor,
+        loss_visibility_floor=args.loss_visibility_floor,
     )
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     
@@ -214,6 +230,7 @@ if __name__ == "__main__":
     parser.add_argument('--vector_loss_weight', type=float, required=True)
     parser.add_argument('--visibility_loss_weight', type=float, default=0.35)
     parser.add_argument('--vector_mask_floor', type=float, default=0.05)
+    parser.add_argument('--loss_visibility_floor', type=float, default=0.25)
     
     args = parser.parse_args()
     train_model(args)

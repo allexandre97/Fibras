@@ -1,5 +1,4 @@
 import os
-import time
 import argparse
 import torch
 import torch.nn as nn
@@ -43,6 +42,8 @@ def train_sweep():
         vector_weight=config.vector_loss_weight,
         visibility_weight=getattr(config, "visibility_loss_weight", 0.35),
         dim=GLOBAL_DIM,
+        vector_mask_floor=getattr(config, "vector_mask_floor", 0.05),
+        loss_visibility_floor=getattr(config, "loss_visibility_floor", 0.25),
     )
     optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
@@ -170,6 +171,15 @@ if __name__ == "__main__":
                 'distribution': 'uniform',
                 'min': 1.0,
                 'max': 10.0
+            },
+            'visibility_loss_weight': {
+                'value': 0.35
+            },
+            'vector_mask_floor': {
+                'value': 0.05
+            },
+            'loss_visibility_floor': {
+                'value': 0.25
             },
             'base_filters': {
                 'values': [8, 16, 32]
