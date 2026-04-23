@@ -137,6 +137,8 @@ class EmpiricalRasterizer:
         gap_prob=0.08,
         enable_sted_monomer_cloud: bool = False,
         sted_monomer_mix: Tuple[float, float, float] = (0.70, 0.20, 0.10),
+        stripe_strength: float = None,
+        vignette_edge_range: Tuple[float, float] = None,
     ):
         self.bounds = bounds
         self.base_sigma = base_sigma
@@ -145,6 +147,8 @@ class EmpiricalRasterizer:
         self.debris_count = debris_count
         self.gap_prob = gap_prob
         self.enable_sted_monomer_cloud = bool(enable_sted_monomer_cloud)
+        self.stripe_strength = stripe_strength
+        self.vignette_edge_range = vignette_edge_range
 
         monomer_mix_arr = np.asarray(sted_monomer_mix, dtype=np.float64)
         if monomer_mix_arr.shape != (3,):
@@ -336,7 +340,8 @@ class EmpiricalRasterizer:
     def _apply_3d_striping(self, volume):
         stripe_axis = np.random.choice([0, 1])
         stripes = np.ones(self.bounds[stripe_axis])
-        stripes += np.random.normal(0, 0.02, size=self.bounds[stripe_axis])
+        stripe_strength = 0.02 if self.stripe_strength is None else float(self.stripe_strength)
+        stripes += np.random.normal(0, stripe_strength, size=self.bounds[stripe_axis])
 
         if stripe_axis == 0:
             volume *= stripes[:, None, None]
@@ -351,7 +356,8 @@ class EmpiricalRasterizer:
         vignette = np.exp(
             -(x_grid**2 + y_grid**2 + (0.35 * z_grid) ** 2) / (2 * (max(self.bounds) * 0.8) ** 2)
         )
-        edge_brightness = np.random.uniform(0.60, 0.85)
+        edge_range = (0.60, 0.85) if self.vignette_edge_range is None else self.vignette_edge_range
+        edge_brightness = np.random.uniform(*edge_range)
         vignette = edge_brightness + (1.0 - edge_brightness) * (vignette / vignette.max())
         return volume * vignette
 
@@ -435,7 +441,8 @@ class EmpiricalRasterizer:
     def _apply_2d_striping(self, image):
         stripe_axis = np.random.choice([0, 1])
         stripes = np.ones(image.shape[stripe_axis])
-        stripes += np.random.normal(0, 0.015, size=image.shape[stripe_axis])
+        stripe_strength = 0.015 if self.stripe_strength is None else float(self.stripe_strength)
+        stripes += np.random.normal(0, stripe_strength, size=image.shape[stripe_axis])
 
         if stripe_axis == 0:
             image *= stripes[:, None]
@@ -449,7 +456,8 @@ class EmpiricalRasterizer:
         y_grid = np.arange(self.bounds[1]) - (self.bounds[1] / 2.0)
         xx, yy = np.meshgrid(x_grid, y_grid, indexing="ij")
         vignette = np.exp(-(xx**2 + yy**2) / (2 * (max(self.bounds[:2]) * 0.85) ** 2))
-        edge_brightness = np.random.uniform(0.72, 0.90)
+        edge_range = (0.72, 0.90) if self.vignette_edge_range is None else self.vignette_edge_range
+        edge_brightness = np.random.uniform(*edge_range)
         vignette = edge_brightness + (1.0 - edge_brightness) * (vignette / vignette.max())
         return image * vignette
 

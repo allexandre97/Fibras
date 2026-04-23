@@ -9,6 +9,12 @@ import numpy as np
 from src.core import FiberSegment, ReflectiveBoundary
 from src.rasterization import EmpiricalRasterizer
 from src.sted import vector_to_orientation_channels_np
+from src.sted_calibration import (
+    CalibrationSampler,
+    estimate_calibrated_fiber_count,
+    load_calibration_profile,
+    match_intensity_to_scene_profile,
+)
 from src.synthesis import CompositeGenerator, RandomWalkGenerator, SpaceColonizationGenerator
 from src.targets import TargetFieldGenerator, WeightedVisibilityTargetGenerator
 
@@ -243,19 +249,24 @@ def _generate_phenotype(bounds: tuple):
     return composite.generate()
 
 
-def _generate_constrained_random_walk(bounds: tuple):
+def _generate_constrained_random_walk(bounds: tuple, scene_config: Optional[dict] = None):
     x_size, y_size, z_size = bounds
-    step_length = max(0.8, max(x_size, y_size) * np.random.uniform(*STED_2D_STEP_SCALE_RANGE))
-    num_steps = np.random.randint(SHORT_FIBER_STEPS[0], SHORT_FIBER_STEPS[1] + 1)
-    max_turn_angle = np.deg2rad(np.random.uniform(SHORT_TURN_DEGREES[0], SHORT_TURN_DEGREES[1]))
+    scene_config = scene_config or {}
+    step_scale_range = scene_config.get("step_scale_range", STED_2D_STEP_SCALE_RANGE)
+    num_steps_range = scene_config.get("num_steps_range", SHORT_FIBER_STEPS)
+    turn_degrees_range = scene_config.get("turn_degrees_range", SHORT_TURN_DEGREES)
+
+    step_length = max(0.8, max(x_size, y_size) * np.random.uniform(*step_scale_range))
+    num_steps = np.random.randint(int(num_steps_range[0]), int(num_steps_range[1]) + 1)
+    max_turn_angle = np.deg2rad(np.random.uniform(float(turn_degrees_range[0]), float(turn_degrees_range[1])))
 
     start_pos = (
         np.random.uniform(x_size * 0.1, x_size * 0.9),
         np.random.uniform(y_size * 0.1, y_size * 0.9),
         np.random.uniform(z_size * 0.2, z_size * 0.8),
     )
-    initial_direction = np.random.normal(size=3) * STED_2D_INITIAL_DIR_SCALE
-    orthogonal_scale = STED_2D_ORTHOGONAL_SCALE
+    initial_direction = np.random.normal(size=3) * scene_config.get("initial_dir_scale", STED_2D_INITIAL_DIR_SCALE)
+    orthogonal_scale = scene_config.get("orthogonal_scale", STED_2D_ORTHOGONAL_SCALE)
 
     generator = RandomWalkGenerator(
         start_pos=start_pos,
@@ -479,6 +490,7 @@ def _prepare_2d_sted_scene(
     annotation_weight_floor: float = DEFAULT_ANNOTATION_WEIGHT_FLOOR,
     soft_skeleton_alpha: float = DEFAULT_SOFT_SKELETON_ALPHA,
     visibility_weight_floor: float = DEFAULT_VISIBILITY_WEIGHT_FLOOR,
+    calibration_sampler: Optional[CalibrationSampler] = None,
 ):
     if soft_skeleton_alpha < 0.0:
         raise ValueError("soft_skeleton_alpha must be greater than or equal to 0.")
@@ -506,7 +518,8 @@ def _prepare_2d_sted_scene(
     walk_parameter_samples = []
     bundle_sizes = []
     slice_center = np.random.uniform(z_size * 0.2, z_size * 0.8)
-    haze_regime = _sample_sted_haze_regime()
+    scene_config = calibration_sampler.sample_scene_config(bounds) if calibration_sampler is not None else None
+    haze_regime = scene_config["haze_regime"] if scene_config is not None else _sample_sted_haze_regime()
     enable_monomer_cloud, monomer_mix = _resolve_sted_monomer_config(haze_regime)
     
     # Reduced debris density to prevent cluttering the image with too many "dots"
@@ -514,13 +527,15 @@ def _prepare_2d_sted_scene(
 
     rasterizer = EmpiricalRasterizer(
         bounds=bounds,
-        base_sigma=1.0,
-        z_anisotropy=np.random.uniform(1.6, 2.8),
-        noise_level=np.random.uniform(0.005, 0.045),
-        debris_count=max(1, dynamic_debris_count),
-        gap_prob=np.random.uniform(0.0, 0.08),
+        base_sigma=scene_config.get("base_sigma", 1.0) if scene_config is not None else 1.0,
+        z_anisotropy=scene_config.get("z_anisotropy", np.random.uniform(1.6, 2.8)) if scene_config is not None else np.random.uniform(1.6, 2.8),
+        noise_level=scene_config.get("noise_level", np.random.uniform(0.005, 0.045)) if scene_config is not None else np.random.uniform(0.005, 0.045),
+        debris_count=max(0, int(scene_config.get("debris_count", dynamic_debris_count))) if scene_config is not None else max(1, dynamic_debris_count),
+        gap_prob=scene_config.get("gap_prob", np.random.uniform(0.0, 0.08)) if scene_config is not None else np.random.uniform(0.0, 0.08),
         enable_sted_monomer_cloud=enable_monomer_cloud,
         sted_monomer_mix=monomer_mix,
+        stripe_strength=scene_config.get("stripe_strength") if scene_config is not None else None,
+        vignette_edge_range=scene_config.get("vignette_edge_range") if scene_config is not None else None,
     )
     target_gen = TargetFieldGenerator((x_size, y_size), max_distance=TARGET_MAX_DISTANCE)
     visibility_target_gen = WeightedVisibilityTargetGenerator((x_size, y_size), base_sigma=rasterizer.base_sigma)
@@ -531,6 +546,7 @@ def _prepare_2d_sted_scene(
     )
     depth_of_field, _, _ = rasterizer._sted_optical_section_params()
     axial_fwhm = rasterizer._sted_axial_fwhm(depth_of_field)
+    dynamic_range = scene_config["dynamic_range"] if scene_config is not None else None
 
     for _ in range(6):
         optical_bundle_lists = []
@@ -538,21 +554,31 @@ def _prepare_2d_sted_scene(
         walk_parameter_samples = []
         bundle_sizes = []
 
-        num_fibers = int(xy_area * np.random.uniform(*STED_2D_FIBER_DENSITY_RANGE))
-        num_fibers = max(1, num_fibers)
+        if scene_config is None:
+            num_fibers = int(xy_area * np.random.uniform(*STED_2D_FIBER_DENSITY_RANGE))
+            num_fibers = max(1, num_fibers)
+        else:
+            num_fibers = estimate_calibrated_fiber_count(bounds, scene_config, depth_of_field)
         requested_fiber_count = int(num_fibers)
         for _ in range(num_fibers):
-            core_segments, walk_params = _generate_constrained_random_walk(bounds)
+            core_segments, walk_params = _generate_constrained_random_walk(bounds, scene_config=scene_config)
             if not core_segments:
                 continue
 
             core_segments_flat.extend(core_segments)
             walk_parameter_samples.append(walk_params)
 
-            bundle_size = int(np.random.choice(STED_2D_BUNDLE_SIZES, p=STED_2D_BUNDLE_PROBS))
+            bundle_probs = (
+                np.asarray(scene_config.get("bundle_probs"), dtype=np.float64)
+                if scene_config is not None and scene_config.get("bundle_probs") is not None
+                else STED_2D_BUNDLE_PROBS
+            )
+            bundle_probs = bundle_probs / bundle_probs.sum()
+            bundle_size = int(np.random.choice(STED_2D_BUNDLE_SIZES, p=bundle_probs))
             bundle_sizes.append(bundle_size)
             if bundle_size > 1:
-                jitter_amount = np.random.uniform(*STED_2D_JITTER_RANGE)
+                jitter_range = scene_config.get("jitter_range", STED_2D_JITTER_RANGE) if scene_config is not None else STED_2D_JITTER_RANGE
+                jitter_amount = np.random.uniform(*jitter_range)
                 optical_segments = apply_optical_jitter(
                     core_segments,
                     bundle_size=bundle_size,
@@ -585,11 +611,19 @@ def _prepare_2d_sted_scene(
         visibility_target = target_data["visibility_target"]
         visibility_segments = target_data["visibility_segments"]
         visibility_weights = target_data["visibility_weights"]
-        if core_segments_flat and projected_segments:
+        if scene_config is not None:
+            target_skeleton_fraction = float(scene_config.get("target_skeleton_fraction", 0.0))
+            centerline_proxy = float(np.mean(edt_target > 0.85))
+            if num_fibers == 0 or projected_segments:
+                if target_skeleton_fraction <= 0.0 or centerline_proxy <= max(0.10, 8.0 * target_skeleton_fraction):
+                    break
+        elif core_segments_flat and projected_segments:
             break
 
-    img_min = np.random.uniform(0.18, 0.45)
-    img_max = np.random.uniform(img_min + 0.15, 1.0)
+    if dynamic_range is None:
+        img_min = np.random.uniform(0.18, 0.45)
+        img_max = np.random.uniform(img_min + 0.15, 1.0)
+        dynamic_range = (img_min, img_max)
 
     return {
         "bounds": bounds,
@@ -610,7 +644,8 @@ def _prepare_2d_sted_scene(
         "soft_skeleton_alpha": float(soft_skeleton_alpha),
         "visibility_weight_floor": float(visibility_weight_floor),
         "axial_fwhm": axial_fwhm,
-        "dynamic_range": (img_min, img_max),
+        "dynamic_range": dynamic_range,
+        "calibration_scene_config": scene_config,
         "rasterizer": rasterizer,
         "edt_focus": edt_focus,
         "edt_soft": edt_soft,
@@ -627,6 +662,8 @@ def _build_2d_sample(
     annotation_weight_floor: float = DEFAULT_ANNOTATION_WEIGHT_FLOOR,
     soft_skeleton_alpha: float = DEFAULT_SOFT_SKELETON_ALPHA,
     visibility_weight_floor: float = DEFAULT_VISIBILITY_WEIGHT_FLOOR,
+    calibration_sampler: Optional[CalibrationSampler] = None,
+    return_metadata: bool = False,
 ):
     scene = _prepare_2d_sted_scene(
         bounds,
@@ -635,12 +672,23 @@ def _build_2d_sample(
         annotation_weight_floor=annotation_weight_floor,
         soft_skeleton_alpha=soft_skeleton_alpha,
         visibility_weight_floor=visibility_weight_floor,
+        calibration_sampler=calibration_sampler,
     )
     image = scene["rasterizer"].render_sted_slice(
         scene["optical_bundle_lists"],
         slice_center=scene["slice_center"],
         dynamic_range=scene["dynamic_range"],
     )
+    if scene["calibration_scene_config"] is not None:
+        image = match_intensity_to_scene_profile(image, scene["calibration_scene_config"])
+    if return_metadata:
+        metadata = {
+            "requested_fiber_count": scene["requested_fiber_count"],
+            "haze_regime": scene["haze_regime"],
+            "dynamic_range": scene["dynamic_range"],
+            "calibration_scene_config": scene["calibration_scene_config"],
+        }
+        return image, scene["edt_target"], scene["vector_target"], scene["visibility_target"], metadata
     return image, scene["edt_target"], scene["vector_target"], scene["visibility_target"]
 
 
@@ -653,6 +701,7 @@ def build_sted_debug_sample(
     soft_skeleton_alpha: float = DEFAULT_SOFT_SKELETON_ALPHA,
     visibility_weight_floor: float = DEFAULT_VISIBILITY_WEIGHT_FLOOR,
     seed: int = None,
+    calibration_sampler: Optional[CalibrationSampler] = None,
 ):
     if len(bounds) == 2:
         synth_bounds = (bounds[0], bounds[1], synth_depth)
@@ -674,6 +723,7 @@ def build_sted_debug_sample(
         annotation_weight_floor=annotation_weight_floor,
         soft_skeleton_alpha=soft_skeleton_alpha,
         visibility_weight_floor=visibility_weight_floor,
+        calibration_sampler=calibration_sampler,
     )
     debug_render = scene["rasterizer"].render_sted_slice_debug(
         scene["optical_bundle_lists"],
@@ -689,6 +739,7 @@ def build_sted_debug_sample(
     debug_render["soft_skeleton_alpha"] = scene["soft_skeleton_alpha"]
     debug_render["visibility_weight_floor"] = scene["visibility_weight_floor"]
     debug_render["axial_fwhm"] = scene["axial_fwhm"]
+    debug_render["calibration_scene_config"] = scene["calibration_scene_config"]
     debug_render["edt_focus"] = scene["edt_focus"]
     debug_render["edt_soft"] = scene["edt_soft"]
     debug_render["edt_target"] = scene["edt_target"]
@@ -808,28 +859,48 @@ def process_single_sample(
     annotation_weight_floor: float,
     soft_skeleton_alpha: float,
     visibility_weight_floor: float,
+    synthesis_mode: str = "legacy",
+    calibration_profile: Optional[dict] = None,
+    real_regime: str = "global",
+    emit_synthesis_metadata: bool = False,
 ):
     import torch
 
     np.random.seed(None)
+    calibration_sampler = None
+    if emit_2d and synthesis_mode == "calibrated":
+        if calibration_profile is None:
+            raise ValueError("Calibrated 2D synthesis requires a calibration profile.")
+        calibration_sampler = CalibrationSampler(calibration_profile, real_regime=real_regime)
 
     if emit_2d:
-        image, edt_target, vector_target, visibility_target = _build_2d_sample(
+        sample = _build_2d_sample(
             bounds,
             label_slab_thickness,
             label_slab_scale=label_slab_scale,
             annotation_weight_floor=annotation_weight_floor,
             soft_skeleton_alpha=soft_skeleton_alpha,
             visibility_weight_floor=visibility_weight_floor,
+            calibration_sampler=calibration_sampler,
+            return_metadata=emit_synthesis_metadata,
         )
+        if emit_synthesis_metadata:
+            image, edt_target, vector_target, visibility_target, metadata = sample
+        else:
+            image, edt_target, vector_target, visibility_target = sample
+            metadata = None
         volume_tensor, targets_tensor = _to_2d_tensors(image, edt_target, vector_target, visibility_target)
     else:
         volume, edt_target, vector_target = _build_3d_sample(bounds)
         volume_tensor, targets_tensor = _to_3d_tensors(volume, edt_target, vector_target)
+        metadata = None
 
     file_id = file_offset + idx
     file_path = os.path.join(output_dir, f"sample_{file_id}.pt")
-    torch.save({"volume": volume_tensor, "targets": targets_tensor}, file_path)
+    record = {"volume": volume_tensor, "targets": targets_tensor}
+    if metadata is not None:
+        record["metadata"] = metadata
+    torch.save(record, file_path)
     return file_id
 
 
@@ -846,6 +917,10 @@ def build_dataset_split(
     annotation_weight_floor: float = DEFAULT_ANNOTATION_WEIGHT_FLOOR,
     soft_skeleton_alpha: float = DEFAULT_SOFT_SKELETON_ALPHA,
     visibility_weight_floor: float = DEFAULT_VISIBILITY_WEIGHT_FLOOR,
+    synthesis_mode: str = "legacy",
+    calibration_profile: Optional[dict] = None,
+    real_regime: str = "global",
+    emit_synthesis_metadata: bool = False,
 ):
     split_dir = os.path.join(base_dir, split_name)
     os.makedirs(split_dir, exist_ok=True)
@@ -868,6 +943,10 @@ def build_dataset_split(
         annotation_weight_floor=annotation_weight_floor,
         soft_skeleton_alpha=soft_skeleton_alpha,
         visibility_weight_floor=visibility_weight_floor,
+        synthesis_mode=synthesis_mode,
+        calibration_profile=calibration_profile,
+        real_regime=real_regime,
+        emit_synthesis_metadata=emit_synthesis_metadata,
     )
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
@@ -919,6 +998,31 @@ if __name__ == "__main__":
         default=DEFAULT_VISIBILITY_WEIGHT_FLOOR,
         help="Minimum axial visibility weight for including out-of-focus skeleton support in 2D STED visibility targets.",
     )
+    parser.add_argument(
+        "--synthesis_mode",
+        type=str,
+        choices=["legacy", "calibrated"],
+        default="legacy",
+        help="Use legacy hard-coded STED priors or a saved real-data calibration profile.",
+    )
+    parser.add_argument(
+        "--calibration_profile",
+        type=str,
+        default=None,
+        help="Path to reports/sted_real_profile.json produced by analyze_real_sted.py.",
+    )
+    parser.add_argument(
+        "--real_regime",
+        type=str,
+        choices=["global", "condition", "div"],
+        default="global",
+        help="Calibration grouping to sample in calibrated 2D mode.",
+    )
+    parser.add_argument(
+        "--emit_synthesis_metadata",
+        action="store_true",
+        help="Store sampled synthesis parameters in each generated .pt record.",
+    )
     parser.add_argument("--train_size", type=int, default=2000)
     parser.add_argument("--val_size", type=int, default=400)
     parser.add_argument("--test_size", type=int, default=400)
@@ -934,6 +1038,8 @@ if __name__ == "__main__":
         raise ValueError("--soft_skeleton_alpha must be greater than or equal to 0.")
     if args.visibility_weight_floor <= 0.0 or args.visibility_weight_floor > 1.0:
         raise ValueError("--visibility_weight_floor must be in the interval (0, 1].")
+    if args.synthesis_mode == "calibrated" and args.calibration_profile is None:
+        raise ValueError("--synthesis_mode calibrated requires --calibration_profile.")
 
     if dims == 2:
         if args.synth_depth < 2:
@@ -947,6 +1053,11 @@ if __name__ == "__main__":
         raise ValueError("Bounds must be either 2 (X, Y) or 3 (X, Y, Z) integers.")
 
     os.makedirs(args.output_dir, exist_ok=True)
+    calibration_profile = None
+    if args.synthesis_mode == "calibrated":
+        if not emit_2d:
+            raise ValueError("Calibrated synthesis is currently supported for 2D STED generation only.")
+        calibration_profile = load_calibration_profile(args.calibration_profile)
 
     build_dataset_split(
         "train",
@@ -961,6 +1072,10 @@ if __name__ == "__main__":
         annotation_weight_floor=args.annotation_weight_floor,
         soft_skeleton_alpha=args.soft_skeleton_alpha,
         visibility_weight_floor=args.visibility_weight_floor,
+        synthesis_mode=args.synthesis_mode,
+        calibration_profile=calibration_profile,
+        real_regime=args.real_regime,
+        emit_synthesis_metadata=args.emit_synthesis_metadata,
     )
     build_dataset_split(
         "val",
@@ -975,6 +1090,10 @@ if __name__ == "__main__":
         annotation_weight_floor=args.annotation_weight_floor,
         soft_skeleton_alpha=args.soft_skeleton_alpha,
         visibility_weight_floor=args.visibility_weight_floor,
+        synthesis_mode=args.synthesis_mode,
+        calibration_profile=calibration_profile,
+        real_regime=args.real_regime,
+        emit_synthesis_metadata=args.emit_synthesis_metadata,
     )
     build_dataset_split(
         "test",
@@ -989,4 +1108,8 @@ if __name__ == "__main__":
         annotation_weight_floor=args.annotation_weight_floor,
         soft_skeleton_alpha=args.soft_skeleton_alpha,
         visibility_weight_floor=args.visibility_weight_floor,
+        synthesis_mode=args.synthesis_mode,
+        calibration_profile=calibration_profile,
+        real_regime=args.real_regime,
+        emit_synthesis_metadata=args.emit_synthesis_metadata,
     )
