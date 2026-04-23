@@ -6,8 +6,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import wandb
 
-from src.model import FlexibleCVFUNet
-from train import PrecomputedFiberDataset, MaskedVectorLoss
+from src.model import STEDResUNet2D
+from train import PrecomputedFiberDataset, StedFieldLoss2D, _add_metric_batch, _average_metrics, _empty_metric_totals
 
 def train_sweep():
     wandb.init()
@@ -16,47 +16,47 @@ def train_sweep():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     num_gpus_available = torch.cuda.device_count()
 
-    base_batch_size_per_gpu = 4
+    base_batch_size_per_gpu = 2
     batch_size = base_batch_size_per_gpu * max(1, num_gpus_available)
-    epochs = 40  
+    epochs = 60
 
     train_dir = os.path.join(GLOBAL_DATA_DIR, "train")
     val_dir = os.path.join(GLOBAL_DATA_DIR, "val")
     
-    train_ds = PrecomputedFiberDataset(train_dir, dim=GLOBAL_DIM)
-    val_ds   = PrecomputedFiberDataset(val_dir, dim=GLOBAL_DIM)
+    train_ds = PrecomputedFiberDataset(train_dir, dim=2, crop_size=GLOBAL_CROP_SIZE, random_crop=True)
+    val_ds = PrecomputedFiberDataset(val_dir, dim=2, crop_size=GLOBAL_CROP_SIZE, random_crop=False)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, 
                               num_workers=8, pin_memory=True, prefetch_factor=4, persistent_workers=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, 
                             num_workers=8, pin_memory=True, prefetch_factor=4, persistent_workers=True)
 
-    model = FlexibleCVFUNet(in_channels=1, base_filters=config.base_filters, dim=GLOBAL_DIM)
+    model = STEDResUNet2D(in_channels=1, base_filters=config.base_filters)
 
     if num_gpus_available > 1:
         model = nn.DataParallel(model)
         
     model = model.to(device)
     
-    criterion = MaskedVectorLoss(
-        vector_weight=config.vector_loss_weight,
+    criterion = StedFieldLoss2D(
+        orientation_weight=config.orientation_loss_weight,
         visibility_weight=getattr(config, "visibility_loss_weight", 0.35),
-        dim=GLOBAL_DIM,
-        vector_mask_floor=getattr(config, "vector_mask_floor", 0.05),
+        orientation_mask_floor=getattr(config, "orientation_mask_floor", 0.05),
         loss_visibility_floor=getattr(config, "loss_visibility_floor", 0.25),
+        skeleton_weight=getattr(config, "skeleton_score_weight", 0.25),
     )
     optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
 
     # --- Early Stopping Tracking Variables ---
-    best_val_loss = float('inf')
+    best_val_score = float('inf')
     patience = 5
     patience_counter = 0
     min_epochs_before_stop = 10 
 
     for epoch in range(epochs):
         model.train()
-        train_loss = 0.0
+        train_totals = _empty_metric_totals()
         
         for inputs, targets in train_loader:
             inputs = inputs.to(device, non_blocking=True)
@@ -70,6 +70,7 @@ def train_sweep():
                     loss = criterion(outputs, targets)
                     if num_gpus_available > 1:
                         loss = loss.mean()
+                    components = criterion.compute_components(outputs, targets)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -78,15 +79,16 @@ def train_sweep():
                 loss = criterion(outputs, targets)
                 if num_gpus_available > 1:
                     loss = loss.mean()
+                components = criterion.compute_components(outputs, targets)
                 loss.backward()
                 optimizer.step()
             
-            train_loss += loss.item()
+            _add_metric_batch(train_totals, criterion, loss, components)
 
-        train_loss /= len(train_loader)
+        train_metrics = _average_metrics(train_totals, len(train_loader))
         
         model.eval()
-        val_loss = 0.0
+        val_totals = _empty_metric_totals()
         with torch.no_grad():
             for inputs, targets in val_loader:
                 inputs = inputs.to(device, non_blocking=True)
@@ -98,25 +100,33 @@ def train_sweep():
                         loss = criterion(outputs, targets)
                         if num_gpus_available > 1:
                             loss = loss.mean()
+                        components = criterion.compute_components(outputs, targets)
                 else:
                     outputs = model(inputs)
                     loss = criterion(outputs, targets)
                     if num_gpus_available > 1:
                         loss = loss.mean()
-                        
-                val_loss += loss.item()
+                    components = criterion.compute_components(outputs, targets)
                 
-        val_loss /= len(val_loader)
+                _add_metric_batch(val_totals, criterion, loss, components)
+
+        val_metrics = _average_metrics(val_totals, len(val_loader))
         
         wandb.log({
             "epoch": epoch + 1,
-            "train_loss": train_loss,
-            "val_loss": val_loss
+            "train_loss": train_metrics["loss"],
+            "train_score": train_metrics["score"],
+            "val_loss": val_metrics["loss"],
+            "val_score": val_metrics["score"],
+            "val_edt": val_metrics["edt"],
+            "val_orientation": val_metrics["orientation"],
+            "val_visibility": val_metrics["visibility"],
+            "val_skeleton_proxy": val_metrics["skeleton_proxy"],
         })
 
         # --- Intra-Run Early Stopping Logic ---
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_metrics["score"] < best_val_score:
+            best_val_score = val_metrics["score"]
             patience_counter = 0
         else:
             patience_counter += 1
@@ -126,11 +136,12 @@ def train_sweep():
             break
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="W&B Sweep for FlexibleCVFUNet")
+    parser = argparse.ArgumentParser(description="W&B Sweep for 2D STED ResUNet")
     parser.add_argument('--gpus', type=str, default="0")
     parser.add_argument('--data_dir', type=str, required=True)
-    parser.add_argument('--dim', type=int, choices=[2, 3], required=True)
+    parser.add_argument('--dim', type=int, choices=[2], default=2)
     parser.add_argument('--sweep_count', type=int, default=20)
+    parser.add_argument('--crop_size', type=int, default=512)
     args = parser.parse_args()
     
     if args.gpus:
@@ -141,13 +152,13 @@ if __name__ == "__main__":
     global GLOBAL_DATA_DIR
     GLOBAL_DATA_DIR = args.data_dir
     
-    global GLOBAL_DIM
-    GLOBAL_DIM = args.dim
+    global GLOBAL_CROP_SIZE
+    GLOBAL_CROP_SIZE = args.crop_size
 
     sweep_config = {
         'method': 'bayes',
         'metric': {
-            'name': 'val_loss',
+            'name': 'val_score',
             'goal': 'minimize'   
         },
         # --- Inter-Run Early Stopping (Hyperband) ---
@@ -167,17 +178,17 @@ if __name__ == "__main__":
                 'min': 1e-6,
                 'max': 1e-2
             },
-            'vector_loss_weight': {
+            'orientation_loss_weight': {
                 'distribution': 'uniform',
-                'min': 1.0,
-                'max': 10.0
+                'min': 0.5,
+                'max': 3.0
             },
             'visibility_loss_weight': {
                 'distribution': 'uniform',
                 'min': 0.10,
                 'max': 0.70
             },
-            'vector_mask_floor': {
+            'orientation_mask_floor': {
                 'distribution': 'uniform',
                 'min': 0.00,
                 'max': 0.20
@@ -187,13 +198,16 @@ if __name__ == "__main__":
                 'min': 0.05,
                 'max': 0.45
             },
+            'skeleton_score_weight': {
+                'values': [0.1, 0.25, 0.5]
+            },
             'base_filters': {
-                'values': [8, 16, 32]
+                'values': [24, 32, 48]
             }
         }
     }
 
-    project_name = f"fibras-cvfunet-{args.dim}d-sweep"
+    project_name = "fibras-sted-resunet2d-sweep"
     sweep_id = wandb.sweep(sweep_config, project=project_name)
     
     wandb.agent(sweep_id, train_sweep, count=args.sweep_count)

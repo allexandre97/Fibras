@@ -4,6 +4,10 @@ from unittest.mock import patch
 import numpy as np
 
 from generate_dataset import (
+    SHORT_FIBER_STEPS,
+    SHORT_TURN_DEGREES,
+    STED_2D_FIBER_DENSITY_RANGE,
+    STED_2D_STEP_SCALE_RANGE,
     _build_2d_sample,
     _build_2d_focus_and_visibility_targets,
     _prepare_2d_sted_scene,
@@ -416,21 +420,23 @@ class StedNoiseModelTests(unittest.TestCase):
 
     def test_2d_walk_and_fiber_constraints_match_realism_ranges(self):
         max_xy = 64.0
-        lower_step = max(0.8, max_xy * 0.018)
-        upper_step = max(0.8, max_xy * 0.030)
+        lower_step = max(0.8, max_xy * STED_2D_STEP_SCALE_RANGE[0])
+        upper_step = max(0.8, max_xy * STED_2D_STEP_SCALE_RANGE[1])
+        lower_fiber_count = max(1, int((64 * 64) * STED_2D_FIBER_DENSITY_RANGE[0]))
+        upper_fiber_count = int((64 * 64) * STED_2D_FIBER_DENSITY_RANGE[1])
 
         for seed in range(40):
             np.random.seed(seed)
             scene = _prepare_2d_sted_scene((64, 64, 16), None)
-            self.assertGreaterEqual(scene["requested_fiber_count"], 10)
-            self.assertLessEqual(scene["requested_fiber_count"], 24)
+            self.assertGreaterEqual(scene["requested_fiber_count"], lower_fiber_count)
+            self.assertLessEqual(scene["requested_fiber_count"], upper_fiber_count)
             self.assertTrue(all(size in {1, 2, 3} for size in scene["bundle_sizes"]))
 
             for walk_cfg in scene["walk_parameter_samples"]:
-                self.assertGreaterEqual(walk_cfg["num_steps"], 4)
-                self.assertLessEqual(walk_cfg["num_steps"], 14)
-                self.assertGreaterEqual(walk_cfg["max_turn_degrees"], 2.0)
-                self.assertLessEqual(walk_cfg["max_turn_degrees"], 12.0)
+                self.assertGreaterEqual(walk_cfg["num_steps"], SHORT_FIBER_STEPS[0])
+                self.assertLessEqual(walk_cfg["num_steps"], SHORT_FIBER_STEPS[1])
+                self.assertGreaterEqual(walk_cfg["max_turn_degrees"], SHORT_TURN_DEGREES[0])
+                self.assertLessEqual(walk_cfg["max_turn_degrees"], SHORT_TURN_DEGREES[1])
                 self.assertGreaterEqual(walk_cfg["step_length"], lower_step)
                 self.assertLessEqual(walk_cfg["step_length"], upper_step)
 
@@ -441,8 +447,10 @@ class StedNoiseModelTests(unittest.TestCase):
             np.random.seed(seed)
             scene = _prepare_2d_sted_scene((40, 40, 14), None)
             seen_haze_regimes.add(scene["haze_regime"])
-            self.assertGreaterEqual(scene["requested_fiber_count"], 10)
-            self.assertLessEqual(scene["requested_fiber_count"], 24)
+            lower_fiber_count = max(1, int((40 * 40) * STED_2D_FIBER_DENSITY_RANGE[0]))
+            upper_fiber_count = int((40 * 40) * STED_2D_FIBER_DENSITY_RANGE[1])
+            self.assertGreaterEqual(scene["requested_fiber_count"], lower_fiber_count)
+            self.assertLessEqual(scene["requested_fiber_count"], upper_fiber_count)
 
             image, edt_target, vector_target, visibility_target = _build_2d_sample((40, 40, 14), None)
             _, targets_tensor = _to_2d_tensors(image, edt_target, vector_target, visibility_target)

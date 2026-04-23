@@ -8,25 +8,26 @@ import numpy as np
 
 from src.core import FiberSegment, ReflectiveBoundary
 from src.rasterization import EmpiricalRasterizer
+from src.sted import vector_to_orientation_channels_np
 from src.synthesis import CompositeGenerator, RandomWalkGenerator, SpaceColonizationGenerator
 from src.targets import TargetFieldGenerator, WeightedVisibilityTargetGenerator
 
 
 PHENOTYPES = ["Highly Branched", "Directional", "Random Tangle", "Cloudy Bundle", "Heterogeneous Mixed"]
-SHORT_FIBER_STEPS = (4, 14)
-SHORT_TURN_DEGREES = (2.0, 12.0)
+SHORT_FIBER_STEPS = (10, 60)
+SHORT_TURN_DEGREES = (0.5, 35.0)
 TARGET_MAX_DISTANCE = 5.0
 DEFAULT_LABEL_SLAB_SCALE = 1.3
 DEFAULT_SOFT_SKELETON_ALPHA = 0.35
-DEFAULT_ANNOTATION_WEIGHT_FLOOR = 0.25
-DEFAULT_VISIBILITY_WEIGHT_FLOOR = 0.03
-STED_2D_FIBER_COUNT_RANGE = (10, 25)
-STED_2D_STEP_SCALE_RANGE = (0.018, 0.030)
+DEFAULT_ANNOTATION_WEIGHT_FLOOR = 0.05
+DEFAULT_VISIBILITY_WEIGHT_FLOOR = 0.02
+STED_2D_FIBER_DENSITY_RANGE = (0.0012, 0.030)
+STED_2D_STEP_SCALE_RANGE = (0.010, 0.060)
 STED_2D_INITIAL_DIR_SCALE = np.array([1.0, 1.0, 0.25], dtype=float)
 STED_2D_ORTHOGONAL_SCALE = np.array([1.0, 1.0, 0.35], dtype=float)
 STED_2D_BUNDLE_SIZES = np.array([1, 2, 3], dtype=int)
 STED_2D_BUNDLE_PROBS = np.array([0.55, 0.35, 0.10], dtype=np.float64)
-STED_2D_JITTER_RANGE = (0.25, 0.70)
+STED_2D_JITTER_RANGE = (0.20, 1.20)
 STED_2D_HAZE_REGIMES = np.array(["none", "subtle", "moderate", "strong"], dtype=object)
 STED_2D_HAZE_PROBS = np.array([0.30, 0.35, 0.25, 0.10], dtype=np.float64)
 
@@ -487,6 +488,8 @@ def _prepare_2d_sted_scene(
         raise ValueError("visibility_weight_floor must be in the interval (0, 1].")
 
     x_size, y_size, z_size = bounds
+    xy_area = x_size * y_size
+    volume_size = x_size * y_size * z_size
 
     optical_bundle_lists = []
     core_segments_flat = []
@@ -505,13 +508,16 @@ def _prepare_2d_sted_scene(
     slice_center = np.random.uniform(z_size * 0.2, z_size * 0.8)
     haze_regime = _sample_sted_haze_regime()
     enable_monomer_cloud, monomer_mix = _resolve_sted_monomer_config(haze_regime)
+    
+    # Reduced debris density to prevent cluttering the image with too many "dots"
+    dynamic_debris_count = int(volume_size * np.random.uniform(0.00001, 0.00007))
 
     rasterizer = EmpiricalRasterizer(
         bounds=bounds,
         base_sigma=1.0,
         z_anisotropy=np.random.uniform(1.6, 2.8),
         noise_level=np.random.uniform(0.005, 0.045),
-        debris_count=np.random.randint(4, 16),
+        debris_count=max(1, dynamic_debris_count),
         gap_prob=np.random.uniform(0.0, 0.08),
         enable_sted_monomer_cloud=enable_monomer_cloud,
         sted_monomer_mix=monomer_mix,
@@ -532,7 +538,8 @@ def _prepare_2d_sted_scene(
         walk_parameter_samples = []
         bundle_sizes = []
 
-        num_fibers = np.random.randint(STED_2D_FIBER_COUNT_RANGE[0], STED_2D_FIBER_COUNT_RANGE[1])
+        num_fibers = int(xy_area * np.random.uniform(*STED_2D_FIBER_DENSITY_RANGE))
+        num_fibers = max(1, num_fibers)
         requested_fiber_count = int(num_fibers)
         for _ in range(num_fibers):
             core_segments, walk_params = _generate_constrained_random_walk(bounds)
@@ -705,8 +712,17 @@ def build_sted_debug_sample(
 def _build_3d_sample(bounds: tuple):
     x_size, y_size, z_size = bounds
     is_flat_volume = z_size == 1
+    volume_size = x_size * y_size * max(1, z_size)
 
-    num_bundles = np.random.randint(3, 12)
+    # 3D Density Ranges (Scaled by Volume)
+    bundle_density_range = (0.00001, 0.00005)
+    debris_density_range = (0.000005, 0.000035)
+
+    num_bundles = int(volume_size * np.random.uniform(*bundle_density_range))
+    num_bundles = max(1, num_bundles)
+    
+    dynamic_debris_count = int(volume_size * np.random.uniform(*debris_density_range))
+
     optical_bundle_lists = []
     core_segments_flat = []
 
@@ -738,7 +754,7 @@ def _build_3d_sample(bounds: tuple):
         base_sigma=1.0,
         z_anisotropy=1.0 if is_flat_volume else np.random.uniform(1.0, 4.0),
         noise_level=np.random.uniform(0.01, 0.15),
-        debris_count=np.random.randint(5, 45),
+        debris_count=max(1, dynamic_debris_count),
         gap_prob=np.random.uniform(0.0, 0.12),
     )
     target_gen = TargetFieldGenerator(bounds, max_distance=TARGET_MAX_DISTANCE)
@@ -753,14 +769,14 @@ def _to_2d_tensors(image, edt_target, vector_target, visibility_target):
 
     image = image.transpose(1, 0)
     edt_target = edt_target.transpose(1, 0)
-    vector_target = vector_target.transpose(0, 2, 1)
+    orientation_target = vector_to_orientation_channels_np(vector_target).transpose(0, 2, 1)
     visibility_target = visibility_target.transpose(1, 0)
 
     volume_tensor = torch.tensor(image[np.newaxis, np.newaxis, :, :], dtype=torch.float32)
     targets = np.zeros((4, 1, image.shape[0], image.shape[1]), dtype=np.float32)
     targets[0, 0, :, :] = edt_target.astype(np.float32)
-    targets[1, 0, :, :] = vector_target[0].astype(np.float32)
-    targets[2, 0, :, :] = vector_target[1].astype(np.float32)
+    targets[1, 0, :, :] = orientation_target[0].astype(np.float32)
+    targets[2, 0, :, :] = orientation_target[1].astype(np.float32)
     targets[3, 0, :, :] = visibility_target.astype(np.float32)
 
     targets_tensor = torch.tensor(targets, dtype=torch.float32)

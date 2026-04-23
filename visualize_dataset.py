@@ -2,6 +2,7 @@ import argparse
 import os
 import re
 
+import matplotlib.pyplot as plt
 import numpy as np
 
 
@@ -73,6 +74,95 @@ def _extract_sample_arrays(data):
     )
 
 
+def _direction_rgb(vector, edt, double_angle: bool = False):
+    """Encode 2D direction/orientation as hue and EDT as brightness."""
+    if double_angle:
+        angle = (0.5 * np.arctan2(vector[1], vector[0])) % np.pi
+    else:
+        angle = np.arctan2(vector[1], vector[0]) % np.pi
+    hue = angle / np.pi
+    brightness = np.clip(edt, 0, 1)
+    hsv = np.stack([hue, np.ones_like(hue), brightness], axis=-1)
+    from matplotlib.colors import hsv_to_rgb
+    return hsv_to_rgb(hsv)
+
+
+def export_sample_png(pt_path: str, out_path: str, visibility_floor: float = 0.25):
+    import torch
+
+    data = torch.load(pt_path, map_location="cpu", weights_only=True)
+    sample = _extract_sample_arrays(data)
+    image = sample["image"]
+    edt = sample["edt"]
+    vector = sample["vector"]
+    visibility = sample["visibility"]
+
+    is_2d = sample["is_2d"]
+    if not is_2d:
+        mid = image.shape[0] // 2
+        image = image[mid]
+        edt = edt[mid]
+        vector = vector[:, mid]
+
+    direction_rgb = _direction_rgb(vector[:2], edt, double_angle=is_2d)
+
+    ncols = 4 if (is_2d and visibility is not None) else 3
+    fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 4), dpi=150)
+
+    axes[0].imshow(image, cmap="magma", vmin=0, vmax=max(image.max(), 1e-8))
+    axes[0].set_title("Image")
+    axes[1].imshow(edt, cmap="viridis", vmin=0, vmax=max(edt.max(), 1e-8))
+    axes[1].set_title("EDT")
+    axes[2].imshow(direction_rgb)
+    axes[2].set_title("Vector Direction")
+
+    if ncols == 4:
+        axes[3].imshow(visibility, cmap="inferno", vmin=0, vmax=1)
+        axes[3].set_title("Visibility")
+
+    for ax in axes:
+        ax.axis("off")
+
+    fig.suptitle(os.path.basename(pt_path), fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def export_dataset_pngs(
+    data_dir: str,
+    export_dir: str,
+    split: str = "train",
+    num_samples: int = 0,
+    visibility_floor: float = 0.25,
+):
+    split_dir = os.path.join(data_dir, split)
+    sample_dir = split_dir if os.path.isdir(split_dir) else data_dir
+
+    files = [
+        os.path.join(sample_dir, f)
+        for f in os.listdir(sample_dir)
+        if f.endswith(".pt")
+    ]
+    files.sort(key=_sample_file_sort_key)
+    if len(files) == 0:
+        raise FileNotFoundError(f"No .pt files found in {sample_dir}")
+
+    if num_samples > 0:
+        files = files[:num_samples]
+
+    os.makedirs(export_dir, exist_ok=True)
+    print(f"Exporting {len(files)} samples from {sample_dir} to {export_dir}")
+
+    for i, pt_path in enumerate(files):
+        name = os.path.splitext(os.path.basename(pt_path))[0]
+        out_path = os.path.join(export_dir, f"{name}.png")
+        export_sample_png(pt_path, out_path, visibility_floor=visibility_floor)
+        print(f"  [{i + 1}/{len(files)}] {out_path}")
+
+    print("Done.")
+
+
 def show_synthetic_data(pt_path: str, visibility_floor: float = 0.25):
     import torch
 
@@ -90,8 +180,6 @@ def show_synthetic_data(pt_path: str, visibility_floor: float = 0.25):
     edt = sample["edt"]
     vector = sample["vector"]
     visibility = sample["visibility"]
-    vector_magnitude = np.linalg.norm(vector, axis=0)
-
     is_2d = sample["is_2d"]
     dim_str = "2D STED" if is_2d else "3D Confocal"
     print(f"Render Mode: {dim_str} | Array Shape: {image.shape}")
@@ -117,13 +205,25 @@ def show_synthetic_data(pt_path: str, visibility_floor: float = 0.25):
         visible=False,
         opacity=0.75,
     )
-    viewer.add_image(
-        vector_magnitude,
-        name="Vector Magnitude",
-        colormap="cividis",
-        visible=False,
-        opacity=0.75,
-    )
+
+    if is_2d:
+        direction_rgb = _direction_rgb(vector[:2], edt, double_angle=True)
+        viewer.add_image(
+            direction_rgb,
+            name="Orientation Direction",
+            rgb=True,
+            visible=False,
+            opacity=0.75,
+        )
+    else:
+        direction_mid = _direction_rgb(vector[:2, vector.shape[1] // 2], edt[edt.shape[0] // 2])
+        viewer.add_image(
+            direction_mid,
+            name="Vector Direction (mid-Z)",
+            rgb=True,
+            visible=False,
+            opacity=0.75,
+        )
 
     viewer.add_labels(
         (edt > 0.15).astype(int),
@@ -291,6 +391,8 @@ if __name__ == "__main__":
         default=0.25,
         help="Floor used in EDT x visibility inspection overlay.",
     )
+    parser.add_argument("--export-dir", type=str, default=None, help="Export samples as PNG files to this directory (works with --file or --data-dir)")
+    parser.add_argument("--num-samples", type=int, default=0, help="Number of samples to export (0 = all). Used with --data-dir --export-dir")
     parser.add_argument("--seed", type=int, default=None, help="Optional RNG seed for --sted-debug mode")
     parser.add_argument("--save", type=str, default=None, help="Optional path to save the STED debug summary figure")
     parser.add_argument("--no-show", action="store_true", help="Do not open the STED debug figure interactively")
@@ -299,17 +401,33 @@ if __name__ == "__main__":
     if args.file:
         if not os.path.exists(args.file):
             raise FileNotFoundError(f"Dataset file not found: {args.file}")
-        show_synthetic_data(args.file, visibility_floor=args.visibility_floor)
+        if args.export_dir:
+            os.makedirs(args.export_dir, exist_ok=True)
+            name = os.path.splitext(os.path.basename(args.file))[0]
+            out_path = os.path.join(args.export_dir, f"{name}.png")
+            export_sample_png(args.file, out_path, visibility_floor=args.visibility_floor)
+            print(f"Exported: {out_path}")
+        else:
+            show_synthetic_data(args.file, visibility_floor=args.visibility_floor)
     elif args.data_dir:
         if not os.path.exists(args.data_dir):
             raise FileNotFoundError(f"Dataset directory not found: {args.data_dir}")
-        show_dataset_sample(
-            data_dir=args.data_dir,
-            split=args.split,
-            index=args.index,
-            random_sample=args.random_sample,
-            visibility_floor=args.visibility_floor,
-        )
+        if args.export_dir:
+            export_dataset_pngs(
+                data_dir=args.data_dir,
+                export_dir=args.export_dir,
+                split=args.split,
+                num_samples=args.num_samples,
+                visibility_floor=args.visibility_floor,
+            )
+        else:
+            show_dataset_sample(
+                data_dir=args.data_dir,
+                split=args.split,
+                index=args.index,
+                random_sample=args.random_sample,
+                visibility_floor=args.visibility_floor,
+            )
     else:
         if args.label_slab_scale <= 0.0:
             raise ValueError("--label_slab_scale must be greater than 0.")
