@@ -138,20 +138,61 @@ class StedFieldLoss2D(nn.Module):
         fixed_orientation_weight: float = 1.0,
         fixed_visibility_weight: float = 0.35,
         skeleton_weight: float = 0.25,
+        train_centerline_weight: float = 0.15,
+        score_centerline_weight: float | None = None,
+        centerline_warmup_epochs: int = 8,
+        centerline_warmup_start_factor: float = 0.25,
     ):
         super().__init__()
         if orientation_mask_floor < 0.0:
             raise ValueError("orientation_mask_floor must be non-negative.")
         if loss_visibility_floor < 0.0 or loss_visibility_floor > 1.0:
             raise ValueError("loss_visibility_floor must be in the interval [0, 1].")
+        if centerline_warmup_epochs < 0:
+            raise ValueError("centerline_warmup_epochs must be non-negative.")
+        if centerline_warmup_start_factor < 0.0 or centerline_warmup_start_factor > 1.0:
+            raise ValueError("centerline_warmup_start_factor must be in the interval [0, 1].")
         self.orientation_weight = float(orientation_weight)
         self.visibility_weight = float(visibility_weight)
         self.orientation_mask_floor = float(orientation_mask_floor)
         self.loss_visibility_floor = float(loss_visibility_floor)
         self.fixed_orientation_weight = float(fixed_orientation_weight)
         self.fixed_visibility_weight = float(fixed_visibility_weight)
-        self.skeleton_weight = float(skeleton_weight)
+        self.score_centerline_weight = float(
+            skeleton_weight if score_centerline_weight is None else score_centerline_weight
+        )
+        self.train_centerline_weight = float(train_centerline_weight)
+        self.centerline_warmup_epochs = int(centerline_warmup_epochs)
+        self.centerline_warmup_start_factor = float(centerline_warmup_start_factor)
+        self._current_train_centerline_weight = self.train_centerline_weight
+        self.centerline_gamma = 6.0
+        self.centerline_eps = 1e-6
         self.mse = nn.MSELoss(reduction="none")
+
+    def _centerline_error(self, pred_edt, target_edt):
+        # Emphasize the ridge center smoothly instead of thresholding at a single EDT cutoff.
+        pred_centerline = torch.clamp(pred_edt.float(), 0.0, 1.0).pow(self.centerline_gamma)
+        target_centerline = torch.clamp(target_edt.float(), 0.0, 1.0).pow(self.centerline_gamma)
+        reduce_dims = tuple(range(1, pred_centerline.ndim))
+        intersection = (pred_centerline * target_centerline).sum(dim=reduce_dims)
+        denom = pred_centerline.sum(dim=reduce_dims) + target_centerline.sum(dim=reduce_dims)
+        dice = (2.0 * intersection + self.centerline_eps) / (denom + self.centerline_eps)
+        return (1.0 - dice).mean()
+
+    def _compute_train_centerline_weight(self, epoch: int) -> float:
+        if self.centerline_warmup_epochs <= 1:
+            return self.train_centerline_weight
+        clamped_epoch = min(max(int(epoch), 0), self.centerline_warmup_epochs - 1)
+        progress = clamped_epoch / max(self.centerline_warmup_epochs - 1, 1)
+        factor = self.centerline_warmup_start_factor + (1.0 - self.centerline_warmup_start_factor) * progress
+        return self.train_centerline_weight * factor
+
+    def set_epoch(self, epoch: int) -> float:
+        self._current_train_centerline_weight = self._compute_train_centerline_weight(epoch)
+        return self._current_train_centerline_weight
+
+    def current_train_centerline_weight(self) -> float:
+        return self._current_train_centerline_weight
 
     def compute_components(self, pred, target):
         pred_edt = pred[:, 0:1]
@@ -174,15 +215,13 @@ class StedFieldLoss2D(nn.Module):
         orientation_loss = (orientation_err * orientation_mask).sum() / (orientation_mask.sum() + 1e-8)
 
         visibility_loss = F.binary_cross_entropy_with_logits(pred_visibility, target_visibility)
-        pred_centerline = (torch.clamp(pred_edt, 0.0, 1.0) > 0.85).to(pred.dtype)
-        target_centerline = (target_edt > 0.85).to(pred.dtype)
-        skeleton_proxy = torch.abs(pred_centerline.mean(dim=(-2, -1)) - target_centerline.mean(dim=(-2, -1))).mean()
+        centerline_error = self._centerline_error(pred_edt, target_edt)
 
         return {
             "edt": edt_loss,
             "orientation": orientation_loss,
             "visibility": visibility_loss,
-            "skeleton_proxy": skeleton_proxy,
+            "centerline_error": centerline_error,
         }
 
     def fixed_score(self, components):
@@ -190,7 +229,7 @@ class StedFieldLoss2D(nn.Module):
             components["edt"]
             + self.fixed_orientation_weight * components["orientation"]
             + self.fixed_visibility_weight * components["visibility"]
-            + self.skeleton_weight * components["skeleton_proxy"]
+            + self.score_centerline_weight * components["centerline_error"]
         )
 
     def forward(self, pred, target):
@@ -199,6 +238,7 @@ class StedFieldLoss2D(nn.Module):
             components["edt"]
             + self.orientation_weight * components["orientation"]
             + self.visibility_weight * components["visibility"]
+            + self.current_train_centerline_weight() * components["centerline_error"]
         )
 
 
@@ -209,14 +249,14 @@ def _empty_metric_totals():
         "edt": 0.0,
         "orientation": 0.0,
         "visibility": 0.0,
-        "skeleton_proxy": 0.0,
+        "centerline_error": 0.0,
     }
 
 
 def _add_metric_batch(totals, criterion, loss, components):
     totals["loss"] += float(loss.detach().cpu())
     totals["score"] += float(criterion.fixed_score(components).detach().cpu())
-    for key in ("edt", "orientation", "visibility", "skeleton_proxy"):
+    for key in ("edt", "orientation", "visibility", "centerline_error"):
         totals[key] += float(components[key].detach().cpu())
 
 
@@ -243,10 +283,24 @@ def train_model(args):
     else:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
+    if args.multi_gpu:
+        if args.nccl_p2p_disable:
+            os.environ["NCCL_P2P_DISABLE"] = "1"
+        if args.nccl_ib_disable:
+            os.environ["NCCL_IB_DISABLE"] = "1"
+        if args.nccl_debug:
+            os.environ["NCCL_DEBUG"] = args.nccl_debug
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     num_gpus_available = torch.cuda.device_count()
+    use_data_parallel = bool(args.multi_gpu and num_gpus_available > 1)
+    batch_size = args.base_batch_size * max(1, num_gpus_available) if use_data_parallel else args.base_batch_size
 
-    batch_size = args.base_batch_size * max(1, num_gpus_available)
+    if device.type == "cuda" and num_gpus_available > 1 and not use_data_parallel:
+        print(
+            f"Detected {num_gpus_available} visible GPUs, but --multi_gpu is disabled. "
+            "Training on a single GPU to avoid NCCL/DataParallel issues."
+        )
 
     wandb_run = None
     if not args.no_wandb:
@@ -267,7 +321,7 @@ def train_model(args):
 
     model = STEDResUNet2D(in_channels=1, base_filters=args.base_filters)
 
-    if num_gpus_available > 1:
+    if use_data_parallel:
         model = nn.DataParallel(model)
         
     model = model.to(device)
@@ -277,7 +331,10 @@ def train_model(args):
         visibility_weight=args.visibility_loss_weight,
         orientation_mask_floor=args.orientation_mask_floor,
         loss_visibility_floor=args.loss_visibility_floor,
-        skeleton_weight=args.skeleton_score_weight,
+        score_centerline_weight=args.score_centerline_weight,
+        train_centerline_weight=args.train_centerline_weight,
+        centerline_warmup_epochs=args.centerline_warmup_epochs,
+        centerline_warmup_start_factor=args.centerline_warmup_start_factor,
     )
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     
@@ -288,6 +345,7 @@ def train_model(args):
 
     print("\nStarting 2D STED ResUNet Training Loop...")
     for epoch in range(args.epochs):
+        active_train_centerline_weight = criterion.set_epoch(epoch)
         model.train()
         train_totals = _empty_metric_totals()
         t0 = time.time()
@@ -302,7 +360,7 @@ def train_model(args):
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                     outputs = model(inputs)
                     loss = criterion(outputs, targets)
-                    if num_gpus_available > 1: loss = loss.mean()
+                    if use_data_parallel: loss = loss.mean()
                     components = criterion.compute_components(outputs, targets)
                 
                 scaler.scale(loss).backward()
@@ -311,7 +369,7 @@ def train_model(args):
             else:
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
-                if num_gpus_available > 1: loss = loss.mean()
+                if use_data_parallel: loss = loss.mean()
                 components = criterion.compute_components(outputs, targets)
                 loss.backward()
                 optimizer.step()
@@ -331,12 +389,12 @@ def train_model(args):
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                         outputs = model(inputs)
                         loss = criterion(outputs, targets)
-                        if num_gpus_available > 1: loss = loss.mean()
+                        if use_data_parallel: loss = loss.mean()
                         components = criterion.compute_components(outputs, targets)
                 else:
                     outputs = model(inputs)
                     loss = criterion(outputs, targets)
-                    if num_gpus_available > 1: loss = loss.mean()
+                    if use_data_parallel: loss = loss.mean()
                     components = criterion.compute_components(outputs, targets)
                 
                 _add_metric_batch(val_totals, criterion, loss, components)
@@ -353,7 +411,9 @@ def train_model(args):
             "val_edt": val_metrics["edt"],
             "val_orientation": val_metrics["orientation"],
             "val_visibility": val_metrics["visibility"],
-            "val_skeleton_proxy": val_metrics["skeleton_proxy"],
+            "val_centerline_error": val_metrics["centerline_error"],
+            "train_centerline_weight": active_train_centerline_weight,
+            "score_centerline_weight": criterion.score_centerline_weight,
             "epoch_time_seconds": t_elapsed,
         }
         if wandb_run is not None:
@@ -361,12 +421,12 @@ def train_model(args):
         print(
             f"-> Epoch {epoch+1} Summary: Train: {train_metrics['loss']:.4f} | "
             f"Val Score: {val_metrics['score']:.4f} | Val Loss: {val_metrics['loss']:.4f} | "
-            f"Time: {t_elapsed:.1f}s"
+            f"Centerline W: {active_train_centerline_weight:.4f} | Time: {t_elapsed:.1f}s"
         )
 
         if val_metrics["score"] < best_val_score:
             best_val_score = val_metrics["score"]
-            state_dict = model.module.state_dict() if num_gpus_available > 1 else model.state_dict()
+            state_dict = model.module.state_dict() if use_data_parallel else model.state_dict()
             save_path = "weights/sted_resunet2d_final.pth"
             torch.save(state_dict, save_path)
 
@@ -387,7 +447,14 @@ if __name__ == "__main__":
     parser.add_argument('--visibility_loss_weight', type=float, default=0.35)
     parser.add_argument('--orientation_mask_floor', type=float, default=0.05)
     parser.add_argument('--loss_visibility_floor', type=float, default=0.25)
-    parser.add_argument('--skeleton_score_weight', type=float, default=0.25)
+    parser.add_argument('--train_centerline_weight', type=float, default=0.15)
+    parser.add_argument('--score_centerline_weight', '--skeleton_score_weight', dest='score_centerline_weight', type=float, default=0.25)
+    parser.add_argument('--centerline_warmup_epochs', type=int, default=8)
+    parser.add_argument('--centerline_warmup_start_factor', type=float, default=0.25)
+    parser.add_argument('--multi_gpu', action='store_true', help="Enable nn.DataParallel across all visible GPUs.")
+    parser.add_argument('--nccl_p2p_disable', action='store_true', help="Set NCCL_P2P_DISABLE=1 when using --multi_gpu.")
+    parser.add_argument('--nccl_ib_disable', action='store_true', help="Set NCCL_IB_DISABLE=1 when using --multi_gpu.")
+    parser.add_argument('--nccl_debug', type=str, choices=['INFO', 'WARN'], default="", help="Set NCCL_DEBUG when using --multi_gpu.")
     parser.add_argument('--no_wandb', action='store_true')
     
     args = parser.parse_args()

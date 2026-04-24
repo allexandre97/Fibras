@@ -3,5 +3,6 @@ small_sted_inspect
 runs
 wandb
 weights
+reports
 .vscode
 *.npz

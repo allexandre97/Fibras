@@ -30,7 +30,10 @@ def evaluate_model(args):
         visibility_weight=args.visibility_loss_weight,
         orientation_mask_floor=args.orientation_mask_floor,
         loss_visibility_floor=args.loss_visibility_floor,
-        skeleton_weight=args.skeleton_score_weight,
+        score_centerline_weight=args.score_centerline_weight,
+        train_centerline_weight=args.train_centerline_weight,
+        centerline_warmup_epochs=args.centerline_warmup_epochs,
+        centerline_warmup_start_factor=args.centerline_warmup_start_factor,
     )
     
     total_metrics = {
@@ -39,7 +42,7 @@ def evaluate_model(args):
         "edt": 0.0,
         "orientation": 0.0,
         "visibility": 0.0,
-        "skeleton_proxy": 0.0,
+        "centerline_error": 0.0,
     }
     
     with torch.no_grad():
@@ -58,7 +61,7 @@ def evaluate_model(args):
             total_metrics["edt"] += components["edt"].item()
             total_metrics["orientation"] += components["orientation"].item()
             total_metrics["visibility"] += components["visibility"].item()
-            total_metrics["skeleton_proxy"] += components["skeleton_proxy"].item()
+            total_metrics["centerline_error"] += components["centerline_error"].item()
 
     n_batches = len(test_loader)
     print(f"\n--- Unseen Test Set Evaluation ({args.dim}D Model) ---")
@@ -68,7 +71,7 @@ def evaluate_model(args):
     print(f"Average EDT Loss:   {total_metrics['edt'] / n_batches:.4f}")
     print(f"Average Orientation: {total_metrics['orientation'] / n_batches:.4f}")
     print(f"Average Visibility: {total_metrics['visibility'] / n_batches:.4f}")
-    print(f"Average Skeleton Proxy: {total_metrics['skeleton_proxy'] / n_batches:.4f}")
+    print(f"Average Centerline Error: {total_metrics['centerline_error'] / n_batches:.4f}")
     print("---------------------------------------------")
 
 if __name__ == "__main__":
@@ -84,7 +87,10 @@ if __name__ == "__main__":
     parser.add_argument('--visibility_loss_weight', type=float, default=0.35)
     parser.add_argument('--orientation_mask_floor', type=float, default=0.05)
     parser.add_argument('--loss_visibility_floor', type=float, default=0.25)
-    parser.add_argument('--skeleton_score_weight', type=float, default=0.25)
+    parser.add_argument('--train_centerline_weight', type=float, default=0.15)
+    parser.add_argument('--score_centerline_weight', '--skeleton_score_weight', dest='score_centerline_weight', type=float, default=0.25)
+    parser.add_argument('--centerline_warmup_epochs', type=int, default=8)
+    parser.add_argument('--centerline_warmup_start_factor', type=float, default=0.25)
     
     args = parser.parse_args()
     evaluate_model(args)

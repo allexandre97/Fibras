@@ -1,20 +1,24 @@
 name: fibras
 channels:
-  - pytorch
   - conda-forge
   - defaults
 dependencies:
   - python=3.10
+  - pip
   - numpy
   - scipy
   - scikit-image
   - networkx
   - numba
-  - pytorch>=2.2
-  - cpuonly
   - tifffile
   - matplotlib
   - pillow
   - wandb
   - napari
   - pyqt
+  - pip:
+      # Official PyTorch CUDA 12.8 wheels. PyTorch 2.7 adds NVIDIA Blackwell support.
+      - --index-url https://download.pytorch.org/whl/cu128
+      - torch==2.7.1
+      - torchvision==0.22.1
+      - torchaudio==2.7.1
