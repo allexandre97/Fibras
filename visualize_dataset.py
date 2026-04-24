@@ -2,6 +2,8 @@ import argparse
 import os
 import re
 
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
 import matplotlib.pyplot as plt
 import numpy as np
 
