@@ -1,0 +1,349 @@
+\documentclass[11pt, a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath, amssymb}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{bm}
+
+\title{\textbf{Fibras: Synthetic STED Fiber Field Learning Pipeline}}
+\author{Pipeline Documentation}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document describes the current Fibras project as implemented in the codebase.
+The project no longer centers on direct topological graph analysis of thresholded
+volumes. Its main path is a supervised learning pipeline for 2D STED-like fiber
+images: synthetic 3D fiber scenes are rendered through an empirical optical model,
+projected into 2D microscopy slices, converted into dense distance, orientation,
+and visibility targets, and used to train a residual U-Net. At inference time the
+network predicts these fields on full-resolution images and a streamline tracker
+converts the fields into a binary skeleton.
+\end{abstract}
+
+\section{Current Project Scope}
+
+The active pipeline is organized around four tasks:
+\begin{enumerate}
+    \item Generate synthetic 2D STED training data from 3D fiber geometry.
+    \item Optionally calibrate synthesis parameters from real STED image statistics.
+    \item Train a 2D residual U-Net to predict fiber localization, orientation, and visibility fields.
+    \item Run tiled inference on real or synthetic images and trace predicted fields into skeleton masks.
+\end{enumerate}
+
+The main scripts are:
+\begin{itemize}
+    \item \texttt{analyze\_real\_sted.py}: measure real-image intensity, foreground, skeleton, noise, stripe, and vignette statistics.
+    \item \texttt{generate\_dataset.py}: build train/validation/test \texttt{.pt} datasets.
+    \item \texttt{train.py}: train \texttt{STEDResUNet2D}.
+    \item \texttt{test.py}: evaluate a saved checkpoint on the held-out split.
+    \item \texttt{inference.py}: predict dense fields on a 2D image and export TIFF outputs.
+    \item \texttt{visual.py} and \texttt{visualize\_dataset.py}: inspect datasets, predictions, and STED synthesis debug views.
+\end{itemize}
+
+\section{Data Representation}
+
+Each generated sample stores an input image and a four-channel target tensor:
+\begin{equation}
+    Y = \left[D,\; C,\; S,\; V\right],
+\end{equation}
+where $D$ is a normalized Euclidean-distance-transform-like centerline confidence,
+$(C,S)$ are double-angle orientation channels, and $V$ is an axial visibility map.
+For 2D samples the tensor layout on disk is:
+\begin{equation}
+    X \in \mathbb{R}^{1 \times 1 \times H \times W},
+    \qquad
+    Y \in \mathbb{R}^{4 \times 1 \times H \times W}.
+\end{equation}
+
+The orientation channels encode an unoriented tangent: a fiber direction
+$\bm{u} = (u_x, u_y)$ and its opposite $-\bm{u}$ must be equivalent. The code
+therefore maps vectors to double-angle coordinates:
+\begin{equation}
+    C = \cos(2\theta) = \frac{u_x^2 - u_y^2}{u_x^2 + u_y^2},
+    \qquad
+    S = \sin(2\theta) = \frac{2u_xu_y}{u_x^2 + u_y^2}.
+\end{equation}
+This removes the polarity ambiguity that would otherwise make tangent regression
+unstable.
+
+\section{Synthetic Geometry}
+
+The geometry layer is built from \texttt{FiberSegment} objects, each holding a
+start point, end point, and thickness multiplier. The project supports several
+generators in \texttt{src/synthesis.py}:
+\begin{itemize}
+    \item \texttt{RandomWalkGenerator}: constrained short fibers with bounded turn angles.
+    \item \texttt{SpaceColonizationGenerator}: branching tree-like structures.
+    \item \texttt{CompositeGenerator}: mixtures of multiple generators.
+\end{itemize}
+
+The current 2D STED path primarily uses constrained 3D random walks. A synthetic
+fiber is generated in a volume $(H,W,Z)$, but only its optical projection into a
+selected focal slice is supervised. The generator samples step length, number of
+steps, initial direction, turn angle, and bundle size. Bundles are formed by
+adding jittered optical copies of the same core geometry:
+\begin{equation}
+    \tilde{\bm{p}} = \bm{p} + \bm{\epsilon}, \qquad
+    \bm{\epsilon} \sim \mathcal{N}(0, \sigma_{\text{jitter}}^2 I).
+\end{equation}
+The unjittered core segments define labels; jittered copies affect only the
+rendered optical appearance.
+
+\section{Empirical STED Rasterization}
+
+Rendering is handled by \texttt{EmpiricalRasterizer}. Segment density is computed
+from the shortest distance to each segment and combined by maximum response for
+basic rasterization:
+\begin{equation}
+    R(\bm{x}) =
+    \max_i \exp\left(
+        -\frac{d(\bm{x}, s_i)^2}{2\sigma_i^2}
+    \right),
+    \qquad
+    \sigma_i = \sigma_{\text{base}} t_i.
+\end{equation}
+
+For STED-like 2D samples the code first rasterizes a 3D signal volume, then
+collapses it to a focal slice with an axial defocus model. For a plane at axial
+offset $\Delta z$ from the focal slice:
+\begin{equation}
+    w_z = \frac{1}{1 + \left(\frac{|\Delta z|}{d_{\text{of}}}\right)^2},
+    \qquad
+    \sigma_{\perp}(z) =
+    \sqrt{\sigma_{\text{focus}}^2 +
+    \left(\alpha_{\text{defocus}}|\Delta z|\right)^2}.
+\end{equation}
+Each plane is laterally blurred according to $\sigma_{\perp}(z)$, weighted by
+$w_z$, and averaged into the final slice. The renderer also adds STED-specific
+appearance effects: stochastic emission gaps, punctate modulation, monomer haze,
+debris, striping, vignetting, Poisson photon noise, read noise, and a small DC
+offset.
+
+\section{Real-Data Calibration}
+
+The calibrated synthesis mode is driven by \texttt{src/sted\_calibration.py}.
+Real TIFF images are normalized, split into patches, and summarized with robust
+foreground and artifact metrics:
+\begin{itemize}
+    \item intensity quantiles such as $p_{50}$, $p_{90}$, $p_{99}$, and $p_{99.9}$;
+    \item foreground and skeleton fractions;
+    \item component counts and approximate fiber widths;
+    \item high-frequency background noise;
+    \item low-frequency variation, vignetting, and stripe strength;
+    \item orientation anisotropy.
+\end{itemize}
+
+These rows are stored as a calibration profile containing quantile summaries
+globally and by real-data groups such as condition or DIV. During dataset
+generation, \texttt{CalibrationSampler} samples a profile and converts measured
+statistics into scene parameters: target skeleton density, base fiber width,
+noise level, debris count, bundle probabilities, dynamic range, monomer haze
+regime, stripe strength, and vignette edge range. The synthetic image is then
+contrast-matched back to sampled real intensity percentiles.
+
+\section{Target Construction}
+
+\subsection{Distance and Orientation Targets}
+
+\texttt{TargetFieldGenerator} computes dense supervision from vector segments.
+For each pixel $\bm{x}$ and segment $s_i$, the closest point on the segment is
+found and the minimum distance is retained:
+\begin{equation}
+    d(\bm{x}) = \min_i d(\bm{x}, s_i).
+\end{equation}
+The stored distance target is clipped and inverted:
+\begin{equation}
+    D(\bm{x}) = \max\left(0, 1 - \frac{d(\bm{x})}{d_{\max}}\right).
+\end{equation}
+The vector target at $\bm{x}$ is the tangent direction of the closest segment and
+is converted to double-angle orientation channels for 2D training.
+
+\subsection{Focus, Annotation, and Visibility Bands}
+
+The 2D STED labels distinguish localization from visibility. A narrow focal slab
+defines the centerlines the network should localize sharply. A broader annotation
+band includes fibers that are optically visible but outside the strict focus
+slab. The final EDT target blends these two maps:
+\begin{equation}
+    D_{\text{target}} =
+    \max\left(D_{\text{focus}},\;
+    \alpha_{\text{soft}} D_{\text{annotation}}\right).
+\end{equation}
+When the soft annotation exceeds the focus target, the corresponding orientation
+target is taken from the annotation map.
+
+The visibility target uses the same axial response as the renderer. A segment is
+clipped to the axial band where its average optical weight remains above a floor.
+Its contribution is rendered as a Gaussian tube weighted by mean axial visibility:
+\begin{equation}
+    V(\bm{x}) = \max_i
+    \left[
+    \bar{w}_{z,i}
+    \exp\left(-\frac{d(\bm{x}, s_i)^2}{2\sigma_i^2}\right)
+    \right].
+\end{equation}
+This target lets training down-weight ambiguous out-of-focus regions without
+discarding them entirely.
+
+\section{Network Architecture}
+
+The active model is \texttt{STEDResUNet2D} in \texttt{src/model.py}. It is a
+residual 2D U-Net with four encoder stages, a residual bottleneck, atrous spatial
+pyramid pooling, and four decoder stages. The output is assembled from three
+heads:
+\begin{equation}
+    f_{\theta}(X) =
+    \left[\hat{D},\; \hat{C},\; \hat{S},\; \hat{L}_V\right],
+\end{equation}
+where $\hat{L}_V$ is a visibility logit. The older \texttt{FlexibleCVFUNet}
+class remains in the codebase as a generic 2D/3D U-Net, but the upgraded training,
+testing, and inference paths require \texttt{--dim 2} and use
+\texttt{STEDResUNet2D}.
+
+\section{Training Objective}
+
+\texttt{StedFieldLoss2D} combines four terms:
+\begin{equation}
+    \mathcal{L} =
+    \mathcal{L}_{D}
+    + \lambda_O \mathcal{L}_{O}
+    + \lambda_V \mathcal{L}_{V}
+    + \lambda_C(t) \mathcal{L}_{C}.
+\end{equation}
+
+The distance loss is visibility-weighted mean squared error:
+\begin{equation}
+    \mathcal{L}_{D} =
+    \frac{\sum_{\bm{x}} c_V(\bm{x})
+    \left(\hat{D}(\bm{x}) - D(\bm{x})\right)^2}
+    {\sum_{\bm{x}} c_V(\bm{x}) + \epsilon},
+    \qquad
+    c_V = \max(V, V_{\min}).
+\end{equation}
+
+The orientation loss normalizes predicted and target double-angle vectors and
+uses a confidence mask from the distance and visibility targets:
+\begin{equation}
+    \mathcal{L}_{O} =
+    \frac{\sum_{\bm{x}} M(\bm{x})
+    \left(1 - \hat{\bm{o}}(\bm{x}) \cdot \bm{o}(\bm{x})\right)}
+    {\sum_{\bm{x}} M(\bm{x}) + \epsilon},
+    \qquad
+    M = \mathbb{1}[D > \tau_D] D c_V.
+\end{equation}
+
+Visibility is trained with binary cross entropy on logits. The centerline term is
+a soft Dice-style error on high-power EDT ridges:
+\begin{equation}
+    \mathcal{L}_{C} =
+    1 -
+    \frac{2\sum_{\bm{x}} \hat{D}(\bm{x})^\gamma D(\bm{x})^\gamma + \epsilon}
+    {\sum_{\bm{x}} \hat{D}(\bm{x})^\gamma +
+     \sum_{\bm{x}} D(\bm{x})^\gamma + \epsilon}.
+\end{equation}
+The centerline weight is warmed up over the first training epochs, while
+validation uses a fixed score so runs remain comparable.
+
+\section{Inference and Streamline Extraction}
+
+\texttt{inference.py} loads a \texttt{STEDResUNet2D} checkpoint, normalizes a
+\texttt{.tif}, \texttt{.npy}, or \texttt{.pt} input image, and runs tiled
+prediction with overlap blending. Tiling keeps full-resolution inference
+practical for large microscopy images:
+\begin{equation}
+    \hat{Y} =
+    \frac{\sum_k W_k \odot f_{\theta}(X_k)}
+         {\sum_k W_k + \epsilon},
+\end{equation}
+where $W_k$ is a ramped blend window for tile $k$.
+
+Predicted orientation channels are converted back to one arbitrary tangent
+polarity:
+\begin{equation}
+    \hat{\theta} = \frac{1}{2}\operatorname{atan2}(\hat{S}, \hat{C}),
+    \qquad
+    \hat{\bm{u}} = (\cos\hat{\theta}, \sin\hat{\theta}).
+\end{equation}
+The tracker multiplies EDT by clipped visibility, skeletonizes the high-confidence
+mask to create seeds, and integrates streamlines forward and backward through the
+predicted vector field. Local vector polarity is flipped when necessary to
+preserve streamline momentum. The exported products include:
+\begin{itemize}
+    \item \texttt{\_skeleton.tif}: traced binary skeleton;
+    \item \texttt{\_pred\_edt.tif}: predicted localization confidence;
+    \item \texttt{\_pred\_vis.tif}: predicted visibility;
+    \item \texttt{\_pred\_orient\_conf.tif}: orientation-channel confidence.
+\end{itemize}
+
+\section{Legacy and Supporting Modules}
+
+Some modules still support older or auxiliary workflows. The volume-generation
+branch can produce 3D samples with EDT and vector targets, and
+\texttt{src/analysis.py} still contains direct density, topology, Hessian, and
+structure-tensor analyzers. These are not the main upgraded STED training path.
+They are useful as reference utilities, but current model training, evaluation,
+and inference are explicitly 2D.
+
+\section{Validation Coverage}
+
+The test suite focuses on the behavior most likely to regress:
+\begin{itemize}
+    \item STED target splitting between focus, annotation, and visibility bands;
+    \item defocus and monomer/noise rendering behavior;
+    \item real-data calibration profile construction and sampling;
+    \item double-angle orientation handling;
+    \item visibility-weighted losses and supervision floors.
+\end{itemize}
+Run the regression suite with:
+\begin{quote}
+\small
+\begin{verbatim}
+python -m unittest discover -s tests
+\end{verbatim}
+\end{quote}
+
+\section{Typical Workflow}
+
+A calibrated end-to-end run starts by measuring real images:
+\begin{quote}
+\small
+\begin{verbatim}
+python analyze_real_sted.py \
+  --real_dir /path/to/real \
+  --output_dir reports/sted_real \
+  --patch_size 512
+\end{verbatim}
+\end{quote}
+The resulting profile can drive synthetic data generation:
+\begin{quote}
+\small
+\begin{verbatim}
+python generate_dataset.py \
+  --output_dir /path/to/sted2d \
+  --bounds 1024 1024 \
+  --synth_depth 16 \
+  --synthesis_mode calibrated \
+  --calibration_profile reports/sted_real/sted_real_profile.json
+\end{verbatim}
+\end{quote}
+Training then consumes the generated split directories:
+\begin{quote}
+\small
+\begin{verbatim}
+python train.py \
+  --gpus 0 \
+  --data_dir /path/to/sted2d \
+  --dim 2 \
+  --crop_size 512
+\end{verbatim}
+\end{quote}
+A saved checkpoint can be evaluated with \texttt{test.py} or applied to new
+images with \texttt{inference.py}.
+
+\end{document}

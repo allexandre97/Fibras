@@ -84,7 +84,13 @@ def main(args):
     
     skeleton = tracker.to_binary_skeleton(streamlines, original_shape)
     
-    base_path = args.image_path.rsplit('.', 1)[0]
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(args.image_path))[0]
+        base_path = os.path.join(args.output_dir, stem)
+    else:
+        base_path = args.image_path.rsplit('.', 1)[0]
+
     tifffile.imwrite(base_path + '_skeleton.tif', skeleton * 255)
     tifffile.imwrite(base_path + '_pred_edt.tif', (np.clip(edt_map, 0, 1) * 255).astype(np.uint8))
     tifffile.imwrite(base_path + '_pred_vis.tif', (visibility_map * 255).astype(np.uint8))
@@ -117,6 +123,7 @@ if __name__ == "__main__":
     parser.add_argument('--tile_size', type=int, default=512)
     parser.add_argument('--tile_overlap', type=int, default=128)
     parser.add_argument('--downsample', type=float, default=1.0, help="Factor to downsample the image before FCN.")
+    parser.add_argument('--output_dir', type=str, default="", help="Optional directory for prediction outputs.")
     parser.add_argument('--no_amp', action='store_true')
     parser.add_argument('--visualize', action='store_true')
     args = parser.parse_args()
