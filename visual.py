@@ -18,7 +18,7 @@ def main():
     ds_parser.add_argument("--split", type=str, choices=["train", "val", "test"], default="train")
     ds_parser.add_argument("--index", type=int, default=0)
     ds_parser.add_argument("--random_sample", action="store_true")
-    ds_parser.add_argument("--visibility_floor", type=float, default=0.25)
+    ds_parser.add_argument("--score_floor", "--visibility_floor", dest="score_floor", type=float, default=0.25)
 
     debug_parser = subparsers.add_parser("sted-debug", help="Debug 3D-to-2D STED synthesis")
     debug_parser.add_argument("--bounds", type=int, nargs=2, default=[64, 64])
@@ -38,14 +38,14 @@ def main():
         run_single_image_inference(args)
     elif args.mode == "dataset":
         if args.file:
-            show_synthetic_data(args.file, visibility_floor=args.visibility_floor)
+            show_synthetic_data(args.file, score_floor=args.score_floor)
         elif args.data_dir:
             show_dataset_sample(
                 data_dir=args.data_dir,
                 split=args.split,
                 index=args.index,
                 random_sample=args.random_sample,
-                visibility_floor=args.visibility_floor,
+                score_floor=args.score_floor,
             )
         else:
             raise ValueError("dataset mode requires either --file or --data_dir")

@@ -43,19 +43,24 @@ def _resolve_dataset_file(data_dir: str, split: str, index: int, random_sample: 
 def _extract_sample_arrays(data):
     volume = data["volume"].detach().cpu().numpy()
     targets = data["targets"].detach().cpu().numpy()
+    target_schema = data.get("target_schema", "legacy")
 
     is_2d = volume.ndim == 4 and volume.shape[0] == 1 and volume.shape[1] == 1
     if is_2d:
         image = volume[0, 0]
-        edt = targets[0, 0]
+        primary = targets[0, 0]
         vector = targets[1:3, 0]
-        visibility = targets[3, 0] if targets.shape[0] > 3 else None
+        auxiliary = targets[3, 0] if targets.shape[0] > 3 else None
+        radius = targets[4, 0] if targets.shape[0] > 4 else None
+        schema = "structural_v1" if targets.shape[0] >= 5 or target_schema == "structural_v1" else "legacy"
         return {
             "is_2d": True,
             "image": image,
-            "edt": edt,
+            "primary": primary,
             "vector": vector,
-            "visibility": visibility,
+            "auxiliary": auxiliary,
+            "radius": radius,
+            "schema": schema,
         }
 
     is_3d = volume.ndim == 4 and volume.shape[0] == 1
@@ -66,9 +71,11 @@ def _extract_sample_arrays(data):
         return {
             "is_2d": False,
             "image": image,
-            "edt": edt,
+            "primary": edt,
             "vector": vector,
-            "visibility": None,
+            "auxiliary": None,
+            "radius": None,
+            "schema": "legacy_3d",
         }
 
     raise ValueError(
@@ -89,38 +96,45 @@ def _direction_rgb(vector, edt, double_angle: bool = False):
     return hsv_to_rgb(hsv)
 
 
-def export_sample_png(pt_path: str, out_path: str, visibility_floor: float = 0.25):
+def export_sample_png(pt_path: str, out_path: str, score_floor: float = 0.25):
     import torch
 
     data = torch.load(pt_path, map_location="cpu", weights_only=True)
     sample = _extract_sample_arrays(data)
     image = sample["image"]
-    edt = sample["edt"]
+    primary = sample["primary"]
     vector = sample["vector"]
-    visibility = sample["visibility"]
+    auxiliary = sample["auxiliary"]
+    radius = sample["radius"]
+    schema = sample["schema"]
 
     is_2d = sample["is_2d"]
     if not is_2d:
         mid = image.shape[0] // 2
         image = image[mid]
-        edt = edt[mid]
+        primary = primary[mid]
         vector = vector[:, mid]
 
-    direction_rgb = _direction_rgb(vector[:2], edt, double_angle=is_2d)
+    direction_rgb = _direction_rgb(vector[:2], primary, double_angle=is_2d)
 
-    ncols = 4 if (is_2d and visibility is not None) else 3
+    show_auxiliary = is_2d and auxiliary is not None
+    show_radius = is_2d and radius is not None and schema == "structural_v1"
+    ncols = 5 if show_radius else (4 if show_auxiliary else 3)
     fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 4), dpi=150)
 
     axes[0].imshow(image, cmap="magma", vmin=0, vmax=max(image.max(), 1e-8))
     axes[0].set_title("Image")
-    axes[1].imshow(edt, cmap="viridis", vmin=0, vmax=max(edt.max(), 1e-8))
-    axes[1].set_title("EDT")
+    axes[1].imshow(primary, cmap="viridis", vmin=0, vmax=max(primary.max(), 1e-8))
+    axes[1].set_title("Centerline" if schema == "structural_v1" else "EDT")
     axes[2].imshow(direction_rgb)
     axes[2].set_title("Vector Direction")
 
-    if ncols == 4:
-        axes[3].imshow(visibility, cmap="inferno", vmin=0, vmax=1)
-        axes[3].set_title("Visibility")
+    if show_auxiliary:
+        axes[3].imshow(auxiliary, cmap="inferno", vmin=0, vmax=1)
+        axes[3].set_title("Traceability" if schema == "structural_v1" else "Visibility")
+    if show_radius:
+        axes[4].imshow(radius, cmap="cividis", vmin=0, vmax=1)
+        axes[4].set_title("Radius")
 
     for ax in axes:
         ax.axis("off")
@@ -136,7 +150,7 @@ def export_dataset_pngs(
     export_dir: str,
     split: str = "train",
     num_samples: int = 0,
-    visibility_floor: float = 0.25,
+    score_floor: float = 0.25,
 ):
     split_dir = os.path.join(data_dir, split)
     sample_dir = split_dir if os.path.isdir(split_dir) else data_dir
@@ -159,13 +173,13 @@ def export_dataset_pngs(
     for i, pt_path in enumerate(files):
         name = os.path.splitext(os.path.basename(pt_path))[0]
         out_path = os.path.join(export_dir, f"{name}.png")
-        export_sample_png(pt_path, out_path, visibility_floor=visibility_floor)
+        export_sample_png(pt_path, out_path, score_floor=score_floor)
         print(f"  [{i + 1}/{len(files)}] {out_path}")
 
     print("Done.")
 
 
-def show_synthetic_data(pt_path: str, visibility_floor: float = 0.25):
+def show_synthetic_data(pt_path: str, score_floor: float = 0.25):
     import torch
 
     try:
@@ -179,18 +193,24 @@ def show_synthetic_data(pt_path: str, visibility_floor: float = 0.25):
     data = torch.load(pt_path, map_location="cpu", weights_only=True)
     sample = _extract_sample_arrays(data)
     image = sample["image"]
-    edt = sample["edt"]
+    primary = sample["primary"]
     vector = sample["vector"]
-    visibility = sample["visibility"]
+    auxiliary = sample["auxiliary"]
+    radius = sample["radius"]
+    schema = sample["schema"]
     is_2d = sample["is_2d"]
     dim_str = "2D STED" if is_2d else "3D Confocal"
     print(f"Render Mode: {dim_str} | Array Shape: {image.shape}")
     print(
         f"Image min/max={float(image.min()):.4f}/{float(image.max()):.4f} | "
-        f"EDT min/max={float(edt.min()):.4f}/{float(edt.max()):.4f}"
+        f"{'Centerline' if schema == 'structural_v1' else 'EDT'} min/max="
+        f"{float(primary.min()):.4f}/{float(primary.max()):.4f}"
     )
-    if visibility is not None:
-        print(f"Visibility min/max={float(visibility.min()):.4f}/{float(visibility.max()):.4f}")
+    if auxiliary is not None:
+        label = "Traceability" if schema == "structural_v1" else "Visibility"
+        print(f"{label} min/max={float(auxiliary.min()):.4f}/{float(auxiliary.max()):.4f}")
+    if radius is not None:
+        print(f"Radius min/max={float(radius.min()):.4f}/{float(radius.max()):.4f}")
 
     viewer = napari.Viewer(title=f"Fibras Dataset Viewer - {dim_str} - {os.path.basename(pt_path)}")
     viewer.add_image(
@@ -201,15 +221,15 @@ def show_synthetic_data(pt_path: str, visibility_floor: float = 0.25):
     )
 
     viewer.add_image(
-        edt,
-        name="EDT Target",
+        primary,
+        name="Centerline Target" if schema == "structural_v1" else "EDT Target",
         colormap="viridis",
         visible=False,
         opacity=0.75,
     )
 
     if is_2d:
-        direction_rgb = _direction_rgb(vector[:2], edt, double_angle=True)
+        direction_rgb = _direction_rgb(vector[:2], primary, double_angle=True)
         viewer.add_image(
             direction_rgb,
             name="Orientation Direction",
@@ -218,7 +238,7 @@ def show_synthetic_data(pt_path: str, visibility_floor: float = 0.25):
             opacity=0.75,
         )
     else:
-        direction_mid = _direction_rgb(vector[:2, vector.shape[1] // 2], edt[edt.shape[0] // 2])
+        direction_mid = _direction_rgb(vector[:2, vector.shape[1] // 2], primary[primary.shape[0] // 2])
         viewer.add_image(
             direction_mid,
             name="Vector Direction (mid-Z)",
@@ -228,45 +248,67 @@ def show_synthetic_data(pt_path: str, visibility_floor: float = 0.25):
         )
 
     viewer.add_labels(
-        (edt > 0.15).astype(int),
-        name="Annotation Mask (EDT > 0.15)",
+        (primary > 0.15).astype(int),
+        name="Centerline Support (> 0.15)" if schema == "structural_v1" else "Annotation Mask (EDT > 0.15)",
         visible=False,
         opacity=0.5,
     )
     viewer.add_labels(
-        (edt > 0.85).astype(int),
-        name="Ground Truth Centerlines (EDT > 0.85)",
+        (primary > 0.50).astype(int),
+        name="Ground Truth Centerlines" if schema == "structural_v1" else "Ground Truth Centerlines (EDT > 0.85)",
         visible=False,
         opacity=0.7,
     )
 
-    if is_2d and visibility is not None:
+    if is_2d and auxiliary is not None:
         viewer.add_image(
-            visibility,
-            name="Visibility Target",
+            auxiliary,
+            name="Traceability Target" if schema == "structural_v1" else "Visibility Target",
             colormap="inferno",
             visible=False,
             opacity=0.7,
         )
-        viewer.add_labels(
-            (visibility > 0.25).astype(int),
-            name="Visibility > 0.25",
-            visible=False,
-            opacity=0.5,
-        )
-        viewer.add_labels(
-            (visibility > 0.50).astype(int),
-            name="Visibility > 0.50",
-            visible=False,
-            opacity=0.5,
-        )
-        viewer.add_image(
-            edt * np.clip(visibility, visibility_floor, 1.0),
-            name=f"EDT x Visibility (floor={visibility_floor:.2f})",
-            colormap="magma",
-            visible=False,
-            opacity=0.7,
-        )
+        if schema == "structural_v1" and radius is not None:
+            viewer.add_image(
+                radius,
+                name="Radius Target",
+                colormap="cividis",
+                visible=False,
+                opacity=0.7,
+            )
+            viewer.add_labels(
+                (auxiliary > score_floor).astype(int),
+                name=f"Traceability > {score_floor:.2f}",
+                visible=False,
+                opacity=0.5,
+            )
+            viewer.add_image(
+                primary * np.sqrt(np.clip(auxiliary, score_floor, 1.0)),
+                name=f"Centerline x sqrt(Traceability floor={score_floor:.2f})",
+                colormap="magma",
+                visible=False,
+                opacity=0.7,
+            )
+        else:
+            viewer.add_labels(
+                (auxiliary > 0.25).astype(int),
+                name="Visibility > 0.25",
+                visible=False,
+                opacity=0.5,
+            )
+            viewer.add_labels(
+                (auxiliary > 0.50).astype(int),
+                name="Visibility > 0.50",
+                visible=False,
+                opacity=0.5,
+            )
+            viewer.add_image(
+                primary * np.clip(auxiliary, score_floor, 1.0),
+                name=f"EDT x Visibility (floor={score_floor:.2f})",
+                colormap="magma",
+                visible=False,
+                opacity=0.7,
+            )
 
     napari.run()
 
@@ -276,7 +318,7 @@ def show_dataset_sample(
     split: str = "train",
     index: int = 0,
     random_sample: bool = False,
-    visibility_floor: float = 0.25,
+    score_floor: float = 0.25,
 ):
     sample_file, idx, total, sample_dir = _resolve_dataset_file(
         data_dir=data_dir,
@@ -288,7 +330,7 @@ def show_dataset_sample(
         f"Dataset directory: {sample_dir} | Selected sample {idx + 1}/{total}: "
         f"{os.path.basename(sample_file)}"
     )
-    show_synthetic_data(sample_file, visibility_floor=visibility_floor)
+    show_synthetic_data(sample_file, score_floor=score_floor)
 
 
 def show_sted_debug(
@@ -388,10 +430,12 @@ if __name__ == "__main__":
     parser.add_argument("--index", type=int, default=0, help="Sample index used with --data-dir")
     parser.add_argument("--random-sample", action="store_true", help="Randomly pick a sample when using --data-dir")
     parser.add_argument(
+        "--score_floor",
         "--visibility_floor",
+        dest="score_floor",
         type=float,
         default=0.25,
-        help="Floor used in EDT x visibility inspection overlay.",
+        help="Floor used in score-combination inspection overlays.",
     )
     parser.add_argument("--export-dir", type=str, default=None, help="Export samples as PNG files to this directory (works with --file or --data-dir)")
     parser.add_argument("--num-samples", type=int, default=0, help="Number of samples to export (0 = all). Used with --data-dir --export-dir")
@@ -407,10 +451,10 @@ if __name__ == "__main__":
             os.makedirs(args.export_dir, exist_ok=True)
             name = os.path.splitext(os.path.basename(args.file))[0]
             out_path = os.path.join(args.export_dir, f"{name}.png")
-            export_sample_png(args.file, out_path, visibility_floor=args.visibility_floor)
+            export_sample_png(args.file, out_path, score_floor=args.score_floor)
             print(f"Exported: {out_path}")
         else:
-            show_synthetic_data(args.file, visibility_floor=args.visibility_floor)
+            show_synthetic_data(args.file, score_floor=args.score_floor)
     elif args.data_dir:
         if not os.path.exists(args.data_dir):
             raise FileNotFoundError(f"Dataset directory not found: {args.data_dir}")
@@ -420,7 +464,7 @@ if __name__ == "__main__":
                 export_dir=args.export_dir,
                 split=args.split,
                 num_samples=args.num_samples,
-                visibility_floor=args.visibility_floor,
+                score_floor=args.score_floor,
             )
         else:
             show_dataset_sample(
@@ -428,7 +472,7 @@ if __name__ == "__main__":
                 split=args.split,
                 index=args.index,
                 random_sample=args.random_sample,
-                visibility_floor=args.visibility_floor,
+                score_floor=args.score_floor,
             )
     else:
         if args.label_slab_scale <= 0.0:

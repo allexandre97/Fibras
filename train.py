@@ -28,8 +28,15 @@ class PrecomputedFiberDataset(Dataset):
         file_path = os.path.join(self.data_dir, self.files[idx])
         data = torch.load(file_path, weights_only=True, map_location='cpu')
         vol, targets = data['volume'], data['targets']
+        target_schema = data.get("target_schema", "legacy")
         
         if self.dim == 2:
+            if target_schema != "structural_v1" or targets.shape[0] < 5:
+                raise ValueError(
+                    "This training path expects 2D samples with target_schema='structural_v1' "
+                    "and 5 target channels (centerline, orientation, traceability, radius). "
+                    "Regenerate the dataset with the upgraded structural target pipeline."
+                )
             vol = vol.squeeze(1)
             targets = targets[:, 0, :, :]
             vol, targets = self._crop_2d(vol, targets)
@@ -133,15 +140,22 @@ class StedFieldLoss2D(nn.Module):
         self,
         orientation_weight: float = 1.0,
         visibility_weight: float = 0.35,
-        orientation_mask_floor: float = 0.05,
+        orientation_mask_floor: float = 0.15,
         loss_visibility_floor: float = 0.25,
         fixed_orientation_weight: float = 1.0,
         fixed_visibility_weight: float = 0.35,
-        skeleton_weight: float = 0.25,
-        train_centerline_weight: float = 0.15,
+        skeleton_weight: float = 1.0,
+        train_centerline_weight: float = 1.0,
         score_centerline_weight: float | None = None,
-        centerline_warmup_epochs: int = 8,
-        centerline_warmup_start_factor: float = 0.25,
+        centerline_warmup_epochs: int = 0,
+        centerline_warmup_start_factor: float = 1.0,
+        radius_weight: float = 0.15,
+        centerline_threshold: float = 0.5,
+        centerline_focal_weight: float = 1.0,
+        centerline_dice_weight: float = 1.0,
+        centerline_cldice_weight: float = 0.5,
+        stability_margin_weight: float = 0.2,
+        score_stability_weight: float = 0.2,
     ):
         super().__init__()
         if orientation_mask_floor < 0.0:
@@ -152,12 +166,14 @@ class StedFieldLoss2D(nn.Module):
             raise ValueError("centerline_warmup_epochs must be non-negative.")
         if centerline_warmup_start_factor < 0.0 or centerline_warmup_start_factor > 1.0:
             raise ValueError("centerline_warmup_start_factor must be in the interval [0, 1].")
+        if centerline_threshold <= 0.0 or centerline_threshold >= 1.0:
+            raise ValueError("centerline_threshold must be in the interval (0, 1).")
         self.orientation_weight = float(orientation_weight)
-        self.visibility_weight = float(visibility_weight)
-        self.orientation_mask_floor = float(orientation_mask_floor)
-        self.loss_visibility_floor = float(loss_visibility_floor)
+        self.traceability_weight = float(visibility_weight)
+        self.centerline_support_floor = float(orientation_mask_floor)
+        self.traceability_floor = float(loss_visibility_floor)
         self.fixed_orientation_weight = float(fixed_orientation_weight)
-        self.fixed_visibility_weight = float(fixed_visibility_weight)
+        self.fixed_traceability_weight = float(fixed_visibility_weight)
         self.score_centerline_weight = float(
             skeleton_weight if score_centerline_weight is None else score_centerline_weight
         )
@@ -165,19 +181,96 @@ class StedFieldLoss2D(nn.Module):
         self.centerline_warmup_epochs = int(centerline_warmup_epochs)
         self.centerline_warmup_start_factor = float(centerline_warmup_start_factor)
         self._current_train_centerline_weight = self.train_centerline_weight
-        self.centerline_gamma = 6.0
+        self.radius_weight = float(radius_weight)
+        self.centerline_threshold = float(centerline_threshold)
+        self.centerline_focal_weight = float(centerline_focal_weight)
+        self.centerline_dice_weight = float(centerline_dice_weight)
+        self.centerline_cldice_weight = float(centerline_cldice_weight)
+        self.stability_margin_weight = float(stability_margin_weight)
+        self.score_stability_weight = float(score_stability_weight)
         self.centerline_eps = 1e-6
+        self.centerline_pos_margin = 0.75
+        self.centerline_neg_margin = 0.25
+        self.centerline_sensitivity_band = 0.10
+        self.cldice_iterations = 8
         self.mse = nn.MSELoss(reduction="none")
 
-    def _centerline_error(self, pred_edt, target_edt):
-        # Emphasize the ridge center smoothly instead of thresholding at a single EDT cutoff.
-        pred_centerline = torch.clamp(pred_edt.float(), 0.0, 1.0).pow(self.centerline_gamma)
-        target_centerline = torch.clamp(target_edt.float(), 0.0, 1.0).pow(self.centerline_gamma)
-        reduce_dims = tuple(range(1, pred_centerline.ndim))
-        intersection = (pred_centerline * target_centerline).sum(dim=reduce_dims)
-        denom = pred_centerline.sum(dim=reduce_dims) + target_centerline.sum(dim=reduce_dims)
+    @staticmethod
+    def _binary_focal_with_logits(logits, targets, alpha: float = 0.75, gamma: float = 2.0):
+        prob = torch.sigmoid(logits)
+        ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        p_t = prob * targets + (1.0 - prob) * (1.0 - targets)
+        alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
+        return (alpha_t * torch.pow(1.0 - p_t, gamma) * ce).mean()
+
+    def _soft_dice_loss(self, prob, target):
+        reduce_dims = tuple(range(1, prob.ndim))
+        intersection = (prob * target).sum(dim=reduce_dims)
+        denom = prob.sum(dim=reduce_dims) + target.sum(dim=reduce_dims)
         dice = (2.0 * intersection + self.centerline_eps) / (denom + self.centerline_eps)
         return (1.0 - dice).mean()
+
+    @staticmethod
+    def _soft_erode(img):
+        p1 = -F.max_pool2d(-img, kernel_size=(3, 1), stride=1, padding=(1, 0))
+        p2 = -F.max_pool2d(-img, kernel_size=(1, 3), stride=1, padding=(0, 1))
+        return torch.min(p1, p2)
+
+    def _soft_open(self, img):
+        return F.max_pool2d(self._soft_erode(img), kernel_size=3, stride=1, padding=1)
+
+    def _soft_skeletonize(self, img):
+        img = torch.clamp(img, 0.0, 1.0)
+        opened = self._soft_open(img)
+        skeleton = F.relu(img - opened)
+        current = img
+        for _ in range(self.cldice_iterations - 1):
+            current = self._soft_erode(current)
+            opened = self._soft_open(current)
+            delta = F.relu(current - opened)
+            skeleton = skeleton + F.relu(delta - skeleton * delta)
+        return torch.clamp(skeleton, 0.0, 1.0)
+
+    def _cldice_loss(self, prob, target):
+        skel_prob = self._soft_skeletonize(prob)
+        skel_target = self._soft_skeletonize(target)
+        reduce_dims = tuple(range(1, prob.ndim))
+        topology_precision = (skel_prob * target).sum(dim=reduce_dims) / (skel_prob.sum(dim=reduce_dims) + self.centerline_eps)
+        topology_sensitivity = (skel_target * prob).sum(dim=reduce_dims) / (skel_target.sum(dim=reduce_dims) + self.centerline_eps)
+        cldice = (2.0 * topology_precision * topology_sensitivity + self.centerline_eps) / (
+            topology_precision + topology_sensitivity + self.centerline_eps
+        )
+        return (1.0 - cldice).mean()
+
+    def _stability_margin_loss(self, prob, target):
+        pos_violation = F.relu(self.centerline_pos_margin - prob) * target
+        neg_violation = F.relu(prob - self.centerline_neg_margin) * (1.0 - target)
+        return (pos_violation + neg_violation).mean()
+
+    def _threshold_sensitivity(self, prob, target):
+        target_binary = (target > 0.5).to(prob.dtype)
+        thresholds = [
+            max(0.05, self.centerline_threshold - self.centerline_sensitivity_band),
+            self.centerline_threshold,
+            min(0.95, self.centerline_threshold + self.centerline_sensitivity_band),
+        ]
+        dice_losses = []
+        reduce_dims = tuple(range(1, prob.ndim))
+        for threshold in thresholds:
+            pred_binary = (prob > threshold).to(prob.dtype)
+            intersection = (pred_binary * target_binary).sum(dim=reduce_dims)
+            denom = pred_binary.sum(dim=reduce_dims) + target_binary.sum(dim=reduce_dims)
+            dice = (2.0 * intersection + self.centerline_eps) / (denom + self.centerline_eps)
+            dice_losses.append(1.0 - dice)
+        stacked = torch.stack(dice_losses, dim=0)
+        return (stacked.max(dim=0).values - stacked.min(dim=0).values).mean()
+
+    def _junction_mask(self, target_centerline):
+        binary = (target_centerline > 0.5).to(target_centerline.dtype)
+        kernel = torch.ones((1, 1, 3, 3), dtype=target_centerline.dtype, device=target_centerline.device)
+        neighbors = F.conv2d(binary, kernel, padding=1) - binary
+        junction = (neighbors >= 3.0).to(target_centerline.dtype)
+        return F.max_pool2d(junction, kernel_size=3, stride=1, padding=1)
 
     def _compute_train_centerline_weight(self, epoch: int) -> float:
         if self.centerline_warmup_epochs <= 1:
@@ -195,50 +288,77 @@ class StedFieldLoss2D(nn.Module):
         return self._current_train_centerline_weight
 
     def compute_components(self, pred, target):
-        pred_edt = pred[:, 0:1]
+        pred_centerline_logits = pred[:, 0:1]
         pred_orientation = pred[:, 1:3]
-        pred_visibility = pred[:, 3:4]
+        pred_traceability_logits = pred[:, 3:4]
+        pred_radius = torch.sigmoid(pred[:, 4:5])
 
-        target_edt = target[:, 0:1]
+        target_centerline = target[:, 0:1]
         target_orientation = normalize_orientation_torch(target[:, 1:3])
-        target_visibility = target[:, 3:4]
-        visibility_conf = torch.clamp(target_visibility, self.loss_visibility_floor, 1.0)
+        target_traceability = target[:, 3:4]
+        target_radius = target[:, 4:5]
 
-        edt_err = self.mse(pred_edt, target_edt)
-        edt_loss = (edt_err * visibility_conf).sum() / (visibility_conf.sum() + 1e-8)
+        centerline_prob = torch.sigmoid(pred_centerline_logits)
+        traceability_conf = torch.clamp(target_traceability, self.traceability_floor, 1.0)
+        junction_mask = self._junction_mask(target_centerline)
+
+        centerline_focal = self._binary_focal_with_logits(pred_centerline_logits, target_centerline)
+        centerline_dice = self._soft_dice_loss(centerline_prob, target_centerline)
+        cldice = self._cldice_loss(centerline_prob, target_centerline)
+        centerline_loss = (
+            self.centerline_focal_weight * centerline_focal
+            + self.centerline_dice_weight * centerline_dice
+            + self.centerline_cldice_weight * cldice
+        )
 
         pred_orientation = normalize_orientation_torch(pred_orientation)
         orientation_dot = torch.sum(pred_orientation * target_orientation, dim=1, keepdim=True)
         orientation_err = 1.0 - torch.clamp(orientation_dot, -1.0, 1.0)
-        edt_conf = torch.clamp(target_edt, 0.0, 1.0)
-        orientation_mask = (edt_conf > self.orientation_mask_floor).to(pred.dtype) * edt_conf * visibility_conf
+        centerline_conf = torch.clamp(target_centerline, 0.0, 1.0)
+        orientation_mask = (
+            (centerline_conf > self.centerline_support_floor).to(pred.dtype)
+            * centerline_conf
+            * traceability_conf
+            * (1.0 - junction_mask)
+        )
         orientation_loss = (orientation_err * orientation_mask).sum() / (orientation_mask.sum() + 1e-8)
 
-        visibility_loss = F.binary_cross_entropy_with_logits(pred_visibility, target_visibility)
-        centerline_error = self._centerline_error(pred_edt, target_edt)
+        traceability_loss = F.binary_cross_entropy_with_logits(pred_traceability_logits, target_traceability)
+        radius_mask = (centerline_conf > self.centerline_support_floor).to(pred.dtype)
+        radius_err = F.smooth_l1_loss(pred_radius, target_radius, reduction="none")
+        radius_loss = (radius_err * radius_mask).sum() / (radius_mask.sum() + 1e-8)
+        stability_margin = self._stability_margin_loss(centerline_prob, target_centerline)
+        threshold_sensitivity = self._threshold_sensitivity(centerline_prob, target_centerline)
 
         return {
-            "edt": edt_loss,
+            "centerline": centerline_loss,
+            "centerline_focal": centerline_focal,
+            "centerline_dice": centerline_dice,
+            "cldice": cldice,
             "orientation": orientation_loss,
-            "visibility": visibility_loss,
-            "centerline_error": centerline_error,
+            "traceability": traceability_loss,
+            "radius": radius_loss,
+            "stability_margin": stability_margin,
+            "threshold_sensitivity": threshold_sensitivity,
         }
 
     def fixed_score(self, components):
         return (
-            components["edt"]
+            self.score_centerline_weight * components["centerline"]
             + self.fixed_orientation_weight * components["orientation"]
-            + self.fixed_visibility_weight * components["visibility"]
-            + self.score_centerline_weight * components["centerline_error"]
+            + self.fixed_traceability_weight * components["traceability"]
+            + self.radius_weight * components["radius"]
+            + self.score_stability_weight * components["threshold_sensitivity"]
         )
 
     def forward(self, pred, target):
         components = self.compute_components(pred, target)
         return (
-            components["edt"]
+            self.current_train_centerline_weight() * components["centerline"]
             + self.orientation_weight * components["orientation"]
-            + self.visibility_weight * components["visibility"]
-            + self.current_train_centerline_weight() * components["centerline_error"]
+            + self.traceability_weight * components["traceability"]
+            + self.radius_weight * components["radius"]
+            + self.stability_margin_weight * components["stability_margin"]
         )
 
 
@@ -246,17 +366,32 @@ def _empty_metric_totals():
     return {
         "loss": 0.0,
         "score": 0.0,
-        "edt": 0.0,
+        "centerline": 0.0,
+        "centerline_focal": 0.0,
+        "centerline_dice": 0.0,
+        "cldice": 0.0,
         "orientation": 0.0,
-        "visibility": 0.0,
-        "centerline_error": 0.0,
+        "traceability": 0.0,
+        "radius": 0.0,
+        "stability_margin": 0.0,
+        "threshold_sensitivity": 0.0,
     }
 
 
 def _add_metric_batch(totals, criterion, loss, components):
     totals["loss"] += float(loss.detach().cpu())
     totals["score"] += float(criterion.fixed_score(components).detach().cpu())
-    for key in ("edt", "orientation", "visibility", "centerline_error"):
+    for key in (
+        "centerline",
+        "centerline_focal",
+        "centerline_dice",
+        "cldice",
+        "orientation",
+        "traceability",
+        "radius",
+        "stability_margin",
+        "threshold_sensitivity",
+    ):
         totals[key] += float(components[key].detach().cpu())
 
 
@@ -335,13 +470,20 @@ def train_model(args):
         train_centerline_weight=args.train_centerline_weight,
         centerline_warmup_epochs=args.centerline_warmup_epochs,
         centerline_warmup_start_factor=args.centerline_warmup_start_factor,
+        radius_weight=args.radius_loss_weight,
+        centerline_threshold=args.centerline_threshold,
+        score_stability_weight=args.score_stability_weight,
+        stability_margin_weight=args.stability_margin_weight,
     )
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
 
     best_val_score = float('inf')
-    os.makedirs("weights", exist_ok=True)
+    save_path = args.save_path
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
 
     print("\nStarting 2D STED ResUNet Training Loop...")
     for epoch in range(args.epochs):
@@ -408,12 +550,17 @@ def train_model(args):
             "train_score": train_metrics["score"],
             "val_loss": val_metrics["loss"],
             "val_score": val_metrics["score"],
-            "val_edt": val_metrics["edt"],
+            "val_centerline": val_metrics["centerline"],
+            "val_centerline_focal": val_metrics["centerline_focal"],
+            "val_centerline_dice": val_metrics["centerline_dice"],
+            "val_cldice": val_metrics["cldice"],
             "val_orientation": val_metrics["orientation"],
-            "val_visibility": val_metrics["visibility"],
-            "val_centerline_error": val_metrics["centerline_error"],
+            "val_traceability": val_metrics["traceability"],
+            "val_radius": val_metrics["radius"],
+            "val_threshold_sensitivity": val_metrics["threshold_sensitivity"],
             "train_centerline_weight": active_train_centerline_weight,
             "score_centerline_weight": criterion.score_centerline_weight,
+            "score_stability_weight": criterion.score_stability_weight,
             "epoch_time_seconds": t_elapsed,
         }
         if wandb_run is not None:
@@ -421,13 +568,13 @@ def train_model(args):
         print(
             f"-> Epoch {epoch+1} Summary: Train: {train_metrics['loss']:.4f} | "
             f"Val Score: {val_metrics['score']:.4f} | Val Loss: {val_metrics['loss']:.4f} | "
-            f"Centerline W: {active_train_centerline_weight:.4f} | Time: {t_elapsed:.1f}s"
+            f"Centerline W: {active_train_centerline_weight:.4f} | "
+            f"Sens: {val_metrics['threshold_sensitivity']:.4f} | Time: {t_elapsed:.1f}s"
         )
 
         if val_metrics["score"] < best_val_score:
             best_val_score = val_metrics["score"]
             state_dict = model.module.state_dict() if use_data_parallel else model.state_dict()
-            save_path = "weights/sted_resunet2d_final.pth"
             torch.save(state_dict, save_path)
 
 if __name__ == "__main__":
@@ -444,13 +591,18 @@ if __name__ == "__main__":
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--orientation_loss_weight', type=float, default=1.0)
-    parser.add_argument('--visibility_loss_weight', type=float, default=0.35)
-    parser.add_argument('--orientation_mask_floor', type=float, default=0.05)
+    parser.add_argument('--visibility_loss_weight', '--traceability_loss_weight', dest='visibility_loss_weight', type=float, default=0.35)
+    parser.add_argument('--orientation_mask_floor', '--centerline_support_floor', dest='orientation_mask_floor', type=float, default=0.15)
     parser.add_argument('--loss_visibility_floor', type=float, default=0.25)
-    parser.add_argument('--train_centerline_weight', type=float, default=0.15)
-    parser.add_argument('--score_centerline_weight', '--skeleton_score_weight', dest='score_centerline_weight', type=float, default=0.25)
-    parser.add_argument('--centerline_warmup_epochs', type=int, default=8)
-    parser.add_argument('--centerline_warmup_start_factor', type=float, default=0.25)
+    parser.add_argument('--radius_loss_weight', type=float, default=0.15)
+    parser.add_argument('--train_centerline_weight', type=float, default=1.0)
+    parser.add_argument('--score_centerline_weight', '--skeleton_score_weight', dest='score_centerline_weight', type=float, default=1.0)
+    parser.add_argument('--centerline_warmup_epochs', type=int, default=0)
+    parser.add_argument('--centerline_warmup_start_factor', type=float, default=1.0)
+    parser.add_argument('--centerline_threshold', type=float, default=0.5)
+    parser.add_argument('--stability_margin_weight', type=float, default=0.2)
+    parser.add_argument('--score_stability_weight', type=float, default=0.2)
+    parser.add_argument('--save_path', type=str, default='weights/sted_resunet2d_final.pth')
     parser.add_argument('--multi_gpu', action='store_true', help="Enable nn.DataParallel across all visible GPUs.")
     parser.add_argument('--nccl_p2p_disable', action='store_true', help="Set NCCL_P2P_DISABLE=1 when using --multi_gpu.")
     parser.add_argument('--nccl_ib_disable', action='store_true', help="Set NCCL_IB_DISABLE=1 when using --multi_gpu.")

@@ -3,18 +3,14 @@ import os
 import time
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional
 
 import numpy as np
 import scipy.ndimage as ndi
 import tifffile
 import torch
 
-try:
-    from skimage.morphology import skeletonize
-except Exception:  # pragma: no cover - exercised only when optional deps are missing.
-    skeletonize = None
-
+from src.decoder import CenterlineGraphDecoder
 from src.inference_utils import normalize_image_percentile, predict_tiled_2d
 from src.model import STEDResUNet2D
 from src.sted import orientation_confidence_np, orientation_to_vector_map_np
@@ -24,14 +20,14 @@ from src.sted_calibration import (
     load_calibration_profile,
     parse_sted_filename,
 )
-from src.tracking import StreamlineTracker
 from src.visualization import AdvancedVisualizer
 
 
 OUTPUT_SUFFIXES = {
     "skeleton": "_skeleton.tif",
-    "pred_edt": "_pred_edt.tif",
-    "pred_vis": "_pred_vis.tif",
+    "pred_centerline": "_pred_centerline.tif",
+    "pred_traceability": "_pred_traceability.tif",
+    "pred_radius": "_pred_radius.tif",
     "pred_orient_conf": "_pred_orient_conf.tif",
     "preview": "_preview.png",
     "summary": "_summary.json",
@@ -43,22 +39,25 @@ class RealInferenceResult:
     image_path: str
     image: np.ndarray
     image_normalized: np.ndarray
-    edt_map: np.ndarray
+    centerline_prob: np.ndarray
     orientation_map: np.ndarray
     vector_map: np.ndarray
     orientation_confidence: np.ndarray
-    visibility_map: np.ndarray
-    edt_for_tracking: np.ndarray
-    seed_mask: np.ndarray
+    traceability_map: np.ndarray
+    radius_map: np.ndarray
+    decoder_score_map: np.ndarray
+    decoder_candidate_mask: np.ndarray
+    decoder_strong_seed_mask: np.ndarray
     skeleton: np.ndarray
-    streamlines: List[np.ndarray]
+    component_paths: List[np.ndarray]
+    endpoint_mask: np.ndarray
+    junction_mask: np.ndarray
     prediction_seconds: float
-    tracking_seconds: float
+    decoding_seconds: float
     total_seconds: float
     tile_size: int
     tile_overlap: int
-    min_edt: float
-    visibility_floor: float
+    centerline_threshold: float
     used_amp: bool
 
 
@@ -74,8 +73,7 @@ def add_inference_arguments(
         parser.add_argument("--image_path", type=str, required=True)
     parser.add_argument("--dim", type=int, choices=[2], default=2)
     parser.add_argument("--base_filters", type=int, default=32)
-    parser.add_argument("--min_edt", type=float, default=0.15)
-    parser.add_argument("--visibility_floor", type=float, default=0.25)
+    parser.add_argument("--centerline_threshold", type=float, default=0.5)
     parser.add_argument("--tile_size", type=int, default=512)
     parser.add_argument("--tile_overlap", type=int, default=128)
     parser.add_argument(
@@ -119,7 +117,17 @@ def load_sted_model(model_path: str, base_filters: int = 32, device_spec: str = 
     model = STEDResUNet2D(in_channels=1, base_filters=base_filters)
     state_dict = torch.load(model_path, map_location=device, weights_only=True)
     state_dict = {k[7:] if k.startswith("module.") else k: v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict)
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError as error:
+        message = str(error)
+        if "edt_head" in message or "visibility_head" in message:
+            raise RuntimeError(
+                f"Checkpoint '{model_path}' uses the legacy EDT/visibility heads and is incompatible "
+                "with the new structural centerline architecture. Train a new checkpoint with the "
+                "upgraded model before running inference."
+            ) from error
+        raise
     model.to(device)
     model.eval()
     return model, device
@@ -158,8 +166,7 @@ def run_real_image_inference(
     device: torch.device,
     tile_size: int = 512,
     tile_overlap: int = 128,
-    min_edt: float = 0.15,
-    visibility_floor: float = 0.25,
+    centerline_threshold: float = 0.5,
     use_amp: bool = True,
 ) -> RealInferenceResult:
     original = np.asarray(image)
@@ -173,51 +180,55 @@ def run_real_image_inference(
         device=device,
         tile_size=tile_size,
         overlap=tile_overlap,
-        output_channels=4,
+        output_channels=5,
         multiple=16,
         use_amp=use_amp,
     )
     prediction_seconds = time.perf_counter() - pred_start
 
-    edt_map = pred[0]
+    centerline_logits = np.clip(pred[0], -20.0, 20.0)
+    centerline_prob = 1.0 / (1.0 + np.exp(-centerline_logits))
     orientation_map = pred[1:3]
     vector_map = orientation_to_vector_map_np(orientation_map)
     orientation_confidence = orientation_confidence_np(orientation_map)
-    visibility_logits = np.clip(pred[3], -20.0, 20.0)
-    visibility_map = 1.0 / (1.0 + np.exp(-visibility_logits))
-    edt_for_tracking = edt_map * np.clip(visibility_map, visibility_floor, 1.0)
+    traceability_logits = np.clip(pred[3], -20.0, 20.0)
+    traceability_map = 1.0 / (1.0 + np.exp(-traceability_logits))
+    radius_logits = np.clip(pred[4], -20.0, 20.0)
+    radius_map = 1.0 / (1.0 + np.exp(-radius_logits))
 
-    tracking_start = time.perf_counter()
-    mask = (edt_for_tracking > min_edt).astype(np.uint8)
-    if skeletonize is None:
-        seed_mask = mask.astype(bool)
-    else:
-        seed_mask = skeletonize(mask).astype(bool)
-    tracker = StreamlineTracker(step_size=0.5, min_edt=min_edt)
-    streamlines = tracker.track(edt_for_tracking, vector_map, seed_mask=seed_mask)
-    skeleton = tracker.to_binary_skeleton(streamlines, original.shape).astype(bool)
-    tracking_seconds = time.perf_counter() - tracking_start
+    decode_start = time.perf_counter()
+    decoder = CenterlineGraphDecoder(centerline_threshold=centerline_threshold)
+    decoded = decoder.decode(
+        centerline_prob=centerline_prob,
+        orientation_map=vector_map,
+        traceability_map=traceability_map,
+        orientation_confidence=orientation_confidence,
+    )
+    decoding_seconds = time.perf_counter() - decode_start
 
     return RealInferenceResult(
         image_path=image_path,
         image=original,
         image_normalized=image_normalized,
-        edt_map=edt_map,
+        centerline_prob=centerline_prob,
         orientation_map=orientation_map,
         vector_map=vector_map,
         orientation_confidence=orientation_confidence,
-        visibility_map=visibility_map,
-        edt_for_tracking=edt_for_tracking,
-        seed_mask=np.asarray(seed_mask, dtype=bool),
-        skeleton=skeleton,
-        streamlines=streamlines,
+        traceability_map=traceability_map,
+        radius_map=radius_map,
+        decoder_score_map=decoded.score_map,
+        decoder_candidate_mask=decoded.candidate_mask,
+        decoder_strong_seed_mask=decoded.strong_seed_mask,
+        skeleton=decoded.skeleton,
+        component_paths=decoded.component_paths,
+        endpoint_mask=decoded.endpoint_mask,
+        junction_mask=decoded.junction_mask,
         prediction_seconds=prediction_seconds,
-        tracking_seconds=tracking_seconds,
+        decoding_seconds=decoding_seconds,
         total_seconds=time.perf_counter() - start_time,
         tile_size=int(tile_size),
         tile_overlap=int(tile_overlap),
-        min_edt=float(min_edt),
-        visibility_floor=float(visibility_floor),
+        centerline_threshold=float(centerline_threshold),
         used_amp=bool(use_amp and device.type == "cuda"),
     )
 
@@ -245,7 +256,10 @@ def build_output_paths(base_path: str) -> Dict[str, str]:
 
 def required_output_paths(base_path: str) -> Dict[str, str]:
     paths = build_output_paths(base_path)
-    return {key: paths[key] for key in ("skeleton", "pred_edt", "pred_vis", "pred_orient_conf", "summary")}
+    return {
+        key: paths[key]
+        for key in ("skeleton", "pred_centerline", "pred_traceability", "pred_radius", "pred_orient_conf", "summary")
+    }
 
 
 def outputs_exist(base_path: str) -> bool:
@@ -254,53 +268,39 @@ def outputs_exist(base_path: str) -> bool:
 
 def save_inference_outputs(result: RealInferenceResult, base_path: str) -> Dict[str, str]:
     paths = build_output_paths(base_path)
-    tifffile.imwrite(paths["skeleton"], (result.skeleton.astype(np.uint8) * 255))
-    tifffile.imwrite(paths["pred_edt"], (np.clip(result.edt_map, 0.0, 1.0) * 255).astype(np.uint8))
-    tifffile.imwrite(paths["pred_vis"], (np.clip(result.visibility_map, 0.0, 1.0) * 255).astype(np.uint8))
-    tifffile.imwrite(
-        paths["pred_orient_conf"],
-        (np.clip(result.orientation_confidence, 0.0, 1.0) * 255).astype(np.uint8),
-    )
+    tifffile.imwrite(paths["skeleton"], result.skeleton.astype(np.uint8) * 255)
+    tifffile.imwrite(paths["pred_centerline"], (np.clip(result.centerline_prob, 0.0, 1.0) * 255).astype(np.uint8))
+    tifffile.imwrite(paths["pred_traceability"], (np.clip(result.traceability_map, 0.0, 1.0) * 255).astype(np.uint8))
+    tifffile.imwrite(paths["pred_radius"], (np.clip(result.radius_map, 0.0, 1.0) * 255).astype(np.uint8))
+    tifffile.imwrite(paths["pred_orient_conf"], (np.clip(result.orientation_confidence, 0.0, 1.0) * 255).astype(np.uint8))
     return paths
 
 
 def load_saved_output_arrays(base_path: str) -> Dict[str, np.ndarray]:
     paths = build_output_paths(base_path)
     return {
-        "skeleton": (tifffile.imread(paths["skeleton"]) > 0),
-        "pred_edt": tifffile.imread(paths["pred_edt"]).astype(np.float32) / 255.0,
-        "pred_vis": tifffile.imread(paths["pred_vis"]).astype(np.float32) / 255.0,
+        "skeleton": tifffile.imread(paths["skeleton"]) > 0,
+        "pred_centerline": tifffile.imread(paths["pred_centerline"]).astype(np.float32) / 255.0,
+        "pred_traceability": tifffile.imread(paths["pred_traceability"]).astype(np.float32) / 255.0,
+        "pred_radius": tifffile.imread(paths["pred_radius"]).astype(np.float32) / 255.0,
         "pred_orient_conf": tifffile.imread(paths["pred_orient_conf"]).astype(np.float32) / 255.0,
     }
 
 
-def _streamline_length_summary(streamlines: Sequence[np.ndarray]) -> Dict[str, float]:
-    lengths = []
-    for path in streamlines:
-        coords = np.asarray(path, dtype=np.float64)
-        if coords.ndim != 2 or len(coords) < 2:
-            continue
-        step_lengths = np.linalg.norm(np.diff(coords, axis=0), axis=1)
-        lengths.append(float(np.sum(step_lengths)))
-
+def _component_length_summary(component_paths: List[np.ndarray]) -> Dict[str, float]:
+    lengths = [float(len(path)) for path in component_paths if len(path) > 0]
     if not lengths:
         return {
-            "streamline_length_mean": 0.0,
-            "streamline_length_median": 0.0,
-            "streamline_length_p95": 0.0,
+            "component_length_mean": 0.0,
+            "component_length_median": 0.0,
+            "component_length_p95": 0.0,
         }
-
     arr = np.asarray(lengths, dtype=np.float64)
     return {
-        "streamline_length_mean": float(np.mean(arr)),
-        "streamline_length_median": float(np.median(arr)),
-        "streamline_length_p95": float(np.percentile(arr, 95.0)),
+        "component_length_mean": float(np.mean(arr)),
+        "component_length_median": float(np.median(arr)),
+        "component_length_p95": float(np.percentile(arr, 95.0)),
     }
-
-
-def _skeleton_component_count(skeleton: np.ndarray) -> int:
-    labels, count = ndi.label(np.asarray(skeleton, dtype=bool))
-    return int(count)
 
 
 def _safe_ratio(numerator: float, denominator: float, default: float = 0.0) -> float:
@@ -358,6 +358,33 @@ def _profile_oob_summary(profile: Optional[Dict[str, object]], metadata: Dict[st
     }
 
 
+def _binary_iou(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=bool)
+    b = np.asarray(b, dtype=bool)
+    union = np.count_nonzero(a | b)
+    if union == 0:
+        return 1.0
+    return float(np.count_nonzero(a & b) / union)
+
+
+def _decoder_self_consistency(result: RealInferenceResult) -> float:
+    thresholds = [
+        max(0.05, result.centerline_threshold - 0.10),
+        result.centerline_threshold,
+        min(0.95, result.centerline_threshold + 0.10),
+    ]
+    skeletons = []
+    for threshold in thresholds:
+        decoded = CenterlineGraphDecoder(centerline_threshold=threshold).decode(
+            centerline_prob=result.centerline_prob,
+            orientation_map=result.vector_map,
+            traceability_map=result.traceability_map,
+            orientation_confidence=result.orientation_confidence,
+        )
+        skeletons.append(decoded.skeleton)
+    return min(_binary_iou(skeletons[0], skeletons[1]), _binary_iou(skeletons[1], skeletons[2]))
+
+
 def summarize_inference_result(
     result: RealInferenceResult,
     output_paths: Optional[Dict[str, str]] = None,
@@ -367,22 +394,22 @@ def summarize_inference_result(
     input_metrics = compute_image_metrics(result.image, source=result.image_path, metadata=metadata)
 
     skeleton_mask = np.asarray(result.skeleton, dtype=bool)
-    pred_mask = result.edt_for_tracking > result.min_edt
-    stream_summary = _streamline_length_summary(result.streamlines)
+    component_summary = _component_length_summary(result.component_paths)
 
     if np.any(skeleton_mask):
         raw_on = float(np.mean(result.image_normalized[skeleton_mask]))
-        edt_on = float(np.mean(result.edt_map[skeleton_mask]))
-        vis_on = float(np.mean(result.visibility_map[skeleton_mask]))
+        centerline_on = float(np.mean(result.centerline_prob[skeleton_mask]))
+        traceability_on = float(np.mean(result.traceability_map[skeleton_mask]))
+        radius_on = float(np.mean(result.radius_map[skeleton_mask]))
     else:
         raw_on = 0.0
-        edt_on = 0.0
-        vis_on = 0.0
+        centerline_on = 0.0
+        traceability_on = 0.0
+        radius_on = 0.0
 
     off_mask = ~skeleton_mask
     raw_off = float(np.mean(result.image_normalized[off_mask])) if np.any(off_mask) else 0.0
-    visibility_floor_mask = result.visibility_map < result.visibility_floor
-    low_support_fraction = float(np.mean(skeleton_mask & visibility_floor_mask))
+    decoder_score_mask = np.asarray(result.decoder_candidate_mask, dtype=bool)
 
     row: Dict[str, object] = {
         "source": result.image_path,
@@ -396,36 +423,39 @@ def summarize_inference_result(
         "status": "ok",
         "tile_size": result.tile_size,
         "tile_overlap": result.tile_overlap,
-        "min_edt": result.min_edt,
-        "visibility_floor": result.visibility_floor,
+        "centerline_threshold": result.centerline_threshold,
         "used_amp": int(result.used_amp),
         "prediction_seconds": float(result.prediction_seconds),
-        "tracking_seconds": float(result.tracking_seconds),
+        "decoding_seconds": float(result.decoding_seconds),
         "total_seconds": float(result.total_seconds),
-        "seed_fraction": float(np.mean(result.seed_mask)),
-        "pred_mask_fraction": float(np.mean(pred_mask)),
-        "streamline_count": int(len(result.streamlines)),
+        "decoder_mask_fraction": float(np.mean(decoder_score_mask)),
+        "component_count": int(len(result.component_paths)),
         "skeleton_pixels": int(np.count_nonzero(skeleton_mask)),
         "skeleton_fraction": float(np.mean(skeleton_mask)),
-        "skeleton_component_count": _skeleton_component_count(skeleton_mask),
-        "pred_edt_mean": float(np.mean(result.edt_map)),
-        "pred_edt_p95": float(np.percentile(result.edt_map, 95.0)),
-        "pred_edt_p99": float(np.percentile(result.edt_map, 99.0)),
-        "pred_vis_mean": float(np.mean(result.visibility_map)),
-        "pred_vis_p95": float(np.percentile(result.visibility_map, 95.0)),
-        "pred_vis_p99": float(np.percentile(result.visibility_map, 99.0)),
+        "endpoint_count": int(np.count_nonzero(result.endpoint_mask)),
+        "junction_count": int(np.count_nonzero(result.junction_mask)),
+        "pred_centerline_mean": float(np.mean(result.centerline_prob)),
+        "pred_centerline_p95": float(np.percentile(result.centerline_prob, 95.0)),
+        "pred_centerline_p99": float(np.percentile(result.centerline_prob, 99.0)),
+        "pred_traceability_mean": float(np.mean(result.traceability_map)),
+        "pred_traceability_p95": float(np.percentile(result.traceability_map, 95.0)),
+        "pred_traceability_p99": float(np.percentile(result.traceability_map, 99.0)),
+        "pred_radius_mean": float(np.mean(result.radius_map)),
+        "pred_radius_p95": float(np.percentile(result.radius_map, 95.0)),
+        "pred_radius_p99": float(np.percentile(result.radius_map, 99.0)),
         "pred_orient_conf_mean": float(np.mean(result.orientation_confidence)),
         "pred_orient_conf_p95": float(np.percentile(result.orientation_confidence, 95.0)),
         "raw_on_skeleton_mean": raw_on,
         "raw_off_skeleton_mean": raw_off,
         "raw_skeleton_contrast": _safe_ratio(raw_on, raw_off, default=0.0),
-        "edt_on_skeleton_mean": edt_on,
-        "vis_on_skeleton_mean": vis_on,
-        "low_support_skeleton_fraction": low_support_fraction,
+        "centerline_on_skeleton_mean": centerline_on,
+        "traceability_on_skeleton_mean": traceability_on,
+        "radius_on_skeleton_mean": radius_on,
+        "decoder_self_consistency": _decoder_self_consistency(result),
         "pred_to_input_skeleton_ratio": _safe_ratio(float(np.mean(skeleton_mask)), float(input_metrics["skeleton_fraction"])),
-        "pred_to_input_foreground_ratio": _safe_ratio(float(np.mean(pred_mask)), float(input_metrics["foreground_fraction"])),
+        "pred_to_input_foreground_ratio": _safe_ratio(float(np.mean(decoder_score_mask)), float(input_metrics["foreground_fraction"])),
     }
-    row.update(stream_summary)
+    row.update(component_summary)
 
     for key, value in input_metrics.items():
         if key in {"source", "row_type", "patch_index", "patch_y", "patch_x"}:
@@ -444,8 +474,9 @@ def summarize_inference_result(
 def render_preview_panel(
     image: np.ndarray,
     skeleton: np.ndarray,
-    edt_map: np.ndarray,
-    visibility_map: np.ndarray,
+    centerline_prob: np.ndarray,
+    traceability_map: np.ndarray,
+    radius_map: np.ndarray,
     orientation_confidence: np.ndarray,
     out_path: str,
     title: str = "",
@@ -470,22 +501,23 @@ def render_preview_panel(
     axes[0].set_title("Raw")
     axes[1].imshow(overlay, vmin=0.0, vmax=1.0)
     axes[1].set_title("Raw + Skeleton")
-    axes[2].imshow(np.clip(edt_map, 0.0, 1.0), cmap="viridis", vmin=0.0, vmax=1.0)
-    axes[2].set_title("Pred EDT")
-    axes[3].imshow(np.clip(visibility_map, 0.0, 1.0), cmap="inferno", vmin=0.0, vmax=1.0)
-    axes[3].set_title("Pred Visibility")
-    axes[4].imshow(np.clip(orientation_confidence, 0.0, 1.0), cmap="cividis", vmin=0.0, vmax=1.0)
-    axes[4].set_title("Orientation Confidence")
+    axes[2].imshow(np.clip(centerline_prob, 0.0, 1.0), cmap="viridis", vmin=0.0, vmax=1.0)
+    axes[2].set_title("Centerline Probability")
+    axes[3].imshow(np.clip(traceability_map, 0.0, 1.0), cmap="inferno", vmin=0.0, vmax=1.0)
+    axes[3].set_title("Traceability")
+    axes[4].imshow(np.clip(radius_map, 0.0, 1.0), cmap="cividis", vmin=0.0, vmax=1.0)
+    axes[4].set_title("Radius")
     axes[5].axis("off")
 
     if metrics:
         lines = [
             f"condition={metrics.get('condition', 'unknown')} div={metrics.get('div', -1)}",
-            f"streamlines={metrics.get('streamline_count', 0)}",
+            f"components={metrics.get('component_count', 0)}",
             f"skeleton_fraction={float(metrics.get('skeleton_fraction', 0.0)):.6f}",
             f"raw_skeleton_contrast={float(metrics.get('raw_skeleton_contrast', 0.0)):.3f}",
-            f"pred_vis_p99={float(metrics.get('pred_vis_p99', 0.0)):.3f}",
-            f"pred_edt_p99={float(metrics.get('pred_edt_p99', 0.0)):.3f}",
+            f"trace_p99={float(metrics.get('pred_traceability_p99', 0.0)):.3f}",
+            f"centerline_p99={float(metrics.get('pred_centerline_p99', 0.0)):.3f}",
+            f"self_consistency={float(metrics.get('decoder_self_consistency', 0.0)):.3f}",
         ]
         oob_count = int(metrics.get("input_profile_oob_count", -1))
         if oob_count >= 0:
@@ -508,8 +540,9 @@ def save_preview_panel(result: RealInferenceResult, out_path: str, metrics: Opti
     return render_preview_panel(
         image=result.image,
         skeleton=result.skeleton,
-        edt_map=result.edt_map,
-        visibility_map=result.visibility_map,
+        centerline_prob=result.centerline_prob,
+        traceability_map=result.traceability_map,
+        radius_map=result.radius_map,
         orientation_confidence=result.orientation_confidence,
         out_path=out_path,
         title=os.path.basename(title),
@@ -519,9 +552,10 @@ def save_preview_panel(result: RealInferenceResult, out_path: str, metrics: Opti
 
 def create_visualization_result(result: RealInferenceResult) -> SimpleNamespace:
     return SimpleNamespace(
-        binary_mask=(result.edt_for_tracking > result.min_edt).astype(np.uint8),
+        binary_mask=result.decoder_candidate_mask.astype(np.uint8),
+        strong_seed_mask=result.decoder_strong_seed_mask.astype(np.uint8),
         skeleton=result.skeleton.astype(np.uint8),
-        hfa_map=result.edt_map,
+        hfa_map=result.centerline_prob,
         fa_macro_map=result.orientation_confidence,
     )
 

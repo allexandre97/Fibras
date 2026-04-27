@@ -19,7 +19,7 @@ def train_sweep():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     num_gpus_available = torch.cuda.device_count()
 
-    base_batch_size_per_gpu = 16
+    base_batch_size_per_gpu = 4
     use_data_parallel = bool(GLOBAL_MULTI_GPU and num_gpus_available > 1)
     batch_size = base_batch_size_per_gpu * max(1, num_gpus_available) if use_data_parallel else base_batch_size_per_gpu
     epochs = 60
@@ -52,9 +52,13 @@ def train_sweep():
             "score_centerline_weight",
             getattr(config, "skeleton_score_weight", 0.25),
         ),
-        train_centerline_weight=getattr(config, "train_centerline_weight", 0.15),
-        centerline_warmup_epochs=getattr(config, "centerline_warmup_epochs", 8),
-        centerline_warmup_start_factor=getattr(config, "centerline_warmup_start_factor", 0.25),
+        train_centerline_weight=getattr(config, "train_centerline_weight", 1.0),
+        centerline_warmup_epochs=getattr(config, "centerline_warmup_epochs", 1),
+        centerline_warmup_start_factor=getattr(config, "centerline_warmup_start_factor", 0.5),
+        radius_weight=getattr(config, "radius_loss_weight", 0.15),
+        centerline_threshold=getattr(config, "centerline_threshold", 0.5),
+        score_stability_weight=getattr(config, "score_stability_weight", 0.2),
+        stability_margin_weight=getattr(config, "stability_margin_weight", 0.2),
     )
     optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
@@ -130,12 +134,17 @@ def train_sweep():
             "train_score": train_metrics["score"],
             "val_loss": val_metrics["loss"],
             "val_score": val_metrics["score"],
-            "val_edt": val_metrics["edt"],
+            "val_centerline": val_metrics["centerline"],
+            "val_centerline_focal": val_metrics["centerline_focal"],
+            "val_centerline_dice": val_metrics["centerline_dice"],
+            "val_cldice": val_metrics["cldice"],
             "val_orientation": val_metrics["orientation"],
-            "val_visibility": val_metrics["visibility"],
-            "val_centerline_error": val_metrics["centerline_error"],
+            "val_traceability": val_metrics["traceability"],
+            "val_radius": val_metrics["radius"],
+            "val_threshold_sensitivity": val_metrics["threshold_sensitivity"],
             "train_centerline_weight": active_train_centerline_weight,
             "score_centerline_weight": criterion.score_centerline_weight,
+            "score_stability_weight": criterion.score_stability_weight,
         })
 
         # --- Intra-Run Early Stopping Logic ---
@@ -211,37 +220,51 @@ if __name__ == "__main__":
             },
             'orientation_loss_weight': {
                 'distribution': 'uniform',
-                'min': 0.6,
-                'max': 1.5
+                'min': 0.5,
+                'max': 1.4
             },
             'visibility_loss_weight': {
                 'distribution': 'uniform',
-                'min': 0.30,
+                'min': 0.25,
                 'max': 0.55
             },
             'orientation_mask_floor': {
                 'distribution': 'uniform',
-                'min': 0.03,
-                'max': 0.15
+                'min': 0.10,
+                'max': 0.25
             },
             'loss_visibility_floor': {
                 'distribution': 'uniform',
                 'min': 0.05,
                 'max': 0.35
             },
+            'radius_loss_weight': {
+                'distribution': 'uniform',
+                'min': 0.05,
+                'max': 0.30
+            },
             'train_centerline_weight': {
                 'distribution': 'uniform',
-                'min': 0.08,
-                'max': 0.22
+                'min': 0.8,
+                'max': 1.4
             },
             'score_centerline_weight': {
-                'value': 0.25
+                'value': 1.0
             },
             'centerline_warmup_epochs': {
-                'value': 8
+                'value': 0
             },
             'centerline_warmup_start_factor': {
-                'value': 0.25
+                'value': 1.0
+            },
+            'centerline_threshold': {
+                'value': 0.5
+            },
+            'stability_margin_weight': {
+                'value': 0.2
+            },
+            'score_stability_weight': {
+                'value': 0.2
             },
             'base_filters': {
                 'values': [32, 40, 48]

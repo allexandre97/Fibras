@@ -34,15 +34,23 @@ def evaluate_model(args):
         train_centerline_weight=args.train_centerline_weight,
         centerline_warmup_epochs=args.centerline_warmup_epochs,
         centerline_warmup_start_factor=args.centerline_warmup_start_factor,
+        radius_weight=args.radius_loss_weight,
+        centerline_threshold=args.centerline_threshold,
+        score_stability_weight=args.score_stability_weight,
+        stability_margin_weight=args.stability_margin_weight,
     )
     
     total_metrics = {
         "loss": 0.0,
         "score": 0.0,
-        "edt": 0.0,
+        "centerline": 0.0,
+        "centerline_focal": 0.0,
+        "centerline_dice": 0.0,
+        "cldice": 0.0,
         "orientation": 0.0,
-        "visibility": 0.0,
-        "centerline_error": 0.0,
+        "traceability": 0.0,
+        "radius": 0.0,
+        "threshold_sensitivity": 0.0,
     }
     
     with torch.no_grad():
@@ -58,20 +66,28 @@ def evaluate_model(args):
             
             total_metrics["loss"] += batch_total_loss.item()
             total_metrics["score"] += criterion.fixed_score(components).item()
-            total_metrics["edt"] += components["edt"].item()
+            total_metrics["centerline"] += components["centerline"].item()
+            total_metrics["centerline_focal"] += components["centerline_focal"].item()
+            total_metrics["centerline_dice"] += components["centerline_dice"].item()
+            total_metrics["cldice"] += components["cldice"].item()
             total_metrics["orientation"] += components["orientation"].item()
-            total_metrics["visibility"] += components["visibility"].item()
-            total_metrics["centerline_error"] += components["centerline_error"].item()
+            total_metrics["traceability"] += components["traceability"].item()
+            total_metrics["radius"] += components["radius"].item()
+            total_metrics["threshold_sensitivity"] += components["threshold_sensitivity"].item()
 
     n_batches = len(test_loader)
     print(f"\n--- Unseen Test Set Evaluation ({args.dim}D Model) ---")
     print(f"Target Checkpoint: {args.model_path}")
     print(f"Average Total Loss: {total_metrics['loss'] / n_batches:.4f}")
     print(f"Average Fixed Score: {total_metrics['score'] / n_batches:.4f}")
-    print(f"Average EDT Loss:   {total_metrics['edt'] / n_batches:.4f}")
+    print(f"Average Centerline Loss: {total_metrics['centerline'] / n_batches:.4f}")
+    print(f"Average Centerline Focal: {total_metrics['centerline_focal'] / n_batches:.4f}")
+    print(f"Average Centerline Dice: {total_metrics['centerline_dice'] / n_batches:.4f}")
+    print(f"Average clDice: {total_metrics['cldice'] / n_batches:.4f}")
     print(f"Average Orientation: {total_metrics['orientation'] / n_batches:.4f}")
-    print(f"Average Visibility: {total_metrics['visibility'] / n_batches:.4f}")
-    print(f"Average Centerline Error: {total_metrics['centerline_error'] / n_batches:.4f}")
+    print(f"Average Traceability: {total_metrics['traceability'] / n_batches:.4f}")
+    print(f"Average Radius: {total_metrics['radius'] / n_batches:.4f}")
+    print(f"Average Threshold Sensitivity: {total_metrics['threshold_sensitivity'] / n_batches:.4f}")
     print("---------------------------------------------")
 
 if __name__ == "__main__":
@@ -84,13 +100,17 @@ if __name__ == "__main__":
     parser.add_argument('--crop_size', type=int, default=0)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--orientation_loss_weight', type=float, default=1.0)
-    parser.add_argument('--visibility_loss_weight', type=float, default=0.35)
-    parser.add_argument('--orientation_mask_floor', type=float, default=0.05)
+    parser.add_argument('--visibility_loss_weight', '--traceability_loss_weight', dest='visibility_loss_weight', type=float, default=0.35)
+    parser.add_argument('--orientation_mask_floor', '--centerline_support_floor', dest='orientation_mask_floor', type=float, default=0.15)
     parser.add_argument('--loss_visibility_floor', type=float, default=0.25)
-    parser.add_argument('--train_centerline_weight', type=float, default=0.15)
-    parser.add_argument('--score_centerline_weight', '--skeleton_score_weight', dest='score_centerline_weight', type=float, default=0.25)
-    parser.add_argument('--centerline_warmup_epochs', type=int, default=8)
-    parser.add_argument('--centerline_warmup_start_factor', type=float, default=0.25)
+    parser.add_argument('--radius_loss_weight', type=float, default=0.15)
+    parser.add_argument('--train_centerline_weight', type=float, default=1.0)
+    parser.add_argument('--score_centerline_weight', '--skeleton_score_weight', dest='score_centerline_weight', type=float, default=1.0)
+    parser.add_argument('--centerline_warmup_epochs', type=int, default=0)
+    parser.add_argument('--centerline_warmup_start_factor', type=float, default=1.0)
+    parser.add_argument('--centerline_threshold', type=float, default=0.5)
+    parser.add_argument('--stability_margin_weight', type=float, default=0.2)
+    parser.add_argument('--score_stability_weight', type=float, default=0.2)
     
     args = parser.parse_args()
     evaluate_model(args)

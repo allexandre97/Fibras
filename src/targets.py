@@ -178,3 +178,113 @@ class WeightedVisibilityTargetGenerator:
             visibility_map[slices] = np.maximum(visibility_map[slices], segment_density)
 
         return np.clip(visibility_map, 0.0, 1.0)
+
+
+@nb.njit(cache=True)
+def _compute_structural_targets_2d_numba(
+    centerline_map,
+    best_score_map,
+    vector_map,
+    radius_map,
+    starts,
+    ends,
+    sigmas,
+    centerline_sigma,
+    radius_normalizer,
+):
+    num_segs = starts.shape[0]
+    shape_x, shape_y = centerline_map.shape
+    cutoff = max(2.5 * centerline_sigma, 1.5)
+    sigma2 = max(centerline_sigma * centerline_sigma, 1e-8)
+
+    for s in range(num_segs):
+        start = starts[s]
+        end = ends[s]
+
+        ab_x = end[0] - start[0]
+        ab_y = end[1] - start[1]
+
+        ab_norm = np.sqrt(ab_x**2 + ab_y**2)
+        if ab_norm < 1e-8:
+            continue
+
+        dir_x, dir_y = ab_x / ab_norm, ab_y / ab_norm
+        sigma = sigmas[s]
+        radius_value = min(1.0, sigma / max(radius_normalizer, 1e-8))
+
+        min_x = max(0, int(np.floor(min(start[0], end[0]) - cutoff)))
+        max_x = min(shape_x, int(np.ceil(max(start[0], end[0]) + cutoff)))
+        min_y = max(0, int(np.floor(min(start[1], end[1]) - cutoff)))
+        max_y = min(shape_y, int(np.ceil(max(start[1], end[1]) + cutoff)))
+
+        ab_dot_max = max(ab_norm**2, 1e-8)
+
+        for i in range(min_x, max_x):
+            for j in range(min_y, max_y):
+                ap_x = i - start[0]
+                ap_y = j - start[1]
+
+                t = (ap_x * ab_x + ap_y * ab_y) / ab_dot_max
+                t = max(0.0, min(1.0, t))
+
+                c_x = start[0] + t * ab_x
+                c_y = start[1] + t * ab_y
+
+                d2 = (i - c_x) ** 2 + (j - c_y) ** 2
+                if d2 > cutoff * cutoff:
+                    continue
+
+                centerline_value = np.exp(-0.5 * d2 / sigma2)
+                if centerline_value > centerline_map[i, j]:
+                    centerline_map[i, j] = centerline_value
+
+                if centerline_value > best_score_map[i, j]:
+                    best_score_map[i, j] = centerline_value
+                    vector_map[0, i, j] = dir_x
+                    vector_map[1, i, j] = dir_y
+                    radius_map[i, j] = radius_value
+
+
+class StructuralTargetGenerator2D:
+    def __init__(
+        self,
+        grid_shape: Tuple[int, int],
+        base_sigma: float = 1.0,
+        centerline_sigma: float = 0.65,
+        radius_normalizer: float = 1.0,
+    ):
+        if len(grid_shape) != 2:
+            raise ValueError("StructuralTargetGenerator2D only supports 2D grids.")
+        self.grid_shape = grid_shape
+        self.base_sigma = float(base_sigma)
+        self.centerline_sigma = float(centerline_sigma)
+        self.radius_normalizer = float(radius_normalizer)
+
+    def generate(self, segments: List[FiberSegment]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        centerline_map = np.zeros(self.grid_shape, dtype=np.float64)
+        best_score_map = np.zeros(self.grid_shape, dtype=np.float64)
+        vector_map = np.zeros((2,) + self.grid_shape, dtype=np.float64)
+        radius_map = np.zeros(self.grid_shape, dtype=np.float64)
+
+        if not segments:
+            return centerline_map, vector_map, radius_map
+
+        starts = np.array([s.start for s in segments], dtype=np.float64)
+        ends = np.array([s.end for s in segments], dtype=np.float64)
+        sigmas = np.array(
+            [max(0.1, self.base_sigma * float(s.thickness_mult)) for s in segments],
+            dtype=np.float64,
+        )
+
+        _compute_structural_targets_2d_numba(
+            centerline_map,
+            best_score_map,
+            vector_map,
+            radius_map,
+            starts,
+            ends,
+            sigmas,
+            self.centerline_sigma,
+            self.radius_normalizer,
+        )
+        return np.clip(centerline_map, 0.0, 1.0), vector_map, np.clip(radius_map, 0.0, 1.0)

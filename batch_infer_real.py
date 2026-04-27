@@ -41,6 +41,63 @@ def _discover_tiff_files(input_dir: str, recursive: bool) -> List[str]:
     return files
 
 
+def _sample_group_key(image_path: str, sample_group: str) -> tuple:
+    metadata = parse_sted_filename(image_path)
+    condition = str(metadata.get("condition", "unknown"))
+    div = metadata.get("div")
+    div_value = int(div) if div is not None else -1
+    if sample_group == "condition":
+        return (condition,)
+    if sample_group == "div":
+        return (div_value,)
+    return (condition, div_value)
+
+
+def _select_image_paths(
+    image_paths: Sequence[str],
+    max_images: int,
+    sample_strategy: str = "first",
+    sample_group: str = "condition_div",
+    sample_seed: int = 0,
+) -> List[str]:
+    image_paths = list(image_paths)
+    if max_images <= 0 or max_images >= len(image_paths):
+        return image_paths
+
+    if sample_strategy == "first":
+        return image_paths[:max_images]
+
+    rng = random.Random(sample_seed)
+    if sample_strategy == "random":
+        shuffled = list(image_paths)
+        rng.shuffle(shuffled)
+        return sorted(shuffled[:max_images])
+
+    groups: Dict[tuple, List[str]] = {}
+    for path in image_paths:
+        groups.setdefault(_sample_group_key(path, sample_group), []).append(path)
+
+    for group_paths in groups.values():
+        rng.shuffle(group_paths)
+
+    active_groups = sorted(groups)
+    selected: List[str] = []
+    while active_groups and len(selected) < max_images:
+        next_active = []
+        for group_key in active_groups:
+            group_paths = groups[group_key]
+            if not group_paths:
+                continue
+            selected.append(group_paths.pop())
+            if len(selected) >= max_images:
+                break
+            if group_paths:
+                next_active.append(group_key)
+        active_groups = next_active
+
+    return sorted(selected)
+
+
 def _write_manifest(rows: Sequence[Dict[str, object]], path: str) -> str:
     fieldnames = sorted({key for row in rows for key in row.keys()})
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -88,11 +145,12 @@ def _build_run_summary(rows: Sequence[Dict[str, object]]) -> Dict[str, object]:
     }
 
     for key in (
-        "streamline_count",
+        "component_count",
         "skeleton_fraction",
         "raw_skeleton_contrast",
-        "pred_edt_p99",
-        "pred_vis_p99",
+        "pred_centerline_p99",
+        "pred_traceability_p99",
+        "decoder_self_consistency",
         "input_profile_oob_count",
         "total_seconds",
     ):
@@ -104,10 +162,11 @@ def _build_run_summary(rows: Sequence[Dict[str, object]]) -> Dict[str, object]:
             group_rows = [row for row in success_rows if row.get(group_key) == value]
             summary["groups"][group_key][str(value)] = {
                 "count": len(group_rows),
-                "streamline_count": _metric_summary(group_rows, "streamline_count"),
+                "component_count": _metric_summary(group_rows, "component_count"),
                 "skeleton_fraction": _metric_summary(group_rows, "skeleton_fraction"),
                 "raw_skeleton_contrast": _metric_summary(group_rows, "raw_skeleton_contrast"),
-                "pred_vis_p99": _metric_summary(group_rows, "pred_vis_p99"),
+                "pred_traceability_p99": _metric_summary(group_rows, "pred_traceability_p99"),
+                "decoder_self_consistency": _metric_summary(group_rows, "decoder_self_consistency"),
             }
 
     def _top_examples(key: str, largest: bool, limit: int = 5) -> List[Dict[str, object]]:
@@ -169,8 +228,9 @@ def _select_preview_rows(rows: Sequence[Dict[str, object]], preview_count: int, 
         ("skeleton_fraction", False),
         ("skeleton_fraction", True),
         ("raw_skeleton_contrast", False),
-        ("pred_vis_p99", False),
-        ("pred_edt_p99", True),
+        ("pred_traceability_p99", False),
+        ("pred_centerline_p99", True),
+        ("decoder_self_consistency", False),
         ("input_profile_oob_count", True),
     ):
         row = _pick_extreme(success_rows, key, largest)
@@ -221,13 +281,23 @@ def main(args):
     if args.downsample > 1.0:
         print("Warning: --downsample is ignored by the 2D STED tiled inference path.")
 
-    image_paths = _discover_tiff_files(args.input_dir, recursive=args.recursive)
-    if args.max_images > 0:
-        image_paths = image_paths[: args.max_images]
-    if not image_paths:
+    discovered_paths = _discover_tiff_files(args.input_dir, recursive=args.recursive)
+    if not discovered_paths:
         raise FileNotFoundError(f"No .tif/.tiff files found in {args.input_dir}")
+    image_paths = _select_image_paths(
+        discovered_paths,
+        max_images=args.max_images,
+        sample_strategy=args.sample_strategy,
+        sample_group=args.sample_group,
+        sample_seed=args.sample_seed,
+    )
 
-    print(f"Discovered {len(image_paths)} real TIFF images.")
+    print(f"Discovered {len(discovered_paths)} real TIFF images.")
+    if len(image_paths) != len(discovered_paths):
+        print(
+            f"Selected {len(image_paths)} images using sample_strategy={args.sample_strategy} "
+            f"sample_group={args.sample_group} sample_seed={args.sample_seed}."
+        )
     model, device = load_sted_model(
         model_path=args.model_path,
         base_filters=args.base_filters,
@@ -257,8 +327,7 @@ def main(args):
                 device=device,
                 tile_size=args.tile_size,
                 tile_overlap=args.tile_overlap,
-                min_edt=args.min_edt,
-                visibility_floor=args.visibility_floor,
+                centerline_threshold=args.centerline_threshold,
                 use_amp=not args.no_amp,
             )
             saved_paths = save_inference_outputs(result, base_path)
@@ -272,7 +341,7 @@ def main(args):
             rows.append(row)
             print(
                 f"[{index}/{len(image_paths)}] traced {os.path.basename(image_path)} "
-                f"| streamlines={row['streamline_count']} "
+                f"| components={row['component_count']} "
                 f"| skeleton_fraction={float(row['skeleton_fraction']):.6f}"
             )
         except Exception as error:
@@ -295,8 +364,9 @@ def main(args):
         render_preview_panel(
             image=load_image_for_inference(row["source"], dim=args.dim),
             skeleton=arrays["skeleton"],
-            edt_map=arrays["pred_edt"],
-            visibility_map=arrays["pred_vis"],
+            centerline_prob=arrays["pred_centerline"],
+            traceability_map=arrays["pred_traceability"],
+            radius_map=arrays["pred_radius"],
             orientation_confidence=arrays["pred_orient_conf"],
             out_path=preview_path,
             title=os.path.basename(row["source"]),
@@ -320,9 +390,10 @@ def main(args):
     if success_rows:
         print(
             "Median outputs: "
-            f"streamlines={np.median(_numeric_values(success_rows, 'streamline_count')):.1f} "
+            f"components={np.median(_numeric_values(success_rows, 'component_count')):.1f} "
             f"skeleton_fraction={np.median(_numeric_values(success_rows, 'skeleton_fraction')):.6f} "
-            f"contrast={np.median(_numeric_values(success_rows, 'raw_skeleton_contrast')):.3f}"
+            f"contrast={np.median(_numeric_values(success_rows, 'raw_skeleton_contrast')):.3f} "
+            f"self_consistency={np.median(_numeric_values(success_rows, 'decoder_self_consistency')):.3f}"
         )
 
 
@@ -338,6 +409,21 @@ if __name__ == "__main__":
     parser.add_argument("--preview_count", type=int, default=16)
     parser.add_argument("--preview_seed", type=int, default=0)
     parser.add_argument("--max_images", type=int, default=0, help="Optional cap on the number of images to process.")
+    parser.add_argument(
+        "--sample_strategy",
+        type=str,
+        choices=("first", "random", "stratified"),
+        default="first",
+        help="How to select images when --max_images is set.",
+    )
+    parser.add_argument(
+        "--sample_group",
+        type=str,
+        choices=("condition", "div", "condition_div"),
+        default="condition_div",
+        help="Grouping used by --sample_strategy stratified.",
+    )
+    parser.add_argument("--sample_seed", type=int, default=0, help="Random seed for subset selection.")
     parser.add_argument("--force", action="store_true", help="Re-run inference even when outputs and per-image summaries already exist.")
     add_inference_arguments(
         parser,

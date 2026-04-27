@@ -452,9 +452,9 @@ class StedNoiseModelTests(unittest.TestCase):
             self.assertGreaterEqual(scene["requested_fiber_count"], lower_fiber_count)
             self.assertLessEqual(scene["requested_fiber_count"], upper_fiber_count)
 
-            image, edt_target, vector_target, visibility_target = _build_2d_sample((40, 40, 14), None)
-            _, targets_tensor = _to_2d_tensors(image, edt_target, vector_target, visibility_target)
-            self.assertEqual(targets_tensor.shape[0], 4)
+            image, centerline_target, vector_target, traceability_target, radius_target = _build_2d_sample((40, 40, 14), None)
+            _, targets_tensor = _to_2d_tensors(image, centerline_target, vector_target, traceability_target, radius_target)
+            self.assertEqual(targets_tensor.shape[0], 5)
 
         self.assertIn("none", seen_haze_regimes)
 

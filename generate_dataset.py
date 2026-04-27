@@ -16,7 +16,7 @@ from src.sted_calibration import (
     match_intensity_to_scene_profile,
 )
 from src.synthesis import CompositeGenerator, RandomWalkGenerator, SpaceColonizationGenerator
-from src.targets import TargetFieldGenerator, WeightedVisibilityTargetGenerator
+from src.targets import StructuralTargetGenerator2D, TargetFieldGenerator, WeightedVisibilityTargetGenerator
 
 
 PHENOTYPES = ["Highly Branched", "Directional", "Random Tangle", "Cloudy Bundle", "Heterogeneous Mixed"]
@@ -27,6 +27,10 @@ DEFAULT_LABEL_SLAB_SCALE = 1.3
 DEFAULT_SOFT_SKELETON_ALPHA = 0.35
 DEFAULT_ANNOTATION_WEIGHT_FLOOR = 0.05
 DEFAULT_VISIBILITY_WEIGHT_FLOOR = 0.02
+DEFAULT_STRUCTURAL_ANNOTATION_ALPHA = 0.35
+DEFAULT_STRUCTURAL_CENTERLINE_SIGMA_SCALE = 0.95
+DEFAULT_STRUCTURAL_ANNOTATION_SIGMA_SCALE = 1.35
+DEFAULT_STRUCTURAL_CENTERLINE_MIN_SIGMA = 0.85
 STED_2D_FIBER_DENSITY_RANGE = (0.0012, 0.030)
 STED_2D_STEP_SCALE_RANGE = (0.010, 0.060)
 STED_2D_INITIAL_DIR_SCALE = np.array([1.0, 1.0, 0.25], dtype=float)
@@ -432,6 +436,9 @@ def _build_2d_focus_and_visibility_targets(
     annotation_weight_floor: float = DEFAULT_ANNOTATION_WEIGHT_FLOOR,
     soft_skeleton_alpha: float = DEFAULT_SOFT_SKELETON_ALPHA,
     visibility_weight_floor: float = DEFAULT_VISIBILITY_WEIGHT_FLOOR,
+    structural_annotation_alpha: float = DEFAULT_STRUCTURAL_ANNOTATION_ALPHA,
+    structural_centerline_sigma_scale: float = DEFAULT_STRUCTURAL_CENTERLINE_SIGMA_SCALE,
+    structural_annotation_sigma_scale: float = DEFAULT_STRUCTURAL_ANNOTATION_SIGMA_SCALE,
 ):
     if soft_skeleton_alpha < 0.0:
         raise ValueError("soft_skeleton_alpha must be greater than or equal to 0.")
@@ -439,6 +446,12 @@ def _build_2d_focus_and_visibility_targets(
         raise ValueError("annotation_weight_floor must be in the interval (0, 1].")
     if visibility_weight_floor <= 0.0 or visibility_weight_floor > 1.0:
         raise ValueError("visibility_weight_floor must be in the interval (0, 1].")
+    if structural_annotation_alpha < 0.0 or structural_annotation_alpha > 1.0:
+        raise ValueError("structural_annotation_alpha must be in the interval [0, 1].")
+    if structural_centerline_sigma_scale <= 0.0:
+        raise ValueError("structural_centerline_sigma_scale must be greater than 0.")
+    if structural_annotation_sigma_scale <= 0.0:
+        raise ValueError("structural_annotation_sigma_scale must be greater than 0.")
 
     focus_segments = _project_segments_to_label_slab(core_segments, slice_center, localization_slab_thickness)
     edt_focus, vector_focus = target_gen.generate(focus_segments)
@@ -465,6 +478,39 @@ def _build_2d_focus_and_visibility_targets(
     if np.any(soft_overwrite_mask):
         vector_target[:, soft_overwrite_mask] = vector_annotation[:, soft_overwrite_mask]
 
+    focus_centerline_sigma = max(
+        DEFAULT_STRUCTURAL_CENTERLINE_MIN_SIGMA,
+        rasterizer.base_sigma * float(structural_centerline_sigma_scale),
+    )
+    annotation_centerline_sigma = max(
+        focus_centerline_sigma,
+        rasterizer.base_sigma * float(structural_annotation_sigma_scale),
+    )
+
+    structural_focus_target_gen = StructuralTargetGenerator2D(
+        target_gen.grid_shape,
+        base_sigma=rasterizer.base_sigma,
+        centerline_sigma=focus_centerline_sigma,
+        radius_normalizer=max(1.0, rasterizer.base_sigma),
+    )
+    structural_annotation_target_gen = StructuralTargetGenerator2D(
+        target_gen.grid_shape,
+        base_sigma=rasterizer.base_sigma,
+        centerline_sigma=annotation_centerline_sigma,
+        radius_normalizer=max(1.0, rasterizer.base_sigma),
+    )
+    centerline_focus, vector_focus_structural, radius_focus = structural_focus_target_gen.generate(focus_segments)
+    centerline_annotation, vector_annotation_structural, radius_annotation = structural_annotation_target_gen.generate(annotation_segments)
+    centerline_soft = np.clip(centerline_annotation * float(structural_annotation_alpha), 0.0, 1.0)
+    centerline_target = np.maximum(centerline_focus, centerline_soft)
+    structural_vector_target = np.array(vector_focus_structural, copy=True)
+    radius_target = np.array(radius_focus, copy=True)
+    centerline_soft_overwrite_mask = centerline_soft > centerline_focus
+    if np.any(centerline_soft_overwrite_mask):
+        structural_vector_target[:, centerline_soft_overwrite_mask] = vector_annotation_structural[:, centerline_soft_overwrite_mask]
+        radius_target[centerline_soft_overwrite_mask] = radius_annotation[centerline_soft_overwrite_mask]
+    traceability_target = np.clip(visibility_target, 0.0, 1.0)
+
     return {
         "focus_segments": focus_segments,
         "annotation_segments": annotation_segments,
@@ -476,10 +522,19 @@ def _build_2d_focus_and_visibility_targets(
         "edt_target": edt_target,
         "vector_target": vector_target,
         "visibility_target": visibility_target,
+        "centerline_focus": centerline_focus,
+        "centerline_soft": centerline_soft,
+        "centerline_target": centerline_target,
+        "structural_vector_target": structural_vector_target,
+        "traceability_target": traceability_target,
+        "radius_target": radius_target,
         "visibility_segments": visibility_segments,
         "visibility_weights": visibility_weights,
         "visibility_weight_floor": float(visibility_weight_floor),
         "annotation_weight_floor": float(annotation_weight_floor),
+        "structural_annotation_alpha": float(structural_annotation_alpha),
+        "structural_centerline_sigma_scale": float(structural_centerline_sigma_scale),
+        "structural_annotation_sigma_scale": float(structural_annotation_sigma_scale),
     }
 
 
@@ -490,6 +545,9 @@ def _prepare_2d_sted_scene(
     annotation_weight_floor: float = DEFAULT_ANNOTATION_WEIGHT_FLOOR,
     soft_skeleton_alpha: float = DEFAULT_SOFT_SKELETON_ALPHA,
     visibility_weight_floor: float = DEFAULT_VISIBILITY_WEIGHT_FLOOR,
+    structural_annotation_alpha: float = DEFAULT_STRUCTURAL_ANNOTATION_ALPHA,
+    structural_centerline_sigma_scale: float = DEFAULT_STRUCTURAL_CENTERLINE_SIGMA_SCALE,
+    structural_annotation_sigma_scale: float = DEFAULT_STRUCTURAL_ANNOTATION_SIGMA_SCALE,
     calibration_sampler: Optional[CalibrationSampler] = None,
 ):
     if soft_skeleton_alpha < 0.0:
@@ -498,6 +556,12 @@ def _prepare_2d_sted_scene(
         raise ValueError("annotation_weight_floor must be in the interval (0, 1].")
     if visibility_weight_floor <= 0.0 or visibility_weight_floor > 1.0:
         raise ValueError("visibility_weight_floor must be in the interval (0, 1].")
+    if structural_annotation_alpha < 0.0 or structural_annotation_alpha > 1.0:
+        raise ValueError("structural_annotation_alpha must be in the interval [0, 1].")
+    if structural_centerline_sigma_scale <= 0.0:
+        raise ValueError("structural_centerline_sigma_scale must be greater than 0.")
+    if structural_annotation_sigma_scale <= 0.0:
+        raise ValueError("structural_annotation_sigma_scale must be greater than 0.")
 
     x_size, y_size, z_size = bounds
     xy_area = x_size * y_size
@@ -514,6 +578,12 @@ def _prepare_2d_sted_scene(
     edt_target = np.zeros((x_size, y_size), dtype=np.float64)
     vector_target = np.zeros((2, x_size, y_size), dtype=np.float64)
     visibility_target = np.zeros((x_size, y_size), dtype=np.float64)
+    centerline_target = np.zeros((x_size, y_size), dtype=np.float64)
+    centerline_focus = np.zeros((x_size, y_size), dtype=np.float64)
+    centerline_soft = np.zeros((x_size, y_size), dtype=np.float64)
+    structural_vector_target = np.zeros((2, x_size, y_size), dtype=np.float64)
+    traceability_target = np.zeros((x_size, y_size), dtype=np.float64)
+    radius_target = np.zeros((x_size, y_size), dtype=np.float64)
     requested_fiber_count = 0
     walk_parameter_samples = []
     bundle_sizes = []
@@ -601,6 +671,9 @@ def _prepare_2d_sted_scene(
             annotation_weight_floor=annotation_weight_floor,
             soft_skeleton_alpha=soft_skeleton_alpha,
             visibility_weight_floor=visibility_weight_floor,
+            structural_annotation_alpha=structural_annotation_alpha,
+            structural_centerline_sigma_scale=structural_centerline_sigma_scale,
+            structural_annotation_sigma_scale=structural_annotation_sigma_scale,
         )
         projected_segments = target_data["focus_segments"]
         annotation_segments = target_data["annotation_segments"]
@@ -609,6 +682,12 @@ def _prepare_2d_sted_scene(
         edt_target = target_data["edt_target"]
         vector_target = target_data["vector_target"]
         visibility_target = target_data["visibility_target"]
+        centerline_focus = target_data["centerline_focus"]
+        centerline_soft = target_data["centerline_soft"]
+        centerline_target = target_data["centerline_target"]
+        structural_vector_target = target_data["structural_vector_target"]
+        traceability_target = target_data["traceability_target"]
+        radius_target = target_data["radius_target"]
         visibility_segments = target_data["visibility_segments"]
         visibility_weights = target_data["visibility_weights"]
         if scene_config is not None:
@@ -652,6 +731,15 @@ def _prepare_2d_sted_scene(
         "edt_target": edt_target,
         "vector_target": vector_target,
         "visibility_target": visibility_target,
+        "centerline_focus": centerline_focus,
+        "centerline_soft": centerline_soft,
+        "centerline_target": centerline_target,
+        "structural_vector_target": structural_vector_target,
+        "traceability_target": traceability_target,
+        "radius_target": radius_target,
+        "structural_annotation_alpha": float(structural_annotation_alpha),
+        "structural_centerline_sigma_scale": float(structural_centerline_sigma_scale),
+        "structural_annotation_sigma_scale": float(structural_annotation_sigma_scale),
     }
 
 
@@ -662,6 +750,9 @@ def _build_2d_sample(
     annotation_weight_floor: float = DEFAULT_ANNOTATION_WEIGHT_FLOOR,
     soft_skeleton_alpha: float = DEFAULT_SOFT_SKELETON_ALPHA,
     visibility_weight_floor: float = DEFAULT_VISIBILITY_WEIGHT_FLOOR,
+    structural_annotation_alpha: float = DEFAULT_STRUCTURAL_ANNOTATION_ALPHA,
+    structural_centerline_sigma_scale: float = DEFAULT_STRUCTURAL_CENTERLINE_SIGMA_SCALE,
+    structural_annotation_sigma_scale: float = DEFAULT_STRUCTURAL_ANNOTATION_SIGMA_SCALE,
     calibration_sampler: Optional[CalibrationSampler] = None,
     return_metadata: bool = False,
 ):
@@ -672,6 +763,9 @@ def _build_2d_sample(
         annotation_weight_floor=annotation_weight_floor,
         soft_skeleton_alpha=soft_skeleton_alpha,
         visibility_weight_floor=visibility_weight_floor,
+        structural_annotation_alpha=structural_annotation_alpha,
+        structural_centerline_sigma_scale=structural_centerline_sigma_scale,
+        structural_annotation_sigma_scale=structural_annotation_sigma_scale,
         calibration_sampler=calibration_sampler,
     )
     image = scene["rasterizer"].render_sted_slice(
@@ -688,8 +782,21 @@ def _build_2d_sample(
             "dynamic_range": scene["dynamic_range"],
             "calibration_scene_config": scene["calibration_scene_config"],
         }
-        return image, scene["edt_target"], scene["vector_target"], scene["visibility_target"], metadata
-    return image, scene["edt_target"], scene["vector_target"], scene["visibility_target"]
+        return (
+            image,
+            scene["centerline_target"],
+            scene["structural_vector_target"],
+            scene["traceability_target"],
+            scene["radius_target"],
+            metadata,
+        )
+    return (
+        image,
+        scene["centerline_target"],
+        scene["structural_vector_target"],
+        scene["traceability_target"],
+        scene["radius_target"],
+    )
 
 
 def build_sted_debug_sample(
@@ -700,6 +807,9 @@ def build_sted_debug_sample(
     annotation_weight_floor: float = DEFAULT_ANNOTATION_WEIGHT_FLOOR,
     soft_skeleton_alpha: float = DEFAULT_SOFT_SKELETON_ALPHA,
     visibility_weight_floor: float = DEFAULT_VISIBILITY_WEIGHT_FLOOR,
+    structural_annotation_alpha: float = DEFAULT_STRUCTURAL_ANNOTATION_ALPHA,
+    structural_centerline_sigma_scale: float = DEFAULT_STRUCTURAL_CENTERLINE_SIGMA_SCALE,
+    structural_annotation_sigma_scale: float = DEFAULT_STRUCTURAL_ANNOTATION_SIGMA_SCALE,
     seed: int = None,
     calibration_sampler: Optional[CalibrationSampler] = None,
 ):
@@ -723,6 +833,9 @@ def build_sted_debug_sample(
         annotation_weight_floor=annotation_weight_floor,
         soft_skeleton_alpha=soft_skeleton_alpha,
         visibility_weight_floor=visibility_weight_floor,
+        structural_annotation_alpha=structural_annotation_alpha,
+        structural_centerline_sigma_scale=structural_centerline_sigma_scale,
+        structural_annotation_sigma_scale=structural_annotation_sigma_scale,
         calibration_sampler=calibration_sampler,
     )
     debug_render = scene["rasterizer"].render_sted_slice_debug(
@@ -745,6 +858,9 @@ def build_sted_debug_sample(
     debug_render["edt_target"] = scene["edt_target"]
     debug_render["vector_target"] = scene["vector_target"]
     debug_render["visibility_target"] = scene["visibility_target"]
+    debug_render["centerline_focus"] = scene["centerline_focus"]
+    debug_render["centerline_soft"] = scene["centerline_soft"]
+    debug_render["centerline_target"] = scene["centerline_target"]
     debug_render["projected_segments"] = scene["projected_segments"]
     debug_render["annotation_segments"] = scene["annotation_segments"]
     debug_render["visibility_segments"] = scene["visibility_segments"]
@@ -815,20 +931,22 @@ def _build_3d_sample(bounds: tuple):
     return volume, edt_target, vector_target
 
 
-def _to_2d_tensors(image, edt_target, vector_target, visibility_target):
+def _to_2d_tensors(image, centerline_target, vector_target, traceability_target, radius_target):
     import torch
 
     image = image.transpose(1, 0)
-    edt_target = edt_target.transpose(1, 0)
+    centerline_target = centerline_target.transpose(1, 0)
     orientation_target = vector_to_orientation_channels_np(vector_target).transpose(0, 2, 1)
-    visibility_target = visibility_target.transpose(1, 0)
+    traceability_target = traceability_target.transpose(1, 0)
+    radius_target = radius_target.transpose(1, 0)
 
     volume_tensor = torch.tensor(image[np.newaxis, np.newaxis, :, :], dtype=torch.float32)
-    targets = np.zeros((4, 1, image.shape[0], image.shape[1]), dtype=np.float32)
-    targets[0, 0, :, :] = edt_target.astype(np.float32)
+    targets = np.zeros((5, 1, image.shape[0], image.shape[1]), dtype=np.float32)
+    targets[0, 0, :, :] = centerline_target.astype(np.float32)
     targets[1, 0, :, :] = orientation_target[0].astype(np.float32)
     targets[2, 0, :, :] = orientation_target[1].astype(np.float32)
-    targets[3, 0, :, :] = visibility_target.astype(np.float32)
+    targets[3, 0, :, :] = traceability_target.astype(np.float32)
+    targets[4, 0, :, :] = radius_target.astype(np.float32)
 
     targets_tensor = torch.tensor(targets, dtype=torch.float32)
     return volume_tensor, targets_tensor
@@ -859,6 +977,9 @@ def process_single_sample(
     annotation_weight_floor: float,
     soft_skeleton_alpha: float,
     visibility_weight_floor: float,
+    structural_annotation_alpha: float,
+    structural_centerline_sigma_scale: float,
+    structural_annotation_sigma_scale: float,
     synthesis_mode: str = "legacy",
     calibration_profile: Optional[dict] = None,
     real_regime: str = "global",
@@ -881,15 +1002,24 @@ def process_single_sample(
             annotation_weight_floor=annotation_weight_floor,
             soft_skeleton_alpha=soft_skeleton_alpha,
             visibility_weight_floor=visibility_weight_floor,
+            structural_annotation_alpha=structural_annotation_alpha,
+            structural_centerline_sigma_scale=structural_centerline_sigma_scale,
+            structural_annotation_sigma_scale=structural_annotation_sigma_scale,
             calibration_sampler=calibration_sampler,
             return_metadata=emit_synthesis_metadata,
         )
         if emit_synthesis_metadata:
-            image, edt_target, vector_target, visibility_target, metadata = sample
+            image, centerline_target, vector_target, traceability_target, radius_target, metadata = sample
         else:
-            image, edt_target, vector_target, visibility_target = sample
+            image, centerline_target, vector_target, traceability_target, radius_target = sample
             metadata = None
-        volume_tensor, targets_tensor = _to_2d_tensors(image, edt_target, vector_target, visibility_target)
+        volume_tensor, targets_tensor = _to_2d_tensors(
+            image,
+            centerline_target,
+            vector_target,
+            traceability_target,
+            radius_target,
+        )
     else:
         volume, edt_target, vector_target = _build_3d_sample(bounds)
         volume_tensor, targets_tensor = _to_3d_tensors(volume, edt_target, vector_target)
@@ -897,7 +1027,11 @@ def process_single_sample(
 
     file_id = file_offset + idx
     file_path = os.path.join(output_dir, f"sample_{file_id}.pt")
-    record = {"volume": volume_tensor, "targets": targets_tensor}
+    record = {
+        "volume": volume_tensor,
+        "targets": targets_tensor,
+        "target_schema": "structural_v1" if emit_2d else "legacy_3d",
+    }
     if metadata is not None:
         record["metadata"] = metadata
     torch.save(record, file_path)
@@ -917,6 +1051,9 @@ def build_dataset_split(
     annotation_weight_floor: float = DEFAULT_ANNOTATION_WEIGHT_FLOOR,
     soft_skeleton_alpha: float = DEFAULT_SOFT_SKELETON_ALPHA,
     visibility_weight_floor: float = DEFAULT_VISIBILITY_WEIGHT_FLOOR,
+    structural_annotation_alpha: float = DEFAULT_STRUCTURAL_ANNOTATION_ALPHA,
+    structural_centerline_sigma_scale: float = DEFAULT_STRUCTURAL_CENTERLINE_SIGMA_SCALE,
+    structural_annotation_sigma_scale: float = DEFAULT_STRUCTURAL_ANNOTATION_SIGMA_SCALE,
     synthesis_mode: str = "legacy",
     calibration_profile: Optional[dict] = None,
     real_regime: str = "global",
@@ -943,6 +1080,9 @@ def build_dataset_split(
         annotation_weight_floor=annotation_weight_floor,
         soft_skeleton_alpha=soft_skeleton_alpha,
         visibility_weight_floor=visibility_weight_floor,
+        structural_annotation_alpha=structural_annotation_alpha,
+        structural_centerline_sigma_scale=structural_centerline_sigma_scale,
+        structural_annotation_sigma_scale=structural_annotation_sigma_scale,
         synthesis_mode=synthesis_mode,
         calibration_profile=calibration_profile,
         real_regime=real_regime,
@@ -999,6 +1139,24 @@ if __name__ == "__main__":
         help="Minimum axial visibility weight for including out-of-focus skeleton support in 2D STED visibility targets.",
     )
     parser.add_argument(
+        "--structural_annotation_alpha",
+        type=float,
+        default=DEFAULT_STRUCTURAL_ANNOTATION_ALPHA,
+        help="Blend weight for the broader annotation-band structural centerline target.",
+    )
+    parser.add_argument(
+        "--structural_centerline_sigma_scale",
+        type=float,
+        default=DEFAULT_STRUCTURAL_CENTERLINE_SIGMA_SCALE,
+        help="Sigma scale used for the sharp centerline structural target relative to rasterizer base sigma.",
+    )
+    parser.add_argument(
+        "--structural_annotation_sigma_scale",
+        type=float,
+        default=DEFAULT_STRUCTURAL_ANNOTATION_SIGMA_SCALE,
+        help="Sigma scale used for the broader annotation-band structural centerline target.",
+    )
+    parser.add_argument(
         "--synthesis_mode",
         type=str,
         choices=["legacy", "calibrated"],
@@ -1038,6 +1196,12 @@ if __name__ == "__main__":
         raise ValueError("--soft_skeleton_alpha must be greater than or equal to 0.")
     if args.visibility_weight_floor <= 0.0 or args.visibility_weight_floor > 1.0:
         raise ValueError("--visibility_weight_floor must be in the interval (0, 1].")
+    if args.structural_annotation_alpha < 0.0 or args.structural_annotation_alpha > 1.0:
+        raise ValueError("--structural_annotation_alpha must be in the interval [0, 1].")
+    if args.structural_centerline_sigma_scale <= 0.0:
+        raise ValueError("--structural_centerline_sigma_scale must be greater than 0.")
+    if args.structural_annotation_sigma_scale <= 0.0:
+        raise ValueError("--structural_annotation_sigma_scale must be greater than 0.")
     if args.synthesis_mode == "calibrated" and args.calibration_profile is None:
         raise ValueError("--synthesis_mode calibrated requires --calibration_profile.")
 
@@ -1072,6 +1236,9 @@ if __name__ == "__main__":
         annotation_weight_floor=args.annotation_weight_floor,
         soft_skeleton_alpha=args.soft_skeleton_alpha,
         visibility_weight_floor=args.visibility_weight_floor,
+        structural_annotation_alpha=args.structural_annotation_alpha,
+        structural_centerline_sigma_scale=args.structural_centerline_sigma_scale,
+        structural_annotation_sigma_scale=args.structural_annotation_sigma_scale,
         synthesis_mode=args.synthesis_mode,
         calibration_profile=calibration_profile,
         real_regime=args.real_regime,
@@ -1090,6 +1257,9 @@ if __name__ == "__main__":
         annotation_weight_floor=args.annotation_weight_floor,
         soft_skeleton_alpha=args.soft_skeleton_alpha,
         visibility_weight_floor=args.visibility_weight_floor,
+        structural_annotation_alpha=args.structural_annotation_alpha,
+        structural_centerline_sigma_scale=args.structural_centerline_sigma_scale,
+        structural_annotation_sigma_scale=args.structural_annotation_sigma_scale,
         synthesis_mode=args.synthesis_mode,
         calibration_profile=calibration_profile,
         real_regime=args.real_regime,
@@ -1108,6 +1278,9 @@ if __name__ == "__main__":
         annotation_weight_floor=args.annotation_weight_floor,
         soft_skeleton_alpha=args.soft_skeleton_alpha,
         visibility_weight_floor=args.visibility_weight_floor,
+        structural_annotation_alpha=args.structural_annotation_alpha,
+        structural_centerline_sigma_scale=args.structural_centerline_sigma_scale,
+        structural_annotation_sigma_scale=args.structural_annotation_sigma_scale,
         synthesis_mode=args.synthesis_mode,
         calibration_profile=calibration_profile,
         real_regime=args.real_regime,

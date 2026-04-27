@@ -40,11 +40,10 @@ def main(args):
         device=device,
         tile_size=args.tile_size,
         tile_overlap=args.tile_overlap,
-        min_edt=args.min_edt,
-        visibility_floor=args.visibility_floor,
+        centerline_threshold=args.centerline_threshold,
         use_amp=not args.no_amp,
     )
-    print(f"Successfully traced {len(result.streamlines)} fiber segments.")
+    print(f"Successfully reconstructed {len(result.component_paths)} fiber components.")
 
     base_path = resolve_output_base(args.image_path, output_dir=args.output_dir)
     output_paths = save_inference_outputs(result, base_path)

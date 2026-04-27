@@ -118,12 +118,13 @@ class ASPPBottleneck2D(nn.Module):
 
 
 class STEDResUNet2D(nn.Module):
-    """Residual 2D U-Net for STED fiber fields.
+    """Residual 2D U-Net for structural STED fiber reconstruction.
 
-    Output channels are EDT, cos(2theta), sin(2theta), and visibility logits.
+    Output channels are centerline logits, cos(2theta), sin(2theta),
+    traceability logits, and normalized radius logits.
     """
 
-    def __init__(self, in_channels=1, base_filters=32, out_channels=4, groups=8):
+    def __init__(self, in_channels=1, base_filters=32, out_channels=5, groups=8):
         super().__init__()
         widths = [base_filters, base_filters * 2, base_filters * 4, base_filters * 8, base_filters * 12]
 
@@ -147,9 +148,10 @@ class STEDResUNet2D(nn.Module):
         self.up1 = nn.ConvTranspose2d(widths[1], widths[0], kernel_size=2, stride=2)
         self.d1 = ResidualBlock2D(widths[0] + widths[0], widths[0], groups=groups)
 
-        self.edt_head = nn.Conv2d(widths[0], 1, kernel_size=1)
+        self.centerline_head = nn.Conv2d(widths[0], 1, kernel_size=1)
         self.orientation_head = nn.Conv2d(widths[0], 2, kernel_size=1)
-        self.visibility_head = nn.Conv2d(widths[0], 1, kernel_size=1)
+        self.traceability_head = nn.Conv2d(widths[0], 1, kernel_size=1)
+        self.radius_head = nn.Conv2d(widths[0], 1, kernel_size=1)
         self.out_channels = out_channels
 
     @staticmethod
@@ -177,9 +179,10 @@ class STEDResUNet2D(nn.Module):
 
         return torch.cat(
             [
-                self.edt_head(d1),
+                self.centerline_head(d1),
                 self.orientation_head(d1),
-                self.visibility_head(d1),
+                self.traceability_head(d1),
+                self.radius_head(d1),
             ],
             dim=1,
         )
