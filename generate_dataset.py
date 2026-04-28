@@ -327,21 +327,58 @@ def apply_coherent_bundle(
     lock_z: bool = False,
     bounds: Tuple[int, int, int] = (64, 64, 16),
 ):
+    """Spawns a coherent bundle with explicit strand spacing and optional drift.
+
+    Unlike apply_coherent_optical_bundle(), this helper is parameterized by the
+    debug/CLI bundle controls. It keeps the strands coherent around the same
+    backbone while allowing controlled angular drift, lateral wander, and axial
+    offsets for visual stress tests.
+    """
     optical_segments = []
-    center = 0.5 * (int(bundle_size) - 1)
-    for strand_index in range(int(bundle_size)):
-        offset = np.array([0.0, (strand_index - center) * float(separation), 0.0])
+    bundle_size = int(bundle_size)
+    if bundle_size <= 0:
+        return optical_segments
+
+    separation = float(separation)
+    center = 0.5 * (bundle_size - 1)
+    theta = float(np.random.uniform(0.0, 2.0 * np.pi))
+    lateral_axis = np.array([math.cos(theta), math.sin(theta), 0.0], dtype=np.float64)
+    max_angle = math.radians(max(0.0, float(direction_jitter_degrees)))
+    lateral_jitter_sigma = abs(separation * float(lateral_jitter_fraction))
+    axial_jitter_sigma = abs(separation * float(axial_jitter_fraction))
+
+    for strand_index in range(bundle_size):
+        strand_offset = lateral_axis * ((strand_index - center) * separation)
+        if not lock_z and axial_jitter_sigma > 0.0:
+            strand_offset = strand_offset.copy()
+            strand_offset[2] += float(np.random.normal(0.0, axial_jitter_sigma))
+
         for seg in core_segments:
-            if direction_jitter_degrees or lateral_jitter_fraction or axial_jitter_fraction:
-                jitter_scale = float(separation) * float(lateral_jitter_fraction)
-                jitter = np.random.normal(0.0, jitter_scale, 3)
-                if lock_z:
-                    jitter[2] = 0.0
-            else:
-                jitter = np.zeros(3)
+            segment_delta = np.asarray(seg.end - seg.start, dtype=np.float64)
+            segment_length = float(np.linalg.norm(segment_delta))
+            direction = _safe_unit_vector(segment_delta, np.array([1.0, 0.0, 0.0], dtype=np.float64))
+
+            if max_angle > 0.0 and segment_length > 1e-8:
+                random_vec = np.random.normal(0.0, 1.0, 3)
+                perpendicular = random_vec - np.dot(random_vec, direction) * direction
+                perpendicular = _safe_unit_vector(perpendicular, np.array([-direction[1], direction[0], 0.0], dtype=np.float64))
+                angle = float(np.random.uniform(-max_angle, max_angle))
+                direction = _safe_unit_vector(
+                    math.cos(angle) * direction + math.sin(angle) * perpendicular,
+                    direction,
+                )
+
+            local_jitter = np.zeros(3, dtype=np.float64)
+            if lateral_jitter_sigma > 0.0:
+                local_jitter[:2] = np.random.normal(0.0, lateral_jitter_sigma, 2)
+            if not lock_z and axial_jitter_sigma > 0.0:
+                local_jitter[2] = float(np.random.normal(0.0, 0.5 * axial_jitter_sigma))
+
+            midpoint = 0.5 * (seg.start + seg.end) + strand_offset + local_jitter
+            new_delta = direction * segment_length
             bundled = FiberSegment(
-                start=seg.start + offset + jitter,
-                end=seg.end + offset + jitter,
+                start=midpoint - 0.5 * new_delta,
+                end=midpoint + 0.5 * new_delta,
                 thickness_mult=seg.thickness_mult,
             )
             optical_segments.append(_clip_segment_to_bounds(bundled, bounds))
@@ -724,6 +761,9 @@ def _prepare_2d_sted_scene(
     coherent_bundle_probability: float = DEFAULT_COHERENT_BUNDLE_PROBABILITY,
     coherent_bundle_size_range: Tuple[int, int] = DEFAULT_COHERENT_BUNDLE_SIZE_RANGE,
     coherent_bundle_separation_range: Tuple[float, float] = DEFAULT_COHERENT_BUNDLE_SEPARATION_RANGE,
+    coherent_bundle_direction_jitter_degrees: Optional[float] = None,
+    coherent_bundle_lateral_jitter_fraction: Optional[float] = None,
+    coherent_bundle_axial_jitter_fraction: Optional[float] = None,
     optical_jitter_range: Tuple[float, float] = DEFAULT_OPTICAL_JITTER_RANGE,
     max_fiber_area_px: float = DEFAULT_MAX_FIBER_AREA_PX,
     min_fibers: int = DEFAULT_MIN_FIBERS,
@@ -810,6 +850,7 @@ def _prepare_2d_sted_scene(
         walk_parameter_samples = []
         bundle_sizes = []
         coherent_bundle_flags = []
+        coherent_bundle_separations = []
 
         num_fibers = _estimate_fiber_count(
             bounds,
@@ -836,15 +877,37 @@ def _prepare_2d_sted_scene(
             bundle_sizes.append(int(bundle_size))
             coherent_bundle_flags.append(bool(coherent_bundle))
 
+            coherent_separation = 0.0
             if bundle_size <= 1:
                 optical_segments = core_segments
             elif coherent_bundle:
-                optical_segments = apply_coherent_optical_bundle(
-                    core_segments,
-                    bounds=bounds,
-                    bundle_size=bundle_size,
-                    separation_range=coherent_bundle_separation_range,
+                use_parameterized_coherent_bundle = (
+                    coherent_bundle_direction_jitter_degrees is not None
+                    or coherent_bundle_lateral_jitter_fraction is not None
+                    or coherent_bundle_axial_jitter_fraction is not None
                 )
+                if use_parameterized_coherent_bundle:
+                    coherent_separation = float(np.random.uniform(*coherent_bundle_separation_range))
+                    optical_segments = apply_coherent_bundle(
+                        core_segments,
+                        bundle_size=bundle_size,
+                        separation=coherent_separation,
+                        direction_jitter_degrees=float(coherent_bundle_direction_jitter_degrees or 0.0),
+                        lateral_jitter_fraction=float(coherent_bundle_lateral_jitter_fraction or 0.0),
+                        axial_jitter_fraction=float(coherent_bundle_axial_jitter_fraction or 0.0),
+                        lock_z=False,
+                        bounds=bounds,
+                    )
+                else:
+                    optical_segments = apply_coherent_optical_bundle(
+                        core_segments,
+                        bounds=bounds,
+                        bundle_size=bundle_size,
+                        separation_range=coherent_bundle_separation_range,
+                    )
+                    coherent_separation = 0.5 * (
+                        float(coherent_bundle_separation_range[0]) + float(coherent_bundle_separation_range[1])
+                    )
             else:
                 jitter_range = scene_config.get("jitter_range", optical_jitter_range) if scene_config is not None else optical_jitter_range
                 jitter_amount = float(np.random.uniform(*jitter_range))
@@ -854,6 +917,7 @@ def _prepare_2d_sted_scene(
                     jitter_amount=jitter_amount,
                     lock_z=False,
                 )
+            coherent_bundle_separations.append(float(coherent_separation))
             optical_bundle_lists.append(optical_segments)
 
         slice_center = float(np.random.uniform(z_size * 0.2, z_size * 0.8))
@@ -889,6 +953,7 @@ def _prepare_2d_sted_scene(
             "walk_parameter_samples": walk_parameter_samples,
             "bundle_sizes": bundle_sizes,
             "coherent_bundle_flags": coherent_bundle_flags,
+            "coherent_bundle_separations": coherent_bundle_separations,
             "slice_center": slice_center,
             "haze_regime": haze_regime,
             "label_slab_scale": float(label_slab_scale),
@@ -1001,6 +1066,7 @@ def _build_2d_sample(
             "visibility_segment_count": len(scene["visibility_segments"]),
             "bundle_sizes": scene["bundle_sizes"],
             "coherent_bundle_flags": scene["coherent_bundle_flags"],
+            "coherent_bundle_separations": scene["coherent_bundle_separations"],
             "haze_regime": scene["haze_regime"],
             "slice_center": scene["slice_center"],
             "depth_of_field": scene["depth_of_field"],
@@ -1063,11 +1129,23 @@ def build_sted_debug_sample(
     coherent_bundle_probability = DEFAULT_COHERENT_BUNDLE_PROBABILITY
     coherent_bundle_size_range = DEFAULT_COHERENT_BUNDLE_SIZE_RANGE
     coherent_bundle_separation_range = DEFAULT_COHERENT_BUNDLE_SEPARATION_RANGE
+    coherent_bundle_direction_jitter_degrees = None
+    coherent_bundle_lateral_jitter_fraction = None
+    coherent_bundle_axial_jitter_fraction = None
     if coherent_bundle_config is not None:
         coherent_bundle_probability = float(coherent_bundle_config.get("probability", coherent_bundle_probability))
         coherent_bundle_size_range = tuple(coherent_bundle_config.get("size_range", coherent_bundle_size_range))
         coherent_bundle_separation_range = tuple(
             coherent_bundle_config.get("separation_range", coherent_bundle_separation_range)
+        )
+        coherent_bundle_direction_jitter_degrees = float(
+            coherent_bundle_config.get("direction_jitter_degrees", 0.0)
+        )
+        coherent_bundle_lateral_jitter_fraction = float(
+            coherent_bundle_config.get("lateral_jitter_fraction", 0.0)
+        )
+        coherent_bundle_axial_jitter_fraction = float(
+            coherent_bundle_config.get("axial_jitter_fraction", 0.0)
         )
 
     scene = _prepare_2d_sted_scene(
@@ -1091,6 +1169,9 @@ def build_sted_debug_sample(
         coherent_bundle_probability=coherent_bundle_probability,
         coherent_bundle_size_range=coherent_bundle_size_range,
         coherent_bundle_separation_range=coherent_bundle_separation_range,
+        coherent_bundle_direction_jitter_degrees=coherent_bundle_direction_jitter_degrees,
+        coherent_bundle_lateral_jitter_fraction=coherent_bundle_lateral_jitter_fraction,
+        coherent_bundle_axial_jitter_fraction=coherent_bundle_axial_jitter_fraction,
         optical_jitter_range=DEFAULT_OPTICAL_JITTER_RANGE,
         max_fiber_area_px=DEFAULT_MAX_FIBER_AREA_PX,
         min_fibers=DEFAULT_MIN_FIBERS,
@@ -1103,18 +1184,23 @@ def build_sted_debug_sample(
         dynamic_range=scene["dynamic_range"],
     )
     debug_render.update({k: v for k, v in scene.items() if k != "rasterizer" and k != "optical_bundle_lists"})
+    debug_render["fiber_count"] = int(scene.get("actual_fiber_count", scene.get("requested_fiber_count", 0)))
     debug_render["projected_segment_count"] = len(scene.get("projected_segments", []))
     debug_render["annotation_segment_count"] = len(scene.get("annotation_segments", []))
     if coherent_bundle_config is not None:
         debug_render["coherent_bundle_config"] = dict(coherent_bundle_config)
-        separation = float(coherent_bundle_separation_range[0])
+        separations = scene.get("coherent_bundle_separations", [])
         debug_render["coherent_bundle_details"] = [
             {
                 "mode": "coherent" if flag else "single",
                 "bundle_size": int(size),
-                "separation": separation,
+                "separation": float(separation),
             }
-            for size, flag in zip(scene.get("bundle_sizes", []), scene.get("coherent_bundle_flags", []))
+            for size, flag, separation in zip(
+                scene.get("bundle_sizes", []),
+                scene.get("coherent_bundle_flags", []),
+                separations,
+            )
         ]
     return debug_render
 

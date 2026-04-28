@@ -2,6 +2,12 @@ import os
 import time
 import argparse
 import sys
+import random
+from contextlib import nullcontext
+from pathlib import Path
+from typing import Any
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,37 +18,83 @@ import wandb
 from src.model import STEDResUNet2D
 from src.sted import normalize_orientation_torch
 
+
+def _torch_load(path: str | os.PathLike[str]) -> dict[str, Any]:
+    """Load a .pt record while staying compatible with older PyTorch versions."""
+    try:
+        return torch.load(path, weights_only=True, map_location="cpu")
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
 class PrecomputedFiberDataset(Dataset):
-    def __init__(self, data_dir: str, dim: int = 2, crop_size: int = 0, random_crop: bool = False):
-        self.data_dir = data_dir
+    """Strict structural_v2 2D STED dataset used by standalone and sweep training."""
+
+    def __init__(
+        self,
+        data_dir: str | os.PathLike[str],
+        dim: int = 2,
+        crop_size: int = 0,
+        random_crop: bool = False,
+        augment_geometric: bool = False,
+        augment_intensity: bool = False,
+    ):
+        if dim != 2:
+            raise ValueError("The upgraded STED dataset path is 2D only. Use dim=2.")
+        self.data_dir = Path(data_dir)
         self.dim = dim
         self.crop_size = int(crop_size or 0)
         self.random_crop = bool(random_crop)
-        self.files = [f for f in os.listdir(data_dir) if f.endswith('.pt')]
-        if len(self.files) == 0:
-            raise FileNotFoundError(f"No .pt files found in {data_dir}")
+        self.augment_geometric = bool(augment_geometric)
+        self.augment_intensity = bool(augment_intensity)
+        self.files = sorted(self.data_dir.glob("*.pt"))
+        if not self.files:
+            raise FileNotFoundError(f"No .pt files found in {self.data_dir}")
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
-        file_path = os.path.join(self.data_dir, self.files[idx])
-        data = torch.load(file_path, weights_only=True, map_location='cpu')
-        vol, targets = data['volume'], data['targets']
+        path = self.files[idx]
+        data = _torch_load(path)
+        if "volume" not in data or "targets" not in data:
+            raise KeyError(f"{path} is missing required keys 'volume' and/or 'targets'.")
+
+        vol = data["volume"].float()
+        targets = data["targets"].float()
         target_schema = data.get("target_schema", "legacy")
-        
-        if self.dim == 2:
-            if target_schema != "structural_v2" or targets.shape[0] != 6:
-                raise ValueError(
-                    "This training path expects 2D samples with target_schema='structural_v2' "
-                    "and 6 target channels (centerline, orientation, traceability, radius, bundle count). "
-                    "Regenerate the dataset with the upgraded structural target pipeline."
-                )
-            vol = vol.squeeze(1)
+
+        if target_schema != "structural_v2":
+            raise ValueError(
+                f"{path} has target_schema={target_schema!r}. Bundle-count training requires "
+                "target_schema='structural_v2'. Regenerate the dataset with the upgraded generator."
+            )
+
+        if targets.ndim == 4 and targets.shape[1] == 1:
             targets = targets[:, 0, :, :]
-            vol, targets = self._crop_2d(vol, targets)
-            
-        return vol, targets
+        elif targets.ndim != 3:
+            raise ValueError(f"{path} has unsupported target tensor shape {tuple(targets.shape)}.")
+
+        if targets.shape[0] != 6:
+            raise ValueError(
+                f"{path} has {targets.shape[0]} target channels. Expected 6 channels: "
+                "centerline, cos(2theta), sin(2theta), traceability, radius, bundle_count."
+            )
+
+        if vol.ndim == 4 and vol.shape[1] == 1:
+            vol = vol.squeeze(1)
+        elif vol.ndim == 2:
+            vol = vol.unsqueeze(0)
+        elif vol.ndim != 3:
+            raise ValueError(f"{path} has unsupported volume tensor shape {tuple(vol.shape)}.")
+
+        vol, targets = self._crop_2d(vol, targets)
+
+        if self.augment_geometric:
+            vol, targets = self._augment_geometric(vol, targets)
+        if self.augment_intensity:
+            vol = self._augment_intensity(vol)
+
+        return vol.contiguous(), targets.contiguous()
 
     def _crop_2d(self, vol, targets):
         if self.crop_size <= 0:
@@ -63,6 +115,40 @@ class PrecomputedFiberDataset(Dataset):
 
         return vol[:, y0:y0 + crop_h, x0:x0 + crop_w], targets[:, y0:y0 + crop_h, x0:x0 + crop_w]
 
+    @staticmethod
+    def _augment_geometric(vol: torch.Tensor, targets: torch.Tensor):
+        # Orientation is encoded as cos(2theta), sin(2theta). Horizontal and
+        # vertical flips preserve cos(2theta) and negate sin(2theta). Odd 90 deg
+        # rotations negate both channels.
+        if torch.rand(()) < 0.5:
+            vol = torch.flip(vol, dims=(-1,))
+            targets = torch.flip(targets, dims=(-1,))
+            targets[2] = -targets[2]
+
+        if torch.rand(()) < 0.5:
+            vol = torch.flip(vol, dims=(-2,))
+            targets = torch.flip(targets, dims=(-2,))
+            targets[2] = -targets[2]
+
+        k = int(torch.randint(0, 4, (1,)).item())
+        if k:
+            vol = torch.rot90(vol, k=k, dims=(-2, -1))
+            targets = torch.rot90(targets, k=k, dims=(-2, -1))
+            if k % 2 == 1:
+                targets[1:3] = -targets[1:3]
+
+        return vol, targets
+
+    @staticmethod
+    def _augment_intensity(vol: torch.Tensor):
+        scale = 0.90 + 0.20 * torch.rand((), dtype=vol.dtype)
+        offset = -0.04 + 0.08 * torch.rand((), dtype=vol.dtype)
+        noise_std = 0.00 + 0.015 * torch.rand((), dtype=vol.dtype)
+        vol = vol * scale + offset
+        if noise_std > 0:
+            vol = vol + torch.randn_like(vol) * noise_std
+        return torch.clamp(vol, 0.0, 1.0)
+
 class StedFieldLoss2D(nn.Module):
     def __init__(
         self,
@@ -79,6 +165,9 @@ class StedFieldLoss2D(nn.Module):
         centerline_warmup_start_factor: float = 1.0,
         radius_weight: float = 0.15,
         bundle_count_weight: float = 0.15,
+        fixed_score_radius_weight: float = 0.25,
+        fixed_score_bundle_count_weight: float = 0.30,
+        fixed_score_threshold_sensitivity_weight: float = 0.20,
         centerline_threshold: float = 0.5,
         centerline_focal_weight: float = 1.0,
         centerline_dice_weight: float = 1.0,
@@ -112,6 +201,9 @@ class StedFieldLoss2D(nn.Module):
         self._current_train_centerline_weight = self.train_centerline_weight
         self.radius_weight = float(radius_weight)
         self.bundle_count_weight = float(bundle_count_weight)
+        self.fixed_score_radius_weight = float(fixed_score_radius_weight)
+        self.fixed_score_bundle_count_weight = float(fixed_score_bundle_count_weight)
+        self.fixed_score_threshold_sensitivity_weight = float(fixed_score_threshold_sensitivity_weight)
         self.centerline_threshold = float(centerline_threshold)
         self.centerline_focal_weight = float(centerline_focal_weight)
         self.centerline_dice_weight = float(centerline_dice_weight)
@@ -282,9 +374,9 @@ class StedFieldLoss2D(nn.Module):
             self.score_centerline_weight * components["centerline"]
             + self.fixed_orientation_weight * components["orientation"]
             + self.fixed_traceability_weight * components["traceability"]
-            + self.radius_weight * components["radius"]
-            + self.bundle_count_weight * components["bundle_count"]
-            + self.score_stability_weight * components["threshold_sensitivity"]
+            + self.fixed_score_radius_weight * components["radius"]
+            + self.fixed_score_bundle_count_weight * components["bundle_count"]
+            + self.fixed_score_threshold_sensitivity_weight * components["threshold_sensitivity"]
         )
 
     def forward(self, pred, target):
@@ -338,15 +430,113 @@ def _average_metrics(totals, n_batches):
     return {key: value / max(n_batches, 1) for key, value in totals.items()}
 
 
-def _data_loader_kwargs(num_workers: int):
+def _set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def _loader_kwargs(num_workers: int, device: torch.device):
     kwargs = {
-        "num_workers": num_workers,
-        "pin_memory": True,
+        "num_workers": int(num_workers),
+        "pin_memory": device.type == "cuda",
     }
     if num_workers > 0:
         kwargs["prefetch_factor"] = 4
         kwargs["persistent_workers"] = True
     return kwargs
+
+
+def _data_loader_kwargs(num_workers: int):
+    return _loader_kwargs(num_workers, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
+
+def _amp_settings(device: torch.device, amp_dtype: str):
+    if device.type != "cuda" or amp_dtype == "off":
+        return None, None
+    if amp_dtype == "bf16":
+        return torch.bfloat16, None
+    if amp_dtype == "fp16":
+        return torch.float16, torch.amp.GradScaler("cuda")
+    raise ValueError(f"Unsupported amp dtype: {amp_dtype}")
+
+
+def _autocast_context(device: torch.device, dtype):
+    if device.type == "cuda" and dtype is not None:
+        return torch.amp.autocast("cuda", dtype=dtype)
+    return nullcontext()
+
+
+def _validate_dataset(data_dir: str, check_samples: int) -> None:
+    for split in ("train", "val"):
+        split_dir = Path(data_dir) / split
+        files = sorted(split_dir.glob("*.pt"))
+        if not files:
+            raise FileNotFoundError(f"No .pt files found in {split_dir}")
+
+        n_check = min(int(check_samples), len(files))
+        for path in files[:n_check]:
+            record = _torch_load(path)
+            schema = record.get("target_schema", "legacy")
+            if schema != "structural_v2":
+                raise ValueError(f"{path} has target_schema={schema!r}; expected 'structural_v2'.")
+            targets = record.get("targets")
+            if targets is None:
+                raise KeyError(f"{path} is missing the 'targets' tensor.")
+            if targets.shape[0] != 6:
+                raise ValueError(f"{path} has target shape {tuple(targets.shape)}; expected 6 target channels.")
+
+
+def _make_criterion(config) -> StedFieldLoss2D:
+    return StedFieldLoss2D(
+        orientation_weight=float(config.orientation_loss_weight),
+        visibility_weight=float(config.visibility_loss_weight),
+        orientation_mask_floor=float(config.orientation_mask_floor),
+        loss_visibility_floor=float(config.loss_visibility_floor),
+        fixed_orientation_weight=float(config.fixed_score_orientation_weight),
+        fixed_visibility_weight=float(config.fixed_score_traceability_weight),
+        score_centerline_weight=float(config.score_centerline_weight),
+        train_centerline_weight=float(config.train_centerline_weight),
+        centerline_warmup_epochs=int(config.centerline_warmup_epochs),
+        centerline_warmup_start_factor=float(config.centerline_warmup_start_factor),
+        radius_weight=float(config.radius_loss_weight),
+        bundle_count_weight=float(config.bundle_count_loss_weight),
+        centerline_threshold=float(config.centerline_threshold),
+        score_stability_weight=float(config.score_stability_weight),
+        stability_margin_weight=float(config.stability_margin_weight),
+        fixed_score_radius_weight=float(config.fixed_score_radius_weight),
+        fixed_score_bundle_count_weight=float(config.fixed_score_bundle_count_weight),
+        fixed_score_threshold_sensitivity_weight=float(config.fixed_score_threshold_sensitivity_weight),
+    )
+
+
+def _state_dict(model: nn.Module, use_data_parallel: bool):
+    return model.module.state_dict() if use_data_parallel else model.state_dict()
+
+
+def _checkpoint_payload(
+    model: nn.Module,
+    use_data_parallel: bool,
+    epoch: int,
+    best_val_score: float,
+    config: dict[str, Any],
+):
+    return {
+        "model_state_dict": _state_dict(model, use_data_parallel),
+        "epoch": int(epoch),
+        "best_val_score": float(best_val_score),
+        "config": dict(config),
+    }
+
+
+def extract_model_state_dict(checkpoint):
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        checkpoint = checkpoint["model_state_dict"]
+    if not isinstance(checkpoint, dict):
+        raise TypeError("Checkpoint must be a state_dict or contain a 'model_state_dict' entry.")
+    return {k[7:] if k.startswith("module.") else k: v for k, v in checkpoint.items()}
+
 
 def train_model(args):
     if args.dim != 2:
@@ -365,10 +555,15 @@ def train_model(args):
         if args.nccl_debug:
             os.environ["NCCL_DEBUG"] = args.nccl_debug
 
+    _set_seed(args.seed)
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     num_gpus_available = torch.cuda.device_count()
     use_data_parallel = bool(args.multi_gpu and num_gpus_available > 1)
     batch_size = args.base_batch_size * max(1, num_gpus_available) if use_data_parallel else args.base_batch_size
+
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     if device.type == "cuda" and num_gpus_available > 1 and not use_data_parallel:
         print(
@@ -376,20 +571,53 @@ def train_model(args):
             "Training on a single GPU to avoid NCCL/DataParallel issues."
         )
 
+    _validate_dataset(args.data_dir, args.check_samples)
+
+    static_config = {
+        "data_dir": args.data_dir,
+        "crop_size": args.crop_size,
+        "val_crop_size": args.val_crop_size or args.crop_size,
+        "epochs": args.epochs,
+        "base_batch_size": args.base_batch_size,
+        "effective_batch_size": batch_size,
+        "num_workers": args.num_workers,
+        "amp_dtype": args.amp_dtype,
+        "grad_clip_norm": args.grad_clip_norm,
+        "multi_gpu": args.multi_gpu,
+        "augment_geometric": args.augment_geometric,
+        "augment_intensity": args.augment_intensity,
+        "seed": args.seed,
+    }
+
     wandb_run = None
     if not args.no_wandb:
         wandb_run = wandb.init(
-            project="fibras-sted-resunet2d",
+            project=args.project,
             config=vars(args)
         )
+        wandb.config.update(static_config, allow_val_change=True)
 
     train_dir = os.path.join(args.data_dir, "train")
     val_dir = os.path.join(args.data_dir, "val")
-    
-    train_ds = PrecomputedFiberDataset(train_dir, dim=2, crop_size=args.crop_size, random_crop=True)
-    val_ds = PrecomputedFiberDataset(val_dir, dim=2, crop_size=args.val_crop_size or args.crop_size, random_crop=False)
 
-    loader_kwargs = _data_loader_kwargs(args.num_workers)
+    train_ds = PrecomputedFiberDataset(
+        train_dir,
+        dim=2,
+        crop_size=args.crop_size,
+        random_crop=True,
+        augment_geometric=args.augment_geometric,
+        augment_intensity=args.augment_intensity,
+    )
+    val_ds = PrecomputedFiberDataset(
+        val_dir,
+        dim=2,
+        crop_size=args.val_crop_size or args.crop_size,
+        random_crop=False,
+        augment_geometric=False,
+        augment_intensity=False,
+    )
+
+    loader_kwargs = _loader_kwargs(args.num_workers, device)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
 
@@ -400,32 +628,25 @@ def train_model(args):
         
     model = model.to(device)
     
-    criterion = StedFieldLoss2D(
-        orientation_weight=args.orientation_loss_weight,
-        visibility_weight=args.visibility_loss_weight,
-        orientation_mask_floor=args.orientation_mask_floor,
-        loss_visibility_floor=args.loss_visibility_floor,
-        score_centerline_weight=args.score_centerline_weight,
-        train_centerline_weight=args.train_centerline_weight,
-        centerline_warmup_epochs=args.centerline_warmup_epochs,
-        centerline_warmup_start_factor=args.centerline_warmup_start_factor,
-        radius_weight=args.radius_loss_weight,
-        bundle_count_weight=args.bundle_count_loss_weight,
-        centerline_threshold=args.centerline_threshold,
-        score_stability_weight=args.score_stability_weight,
-        stability_margin_weight=args.stability_margin_weight,
-    )
+    criterion = _make_criterion(args)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    
-    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+    autocast_dtype, scaler = _amp_settings(device, args.amp_dtype)
 
     best_val_score = float('inf')
+    best_epoch = 0
+    patience_counter = 0
+    patience = int(args.early_stop_patience)
+    min_epochs_before_stop = int(args.min_epochs_before_stop)
     save_path = args.save_path
     save_dir = os.path.dirname(save_path)
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
 
-    print("\nStarting 2D STED ResUNet Training Loop...")
+    print(
+        "\nStarting 2D STED ResUNet Training Loop... "
+        f"device={device}, batch_size={batch_size}, train={len(train_ds)}, val={len(val_ds)}, "
+        f"base_filters={int(args.base_filters)}"
+    )
     for epoch in range(args.epochs):
         active_train_centerline_weight = criterion.set_epoch(epoch)
         model.train()
@@ -437,23 +658,25 @@ def train_model(args):
             targets = targets.to(device, non_blocking=True)
             
             optimizer.zero_grad(set_to_none=True)
-            
-            if scaler:
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
-                    if use_data_parallel: loss = loss.mean()
-                    components = criterion.compute_components(outputs, targets)
-                
+
+            with _autocast_context(device, autocast_dtype):
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                if use_data_parallel:
+                    loss = loss.mean()
+                components = criterion.compute_components(outputs, targets)
+
+            if scaler is not None:
                 scaler.scale(loss).backward()
+                if args.grad_clip_norm > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                if use_data_parallel: loss = loss.mean()
-                components = criterion.compute_components(outputs, targets)
                 loss.backward()
+                if args.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
                 optimizer.step()
             
             _add_metric_batch(train_totals, criterion, loss, components)
@@ -466,30 +689,55 @@ def train_model(args):
             for inputs, targets in val_loader:
                 inputs = inputs.to(device, non_blocking=True)
                 targets = targets.to(device, non_blocking=True)
-                
-                if scaler:
-                    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                        outputs = model(inputs)
-                        loss = criterion(outputs, targets)
-                        if use_data_parallel: loss = loss.mean()
-                        components = criterion.compute_components(outputs, targets)
-                else:
+
+                with _autocast_context(device, autocast_dtype):
                     outputs = model(inputs)
                     loss = criterion(outputs, targets)
-                    if use_data_parallel: loss = loss.mean()
+                    if use_data_parallel:
+                        loss = loss.mean()
                     components = criterion.compute_components(outputs, targets)
                 
                 _add_metric_batch(val_totals, criterion, loss, components)
 
         val_metrics = _average_metrics(val_totals, len(val_loader))
         t_elapsed = time.time() - t0
-        
+
+        improved = val_metrics["score"] < best_val_score
+        if improved:
+            best_val_score = val_metrics["score"]
+            best_epoch = epoch + 1
+            patience_counter = 0
+            torch.save(
+                _checkpoint_payload(
+                    model,
+                    use_data_parallel,
+                    epoch + 1,
+                    best_val_score,
+                    {**vars(args), **static_config},
+                ),
+                save_path,
+            )
+        else:
+            patience_counter += 1
+
         log_data = {
             "epoch": epoch + 1,
+            "epoch_time_seconds": t_elapsed,
             "train_loss": train_metrics["loss"],
             "train_score": train_metrics["score"],
+            "train_centerline": train_metrics["centerline"],
+            "train_centerline_focal": train_metrics["centerline_focal"],
+            "train_centerline_dice": train_metrics["centerline_dice"],
+            "train_cldice": train_metrics["cldice"],
+            "train_orientation": train_metrics["orientation"],
+            "train_traceability": train_metrics["traceability"],
+            "train_radius": train_metrics["radius"],
+            "train_bundle_count": train_metrics["bundle_count"],
+            "train_threshold_sensitivity": train_metrics["threshold_sensitivity"],
             "val_loss": val_metrics["loss"],
             "val_score": val_metrics["score"],
+            "best_val_score": best_val_score,
+            "best_epoch": best_epoch,
             "val_centerline": val_metrics["centerline"],
             "val_centerline_focal": val_metrics["centerline_focal"],
             "val_centerline_dice": val_metrics["centerline_dice"],
@@ -499,25 +747,31 @@ def train_model(args):
             "val_radius": val_metrics["radius"],
             "val_bundle_count": val_metrics["bundle_count"],
             "val_threshold_sensitivity": val_metrics["threshold_sensitivity"],
-            "train_centerline_weight": active_train_centerline_weight,
+            "active_train_centerline_weight": active_train_centerline_weight,
+            "train_radius_loss_weight": criterion.radius_weight,
+            "train_bundle_count_loss_weight": criterion.bundle_count_weight,
             "score_centerline_weight": criterion.score_centerline_weight,
-            "score_stability_weight": criterion.score_stability_weight,
-            "epoch_time_seconds": t_elapsed,
+            "score_orientation_weight": criterion.fixed_orientation_weight,
+            "score_traceability_weight": criterion.fixed_traceability_weight,
+            "score_radius_weight": criterion.fixed_score_radius_weight,
+            "score_bundle_count_weight": criterion.fixed_score_bundle_count_weight,
+            "score_threshold_sensitivity_weight": criterion.fixed_score_threshold_sensitivity_weight,
         }
         if wandb_run is not None:
             wandb.log(log_data)
         print(
-            f"-> Epoch {epoch+1} Summary: Train: {train_metrics['loss']:.4f} | "
-            f"Val Score: {val_metrics['score']:.4f} | Val Loss: {val_metrics['loss']:.4f} | "
-            f"Centerline W: {active_train_centerline_weight:.4f} | "
-            f"Bundle: {val_metrics['bundle_count']:.4f} | "
-            f"Sens: {val_metrics['threshold_sensitivity']:.4f} | Time: {t_elapsed:.1f}s"
+            f"Epoch {epoch + 1:03d}/{args.epochs} | "
+            f"val_score={val_metrics['score']:.5f} | best={best_val_score:.5f} @ {best_epoch} | "
+            f"val_bundle={val_metrics['bundle_count']:.5f} | val_radius={val_metrics['radius']:.5f} | "
+            f"time={t_elapsed:.1f}s"
         )
 
-        if val_metrics["score"] < best_val_score:
-            best_val_score = val_metrics["score"]
-            state_dict = model.module.state_dict() if use_data_parallel else model.state_dict()
-            torch.save(state_dict, save_path)
+        if patience > 0 and epoch + 1 >= min_epochs_before_stop and patience_counter >= patience:
+            print(
+                f"Early stopping at epoch {epoch + 1}: no best_val_score improvement "
+                f"for {patience} epochs after minimum {min_epochs_before_stop} epochs."
+            )
+            break
 
 def add_train_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--gpus', type=str, default="0")
@@ -528,9 +782,16 @@ def add_train_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--crop_size', type=int, default=512)
     parser.add_argument('--val_crop_size', type=int, default=0)
     parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--project', type=str, default="fibras-sted-resunet2d")
     parser.add_argument('--base_filters', type=int, default=32)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--amp_dtype', type=str, choices=['bf16', 'fp16', 'off'], default='bf16')
+    parser.add_argument('--grad_clip_norm', type=float, default=1.0)
+    parser.add_argument('--check_samples', type=int, default=16)
+    parser.add_argument('--augment_geometric', action='store_true')
+    parser.add_argument('--augment_intensity', action='store_true')
+    parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--orientation_loss_weight', type=float, default=1.0)
     parser.add_argument('--visibility_loss_weight', '--traceability_loss_weight', dest='visibility_loss_weight', type=float, default=0.35)
     parser.add_argument('--orientation_mask_floor', '--centerline_support_floor', dest='orientation_mask_floor', type=float, default=0.15)
@@ -539,11 +800,18 @@ def add_train_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--bundle_count_loss_weight', type=float, default=0.15)
     parser.add_argument('--train_centerline_weight', type=float, default=1.0)
     parser.add_argument('--score_centerline_weight', '--skeleton_score_weight', dest='score_centerline_weight', type=float, default=1.0)
-    parser.add_argument('--centerline_warmup_epochs', type=int, default=0)
-    parser.add_argument('--centerline_warmup_start_factor', type=float, default=1.0)
+    parser.add_argument('--fixed_score_orientation_weight', type=float, default=1.0)
+    parser.add_argument('--fixed_score_traceability_weight', type=float, default=0.35)
+    parser.add_argument('--fixed_score_radius_weight', type=float, default=0.25)
+    parser.add_argument('--fixed_score_bundle_count_weight', type=float, default=0.30)
+    parser.add_argument('--fixed_score_threshold_sensitivity_weight', type=float, default=0.20)
+    parser.add_argument('--centerline_warmup_epochs', type=int, default=3)
+    parser.add_argument('--centerline_warmup_start_factor', type=float, default=0.5)
     parser.add_argument('--centerline_threshold', type=float, default=0.5)
     parser.add_argument('--stability_margin_weight', type=float, default=0.2)
     parser.add_argument('--score_stability_weight', type=float, default=0.2)
+    parser.add_argument('--early_stop_patience', type=int, default=10)
+    parser.add_argument('--min_epochs_before_stop', type=int, default=25)
     parser.add_argument('--save_path', type=str, default='weights/sted_resunet2d_final.pth')
     parser.add_argument('--multi_gpu', action='store_true', help="Enable nn.DataParallel across all visible GPUs.")
     parser.add_argument('--nccl_p2p_disable', action='store_true', help="Set NCCL_P2P_DISABLE=1 when using --multi_gpu.")

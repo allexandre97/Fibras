@@ -21,6 +21,7 @@ from src.sted_calibration import (
     parse_sted_filename,
 )
 from src.visualization import AdvancedVisualizer
+from train import extract_model_state_dict
 
 
 OUTPUT_SUFFIXES = {
@@ -119,8 +120,8 @@ def resolve_device(device_spec: str = "auto") -> torch.device:
 def load_sted_model(model_path: str, base_filters: int = 32, device_spec: str = "auto"):
     device = resolve_device(device_spec)
     model = STEDResUNet2D(in_channels=1, base_filters=base_filters)
-    state_dict = torch.load(model_path, map_location=device, weights_only=True)
-    state_dict = {k[7:] if k.startswith("module.") else k: v for k, v in state_dict.items()}
+    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+    state_dict = extract_model_state_dict(checkpoint)
     try:
         model.load_state_dict(state_dict)
     except RuntimeError as error:

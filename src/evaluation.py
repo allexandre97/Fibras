@@ -4,7 +4,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.model import STEDResUNet2D
-from train import PrecomputedFiberDataset, StedFieldLoss2D
+from train import PrecomputedFiberDataset, StedFieldLoss2D, extract_model_state_dict
 
 def evaluate_model(args):
     if args.dim != 2:
@@ -18,10 +18,8 @@ def evaluate_model(args):
 
     model = STEDResUNet2D(in_channels=1, base_filters=args.base_filters)
     
-    state_dict = torch.load(args.model_path, map_location=device, weights_only=True)
-    new_state_dict = {k[7:] if k.startswith('module.') else k: v for k, v in state_dict.items()}
-        
-    model.load_state_dict(new_state_dict)
+    checkpoint = torch.load(args.model_path, map_location=device, weights_only=True)
+    model.load_state_dict(extract_model_state_dict(checkpoint))
     model.to(device)
     model.eval()
 
@@ -30,12 +28,17 @@ def evaluate_model(args):
         visibility_weight=args.visibility_loss_weight,
         orientation_mask_floor=args.orientation_mask_floor,
         loss_visibility_floor=args.loss_visibility_floor,
+        fixed_orientation_weight=args.fixed_score_orientation_weight,
+        fixed_visibility_weight=args.fixed_score_traceability_weight,
         score_centerline_weight=args.score_centerline_weight,
         train_centerline_weight=args.train_centerline_weight,
         centerline_warmup_epochs=args.centerline_warmup_epochs,
         centerline_warmup_start_factor=args.centerline_warmup_start_factor,
         radius_weight=args.radius_loss_weight,
         bundle_count_weight=args.bundle_count_loss_weight,
+        fixed_score_radius_weight=args.fixed_score_radius_weight,
+        fixed_score_bundle_count_weight=args.fixed_score_bundle_count_weight,
+        fixed_score_threshold_sensitivity_weight=args.fixed_score_threshold_sensitivity_weight,
         centerline_threshold=args.centerline_threshold,
         score_stability_weight=args.score_stability_weight,
         stability_margin_weight=args.stability_margin_weight,
@@ -110,6 +113,11 @@ def add_evaluate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--bundle_count_loss_weight', type=float, default=0.15)
     parser.add_argument('--train_centerline_weight', type=float, default=1.0)
     parser.add_argument('--score_centerline_weight', '--skeleton_score_weight', dest='score_centerline_weight', type=float, default=1.0)
+    parser.add_argument('--fixed_score_orientation_weight', type=float, default=1.0)
+    parser.add_argument('--fixed_score_traceability_weight', type=float, default=0.35)
+    parser.add_argument('--fixed_score_radius_weight', type=float, default=0.25)
+    parser.add_argument('--fixed_score_bundle_count_weight', type=float, default=0.30)
+    parser.add_argument('--fixed_score_threshold_sensitivity_weight', type=float, default=0.20)
     parser.add_argument('--centerline_warmup_epochs', type=int, default=0)
     parser.add_argument('--centerline_warmup_start_factor', type=float, default=1.0)
     parser.add_argument('--centerline_threshold', type=float, default=0.5)

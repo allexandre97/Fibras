@@ -9,25 +9,32 @@ labels.
 from __future__ import annotations
 
 import argparse
-import glob
 import os
-import random
 import sys
 import time
-from contextlib import nullcontext
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 import wandb
 
 from src.model import STEDResUNet2D
-from train import StedFieldLoss2D, _add_metric_batch, _average_metrics, _empty_metric_totals
+from train import (
+    PrecomputedFiberDataset,
+    _add_metric_batch,
+    _amp_settings,
+    _autocast_context,
+    _average_metrics,
+    _checkpoint_payload,
+    _empty_metric_totals,
+    _loader_kwargs,
+    _make_criterion,
+    _set_seed,
+    _validate_dataset,
+)
 
 
 @dataclass
@@ -52,252 +59,6 @@ class StaticSweepArgs:
 GLOBAL_ARGS: StaticSweepArgs | None = None
 
 
-def _torch_load(path: str | os.PathLike[str]) -> dict[str, Any]:
-    """Load a .pt record while staying compatible with older PyTorch versions."""
-    try:
-        return torch.load(path, weights_only=True, map_location="cpu")
-    except TypeError:
-        return torch.load(path, map_location="cpu")
-
-
-class StrictStructuralV2Dataset(Dataset):
-    """Precomputed 2D STED dataset with strict structural_v2 validation.
-
-    The original training dataset class has a backwards-compatibility path that
-    fabricates a bundle-count target for 5-channel structural_v1 samples.  That
-    is undesirable for the current project because bundle count is a real target.
-    This dataset therefore hard-fails unless every sample has exactly six target
-    channels.
-    """
-
-    def __init__(
-        self,
-        data_dir: str | os.PathLike[str],
-        crop_size: int = 0,
-        random_crop: bool = False,
-        augment_geometric: bool = False,
-        augment_intensity: bool = False,
-    ):
-        self.data_dir = Path(data_dir)
-        self.crop_size = int(crop_size or 0)
-        self.random_crop = bool(random_crop)
-        self.augment_geometric = bool(augment_geometric)
-        self.augment_intensity = bool(augment_intensity)
-        self.files = sorted(self.data_dir.glob("*.pt"))
-        if not self.files:
-            raise FileNotFoundError(f"No .pt files found in {self.data_dir}")
-
-    def __len__(self) -> int:
-        return len(self.files)
-
-    def __getitem__(self, idx: int):
-        path = self.files[idx]
-        record = _torch_load(path)
-        if "volume" not in record or "targets" not in record:
-            raise KeyError(f"{path} is missing required keys 'volume' and/or 'targets'.")
-
-        target_schema = record.get("target_schema", "legacy")
-        if target_schema != "structural_v2":
-            raise ValueError(
-                f"{path} has target_schema={target_schema!r}. Bundle-count training requires "
-                "target_schema='structural_v2'. Regenerate the dataset with the upgraded generator."
-            )
-
-        vol = record["volume"].float()
-        targets = record["targets"].float()
-
-        if targets.ndim == 4 and targets.shape[1] == 1:
-            targets = targets[:, 0, :, :]
-        elif targets.ndim != 3:
-            raise ValueError(f"{path} has unsupported target tensor shape {tuple(targets.shape)}.")
-
-        if targets.shape[0] != 6:
-            raise ValueError(
-                f"{path} has {targets.shape[0]} target channels. Expected 6 channels: "
-                "centerline, cos(2theta), sin(2theta), traceability, radius, bundle_count."
-            )
-
-        if vol.ndim == 4 and vol.shape[1] == 1:
-            vol = vol.squeeze(1)
-        elif vol.ndim == 2:
-            vol = vol.unsqueeze(0)
-        elif vol.ndim != 3:
-            raise ValueError(f"{path} has unsupported volume tensor shape {tuple(vol.shape)}.")
-
-        vol, targets = self._crop_2d(vol, targets)
-
-        if self.augment_geometric:
-            vol, targets = self._augment_geometric(vol, targets)
-        if self.augment_intensity:
-            vol = self._augment_intensity(vol)
-
-        return vol.contiguous(), targets.contiguous()
-
-    def _crop_2d(self, vol: torch.Tensor, targets: torch.Tensor):
-        if self.crop_size <= 0:
-            return vol, targets
-
-        h, w = vol.shape[-2:]
-        crop_h = min(self.crop_size, h)
-        crop_w = min(self.crop_size, w)
-        if crop_h == h and crop_w == w:
-            return vol, targets
-
-        if self.random_crop:
-            y0 = int(torch.randint(0, h - crop_h + 1, (1,)).item())
-            x0 = int(torch.randint(0, w - crop_w + 1, (1,)).item())
-        else:
-            y0 = (h - crop_h) // 2
-            x0 = (w - crop_w) // 2
-
-        return vol[:, y0 : y0 + crop_h, x0 : x0 + crop_w], targets[:, y0 : y0 + crop_h, x0 : x0 + crop_w]
-
-    @staticmethod
-    def _augment_geometric(vol: torch.Tensor, targets: torch.Tensor):
-        # Orientation is encoded as cos(2theta), sin(2theta).  Horizontal and
-        # vertical flips preserve cos(2theta) and negate sin(2theta).  Odd 90°
-        # rotations negate both channels.
-        if torch.rand(()) < 0.5:
-            vol = torch.flip(vol, dims=(-1,))
-            targets = torch.flip(targets, dims=(-1,))
-            targets[2] = -targets[2]
-
-        if torch.rand(()) < 0.5:
-            vol = torch.flip(vol, dims=(-2,))
-            targets = torch.flip(targets, dims=(-2,))
-            targets[2] = -targets[2]
-
-        k = int(torch.randint(0, 4, (1,)).item())
-        if k:
-            vol = torch.rot90(vol, k=k, dims=(-2, -1))
-            targets = torch.rot90(targets, k=k, dims=(-2, -1))
-            if k % 2 == 1:
-                targets[1:3] = -targets[1:3]
-
-        return vol, targets
-
-    @staticmethod
-    def _augment_intensity(vol: torch.Tensor):
-        # Keep this conservative: the synthetic generator already tries to match
-        # real intensity/noise statistics.  This only prevents overfitting to a
-        # fixed normalization.
-        scale = 0.90 + 0.20 * torch.rand((), dtype=vol.dtype)
-        offset = -0.04 + 0.08 * torch.rand((), dtype=vol.dtype)
-        noise_std = 0.00 + 0.015 * torch.rand((), dtype=vol.dtype)
-        vol = vol * scale + offset
-        if noise_std > 0:
-            vol = vol + torch.randn_like(vol) * noise_std
-        return torch.clamp(vol, 0.0, 1.0)
-
-
-class SweepStedFieldLoss2D(StedFieldLoss2D):
-    """Loss with a model-selection score decoupled from swept train weights."""
-
-    def __init__(
-        self,
-        *args,
-        fixed_score_radius_weight: float = 0.25,
-        fixed_score_bundle_count_weight: float = 0.30,
-        fixed_score_threshold_sensitivity_weight: float = 0.20,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        self.fixed_score_radius_weight = float(fixed_score_radius_weight)
-        self.fixed_score_bundle_count_weight = float(fixed_score_bundle_count_weight)
-        self.fixed_score_threshold_sensitivity_weight = float(fixed_score_threshold_sensitivity_weight)
-
-    def fixed_score(self, components):
-        return (
-            self.score_centerline_weight * components["centerline"]
-            + self.fixed_orientation_weight * components["orientation"]
-            + self.fixed_traceability_weight * components["traceability"]
-            + self.fixed_score_radius_weight * components["radius"]
-            + self.fixed_score_bundle_count_weight * components["bundle_count"]
-            + self.fixed_score_threshold_sensitivity_weight * components["threshold_sensitivity"]
-        )
-
-
-def _set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def _loader_kwargs(num_workers: int, device: torch.device) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {
-        "num_workers": int(num_workers),
-        "pin_memory": device.type == "cuda",
-    }
-    if num_workers > 0:
-        kwargs["prefetch_factor"] = 4
-        kwargs["persistent_workers"] = True
-    return kwargs
-
-
-def _amp_settings(device: torch.device, amp_dtype: str):
-    if device.type != "cuda" or amp_dtype == "off":
-        return None, None
-    if amp_dtype == "bf16":
-        return torch.bfloat16, None
-    if amp_dtype == "fp16":
-        return torch.float16, torch.amp.GradScaler("cuda")
-    raise ValueError(f"Unsupported amp dtype: {amp_dtype}")
-
-
-def _autocast_context(device: torch.device, dtype):
-    if device.type == "cuda" and dtype is not None:
-        return torch.amp.autocast("cuda", dtype=dtype)
-    return nullcontext()
-
-
-def _validate_dataset(data_dir: str, check_samples: int) -> None:
-    for split in ("train", "val"):
-        split_dir = Path(data_dir) / split
-        files = sorted(split_dir.glob("*.pt"))
-        if not files:
-            raise FileNotFoundError(f"No .pt files found in {split_dir}")
-
-        n_check = min(int(check_samples), len(files))
-        for path in files[:n_check]:
-            record = _torch_load(path)
-            schema = record.get("target_schema", "legacy")
-            if schema != "structural_v2":
-                raise ValueError(f"{path} has target_schema={schema!r}; expected 'structural_v2'.")
-            targets = record.get("targets")
-            if targets is None:
-                raise KeyError(f"{path} is missing the 'targets' tensor.")
-            if targets.shape[0] != 6:
-                raise ValueError(f"{path} has target shape {tuple(targets.shape)}; expected 6 target channels.")
-
-
-def _make_criterion(config) -> SweepStedFieldLoss2D:
-    return SweepStedFieldLoss2D(
-        orientation_weight=float(config.orientation_loss_weight),
-        visibility_weight=float(config.visibility_loss_weight),
-        orientation_mask_floor=float(config.orientation_mask_floor),
-        loss_visibility_floor=float(config.loss_visibility_floor),
-        fixed_orientation_weight=float(config.fixed_score_orientation_weight),
-        fixed_visibility_weight=float(config.fixed_score_traceability_weight),
-        score_centerline_weight=float(config.score_centerline_weight),
-        train_centerline_weight=float(config.train_centerline_weight),
-        centerline_warmup_epochs=int(config.centerline_warmup_epochs),
-        centerline_warmup_start_factor=float(config.centerline_warmup_start_factor),
-        radius_weight=float(config.radius_loss_weight),
-        bundle_count_weight=float(config.bundle_count_loss_weight),
-        centerline_threshold=float(config.centerline_threshold),
-        score_stability_weight=float(config.score_stability_weight),
-        stability_margin_weight=float(config.stability_margin_weight),
-        fixed_score_radius_weight=float(config.fixed_score_radius_weight),
-        fixed_score_bundle_count_weight=float(config.fixed_score_bundle_count_weight),
-        fixed_score_threshold_sensitivity_weight=float(config.fixed_score_threshold_sensitivity_weight),
-    )
-
-
-def _state_dict(model: nn.Module, use_data_parallel: bool):
-    return model.module.state_dict() if use_data_parallel else model.state_dict()
-
-
 def _save_checkpoint(
     model: nn.Module,
     use_data_parallel: bool,
@@ -309,15 +70,7 @@ def _save_checkpoint(
 ) -> None:
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, f"sweep_{run_id}_best.pth")
-    torch.save(
-        {
-            "model_state_dict": _state_dict(model, use_data_parallel),
-            "epoch": int(epoch),
-            "best_val_score": float(best_val_score),
-            "config": dict(config),
-        },
-        path,
-    )
+    torch.save(_checkpoint_payload(model, use_data_parallel, epoch, best_val_score, config), path)
 
 
 def train_sweep() -> None:
@@ -356,15 +109,17 @@ def train_sweep() -> None:
 
     train_dir = os.path.join(args.data_dir, "train")
     val_dir = os.path.join(args.data_dir, "val")
-    train_ds = StrictStructuralV2Dataset(
+    train_ds = PrecomputedFiberDataset(
         train_dir,
+        dim=2,
         crop_size=args.crop_size,
         random_crop=True,
         augment_geometric=args.augment_geometric,
         augment_intensity=args.augment_intensity,
     )
-    val_ds = StrictStructuralV2Dataset(
+    val_ds = PrecomputedFiberDataset(
         val_dir,
+        dim=2,
         crop_size=args.val_crop_size or args.crop_size,
         random_crop=False,
         augment_geometric=False,
@@ -537,16 +292,16 @@ def _build_sweep_config(args: argparse.Namespace) -> dict[str, Any]:
             # Expand upward, but keep the lower end near the useful region.
             "learning_rate": {
                 "distribution": "log_uniform_values",
-                "min": 6e-5,
-                "max": 2.0e-4,
+                "min": 1.5e-4,
+                "max": 3.0e-4,
             },
 
             # Best value was ~1.35e-4, fairly high.
             # Search around that, allowing stronger regularization.
             "weight_decay": {
                 "distribution": "log_uniform_values",
-                "min": 5e-5,
-                "max": 4e-4,
+                "min": 1e-5,
+                "max": 1.5e-4,
             },
 
             # Best value was ~0.92, well inside the old range.
@@ -562,22 +317,22 @@ def _build_sweep_config(args: argparse.Namespace) -> dict[str, Any]:
             "visibility_loss_weight": {
                 "distribution": "uniform",
                 "min": 0.45,
-                "max": 0.85,
+                "max": 0.70,
             },
 
             # Best value was ~0.072, toward the lower end.
             # Keep the floor low so orientation supervision is not too narrowly masked.
             "orientation_mask_floor": {
                 "distribution": "uniform",
-                "min": 0.04,
-                "max": 0.11,
+                "min": 0.07,
+                "max": 0.14,
             },
 
             # Best value was ~0.116, comfortably inside this narrower range.
             "loss_visibility_floor": {
                 "distribution": "uniform",
-                "min": 0.07,
-                "max": 0.18,
+                "min": 0.06,
+                "max": 0.13,
             },
 
             # Best value was ~0.365, near the old upper bound.
@@ -600,8 +355,8 @@ def _build_sweep_config(args: argparse.Namespace) -> dict[str, Any]:
             # Expand upward.
             "train_centerline_weight": {
                 "distribution": "uniform",
-                "min": 1.00,
-                "max": 1.45,
+                "min": 1.20,
+                "max": 1.70,
             },
 
             # Keep these fixed for this sweep.

@@ -71,6 +71,14 @@ class StedSynthesisVisualizer:
         return mask & ~eroded
 
     @staticmethod
+    def _debug_fiber_count(debug_data):
+        for key in ("actual_fiber_count", "fiber_count", "requested_fiber_count"):
+            value = debug_data.get(key)
+            if value is not None:
+                return int(value)
+        return 0
+
+    @staticmethod
     def _normalize_to_uint8(image):
         image = np.asarray(image, dtype=np.float64)
         image = image - image.min()
@@ -182,7 +190,8 @@ class StedSynthesisVisualizer:
         soft_alpha = float(debug_data.get("soft_skeleton_alpha", 0.0))
         bundle_details = debug_data.get("coherent_bundle_details", [])
         coherent_details = [detail for detail in bundle_details if detail.get("mode") == "coherent"]
-        bundle_title = f"fibers={debug_data['fiber_count']}"
+        fiber_count = StedSynthesisVisualizer._debug_fiber_count(debug_data)
+        bundle_title = f"fibers={fiber_count}"
         if coherent_details:
             sizes = [int(detail.get("bundle_size", 1)) for detail in coherent_details]
             separations = [float(detail.get("separation", 0.0)) for detail in coherent_details]
@@ -282,7 +291,8 @@ class StedSynthesisVisualizer:
         soft_alpha = float(debug_data.get("soft_skeleton_alpha", 0.0))
         bundle_details = debug_data.get("coherent_bundle_details", [])
         coherent_details = [detail for detail in bundle_details if detail.get("mode") == "coherent"]
-        bundle_title = f"{debug_data['fiber_count']} fibers"
+        fiber_count = StedSynthesisVisualizer._debug_fiber_count(debug_data)
+        bundle_title = f"{fiber_count} fibers"
         if coherent_details:
             sizes = [int(detail.get("bundle_size", 1)) for detail in coherent_details]
             separations = [float(detail.get("separation", 0.0)) for detail in coherent_details]
