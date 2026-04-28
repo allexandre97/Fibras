@@ -29,12 +29,11 @@ That command must succeed before PyTorch can use the GPUs.
 Build a calibrated synthetic 2D STED dataset:
 
 ```bash
-python analyze_real_sted.py --real_dir /ssd/STED_dataset/data --output_dir reports/sted_real --patch_size 512
+python analyze_real_sted.py profile-real --real_dir /ssd/STED_dataset/data --output_dir reports/sted_real --patch_size 512
 python generate_dataset.py \
   --output_dir /ssd/Fibras_Dataset/sted2d_calibrated_v1 \
   --bounds 1024 1024 \
   --synth_depth 16 \
-  --synthesis_mode calibrated \
   --calibration_profile reports/sted_real/sted_real_profile.json
 ```
 
@@ -43,7 +42,7 @@ python generate_dataset.py \
 Run 2D STED training:
 
 ```bash
-python train.py \
+python train.py fit \
   --gpus 0 \
   --data_dir /ssd/Fibras_Dataset/sted2d_calibrated_v1 \
   --dim 2 \

@@ -52,7 +52,10 @@ def _extract_sample_arrays(data):
         vector = targets[1:3, 0]
         auxiliary = targets[3, 0] if targets.shape[0] > 3 else None
         radius = targets[4, 0] if targets.shape[0] > 4 else None
-        schema = "structural_v1" if targets.shape[0] >= 5 or target_schema == "structural_v1" else "legacy"
+        bundle_count = targets[5, 0] if targets.shape[0] > 5 else None
+        schema = "structural_v2" if targets.shape[0] >= 6 or target_schema == "structural_v2" else (
+            "structural_v1" if targets.shape[0] >= 5 or target_schema == "structural_v1" else "legacy"
+        )
         return {
             "is_2d": True,
             "image": image,
@@ -60,6 +63,7 @@ def _extract_sample_arrays(data):
             "vector": vector,
             "auxiliary": auxiliary,
             "radius": radius,
+            "bundle_count": bundle_count,
             "schema": schema,
         }
 
@@ -75,6 +79,7 @@ def _extract_sample_arrays(data):
             "vector": vector,
             "auxiliary": None,
             "radius": None,
+            "bundle_count": None,
             "schema": "legacy_3d",
         }
 
@@ -106,7 +111,9 @@ def export_sample_png(pt_path: str, out_path: str, score_floor: float = 0.25):
     vector = sample["vector"]
     auxiliary = sample["auxiliary"]
     radius = sample["radius"]
+    bundle_count = sample["bundle_count"]
     schema = sample["schema"]
+    is_structural = schema in {"structural_v1", "structural_v2"}
 
     is_2d = sample["is_2d"]
     if not is_2d:
@@ -118,23 +125,27 @@ def export_sample_png(pt_path: str, out_path: str, score_floor: float = 0.25):
     direction_rgb = _direction_rgb(vector[:2], primary, double_angle=is_2d)
 
     show_auxiliary = is_2d and auxiliary is not None
-    show_radius = is_2d and radius is not None and schema == "structural_v1"
-    ncols = 5 if show_radius else (4 if show_auxiliary else 3)
+    show_radius = is_2d and radius is not None and schema in {"structural_v1", "structural_v2"}
+    show_bundle_count = is_2d and bundle_count is not None and schema == "structural_v2"
+    ncols = 6 if show_bundle_count else (5 if show_radius else (4 if show_auxiliary else 3))
     fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 4), dpi=150)
 
     axes[0].imshow(image, cmap="magma", vmin=0, vmax=max(image.max(), 1e-8))
     axes[0].set_title("Image")
     axes[1].imshow(primary, cmap="viridis", vmin=0, vmax=max(primary.max(), 1e-8))
-    axes[1].set_title("Centerline" if schema == "structural_v1" else "EDT")
+    axes[1].set_title("Centerline" if is_structural else "EDT")
     axes[2].imshow(direction_rgb)
     axes[2].set_title("Vector Direction")
 
     if show_auxiliary:
         axes[3].imshow(auxiliary, cmap="inferno", vmin=0, vmax=1)
-        axes[3].set_title("Traceability" if schema == "structural_v1" else "Visibility")
+        axes[3].set_title("Traceability" if is_structural else "Visibility")
     if show_radius:
         axes[4].imshow(radius, cmap="cividis", vmin=0, vmax=1)
         axes[4].set_title("Radius")
+    if show_bundle_count:
+        axes[5].imshow(bundle_count * 6.0, cmap="plasma", vmin=0, vmax=6)
+        axes[5].set_title("Bundle Count")
 
     for ax in axes:
         ax.axis("off")
@@ -197,20 +208,24 @@ def show_synthetic_data(pt_path: str, score_floor: float = 0.25):
     vector = sample["vector"]
     auxiliary = sample["auxiliary"]
     radius = sample["radius"]
+    bundle_count = sample["bundle_count"]
     schema = sample["schema"]
+    is_structural = schema in {"structural_v1", "structural_v2"}
     is_2d = sample["is_2d"]
     dim_str = "2D STED" if is_2d else "3D Confocal"
     print(f"Render Mode: {dim_str} | Array Shape: {image.shape}")
     print(
         f"Image min/max={float(image.min()):.4f}/{float(image.max()):.4f} | "
-        f"{'Centerline' if schema == 'structural_v1' else 'EDT'} min/max="
+        f"{'Centerline' if is_structural else 'EDT'} min/max="
         f"{float(primary.min()):.4f}/{float(primary.max()):.4f}"
     )
     if auxiliary is not None:
-        label = "Traceability" if schema == "structural_v1" else "Visibility"
+        label = "Traceability" if is_structural else "Visibility"
         print(f"{label} min/max={float(auxiliary.min()):.4f}/{float(auxiliary.max()):.4f}")
     if radius is not None:
         print(f"Radius min/max={float(radius.min()):.4f}/{float(radius.max()):.4f}")
+    if bundle_count is not None:
+        print(f"Bundle count min/max={float((bundle_count * 6.0).min()):.4f}/{float((bundle_count * 6.0).max()):.4f}")
 
     viewer = napari.Viewer(title=f"Fibras Dataset Viewer - {dim_str} - {os.path.basename(pt_path)}")
     viewer.add_image(
@@ -222,7 +237,7 @@ def show_synthetic_data(pt_path: str, score_floor: float = 0.25):
 
     viewer.add_image(
         primary,
-        name="Centerline Target" if schema == "structural_v1" else "EDT Target",
+        name="Centerline Target" if is_structural else "EDT Target",
         colormap="viridis",
         visible=False,
         opacity=0.75,
@@ -249,13 +264,13 @@ def show_synthetic_data(pt_path: str, score_floor: float = 0.25):
 
     viewer.add_labels(
         (primary > 0.15).astype(int),
-        name="Centerline Support (> 0.15)" if schema == "structural_v1" else "Annotation Mask (EDT > 0.15)",
+        name="Centerline Support (> 0.15)" if is_structural else "Annotation Mask (EDT > 0.15)",
         visible=False,
         opacity=0.5,
     )
     viewer.add_labels(
         (primary > 0.50).astype(int),
-        name="Ground Truth Centerlines" if schema == "structural_v1" else "Ground Truth Centerlines (EDT > 0.85)",
+        name="Ground Truth Centerlines" if is_structural else "Ground Truth Centerlines (EDT > 0.85)",
         visible=False,
         opacity=0.7,
     )
@@ -263,12 +278,12 @@ def show_synthetic_data(pt_path: str, score_floor: float = 0.25):
     if is_2d and auxiliary is not None:
         viewer.add_image(
             auxiliary,
-            name="Traceability Target" if schema == "structural_v1" else "Visibility Target",
+            name="Traceability Target" if is_structural else "Visibility Target",
             colormap="inferno",
             visible=False,
             opacity=0.7,
         )
-        if schema == "structural_v1" and radius is not None:
+        if schema in {"structural_v1", "structural_v2"} and radius is not None:
             viewer.add_image(
                 radius,
                 name="Radius Target",
@@ -289,6 +304,14 @@ def show_synthetic_data(pt_path: str, score_floor: float = 0.25):
                 visible=False,
                 opacity=0.7,
             )
+            if schema == "structural_v2" and bundle_count is not None:
+                viewer.add_image(
+                    bundle_count * 6.0,
+                    name="Bundle Count Target",
+                    colormap="plasma",
+                    visible=False,
+                    opacity=0.7,
+                )
         else:
             viewer.add_labels(
                 (auxiliary > 0.25).astype(int),
@@ -341,12 +364,30 @@ def show_sted_debug(
     annotation_weight_floor=0.25,
     soft_skeleton_alpha=0.35,
     visibility_weight_floor=0.03,
+    bundle_phenotype=False,
+    bundle_probability=None,
+    bundle_size_range=(2, 6),
+    bundle_separation_range=(0.7, 2.4),
+    bundle_direction_jitter_degrees=5.0,
+    bundle_lateral_jitter_fraction=0.20,
+    bundle_axial_jitter_fraction=0.25,
     seed=None,
     save_path=None,
     show=True,
 ):
     from generate_dataset import build_sted_debug_sample
     from src.visualization import StedSynthesisVisualizer
+
+    coherent_bundle_config = None
+    if bundle_phenotype or bundle_probability is not None:
+        coherent_bundle_config = {
+            "probability": 1.0 if bundle_probability is None else float(bundle_probability),
+            "size_range": tuple(bundle_size_range),
+            "separation_range": tuple(bundle_separation_range),
+            "direction_jitter_degrees": float(bundle_direction_jitter_degrees),
+            "lateral_jitter_fraction": float(bundle_lateral_jitter_fraction),
+            "axial_jitter_fraction": float(bundle_axial_jitter_fraction),
+        }
 
     debug_data = build_sted_debug_sample(
         tuple(bounds),
@@ -357,12 +398,29 @@ def show_sted_debug(
         soft_skeleton_alpha=soft_skeleton_alpha,
         visibility_weight_floor=visibility_weight_floor,
         seed=seed,
+        coherent_bundle_config=coherent_bundle_config,
     )
     StedSynthesisVisualizer.show_sted_debug_summary(
         debug_data,
         save_path=save_path,
         show=show,
     )
+
+    bundle_details = debug_data.get("coherent_bundle_details", [])
+    coherent_count = sum(1 for detail in bundle_details if detail.get("mode") == "coherent")
+    coherent_sizes = [detail.get("bundle_size", 1) for detail in bundle_details if detail.get("mode") == "coherent"]
+    coherent_separations = [
+        detail.get("separation", 0.0)
+        for detail in bundle_details
+        if detail.get("mode") == "coherent"
+    ]
+    bundle_summary = "coherent_bundles=0"
+    if coherent_count > 0:
+        bundle_summary = (
+            f"coherent_bundles={coherent_count}, "
+            f"bundle_size_range={min(coherent_sizes)}-{max(coherent_sizes)}, "
+            f"separation_range={min(coherent_separations):.2f}-{max(coherent_separations):.2f}"
+        )
 
     print(
         "Generated STED debug sample "
@@ -377,7 +435,8 @@ def show_sted_debug(
         f"noise_level={debug_data['noise_level']:.4f}, "
         f"noise_n={debug_data['noise_level_normalized']:.4f}, "
         f"monomer_regime={debug_data.get('monomer_regime', 'n/a')}, "
-        f"monomer_amp={debug_data.get('monomer_amplitude', 0.0):.4f})."
+        f"monomer_amp={debug_data.get('monomer_amplitude', 0.0):.4f}, "
+        f"{bundle_summary})."
     )
     if save_path is not None:
         print(f"Saved debug summary to: {save_path}")
@@ -425,6 +484,49 @@ if __name__ == "__main__":
         type=float,
         default=0.03,
         help="Minimum axial visibility weight for 2D STED visibility targets in --sted-debug mode.",
+    )
+    parser.add_argument(
+        "--bundle_phenotype",
+        action="store_true",
+        help="Force coherent longitudinal fiber bundles in --sted-debug mode.",
+    )
+    parser.add_argument(
+        "--bundle_probability",
+        type=float,
+        default=None,
+        help="Probability of rendering each backbone as a coherent bundle in --sted-debug mode.",
+    )
+    parser.add_argument(
+        "--bundle_size_range",
+        type=int,
+        nargs=2,
+        default=[2, 6],
+        help="Inclusive min/max number of individual fibers in coherent bundles.",
+    )
+    parser.add_argument(
+        "--bundle_separation_range",
+        type=float,
+        nargs=2,
+        default=[0.7, 2.4],
+        help="Min/max lateral separation in voxels between adjacent fibers in coherent bundles.",
+    )
+    parser.add_argument(
+        "--bundle_direction_jitter_degrees",
+        type=float,
+        default=5.0,
+        help="Maximum per-strand angular drift in degrees for coherent bundles.",
+    )
+    parser.add_argument(
+        "--bundle_lateral_jitter_fraction",
+        type=float,
+        default=0.20,
+        help="Low-frequency lateral wander as a fraction of coherent bundle separation.",
+    )
+    parser.add_argument(
+        "--bundle_axial_jitter_fraction",
+        type=float,
+        default=0.25,
+        help="Axial strand offset as a fraction of coherent bundle separation.",
     )
     parser.add_argument("--split", type=str, choices=["train", "val", "test"], default="train", help="Split used with --data-dir")
     parser.add_argument("--index", type=int, default=0, help="Sample index used with --data-dir")
@@ -491,6 +593,13 @@ if __name__ == "__main__":
             annotation_weight_floor=args.annotation_weight_floor,
             soft_skeleton_alpha=args.soft_skeleton_alpha,
             visibility_weight_floor=args.visibility_weight_floor,
+            bundle_phenotype=args.bundle_phenotype,
+            bundle_probability=args.bundle_probability,
+            bundle_size_range=args.bundle_size_range,
+            bundle_separation_range=args.bundle_separation_range,
+            bundle_direction_jitter_degrees=args.bundle_direction_jitter_degrees,
+            bundle_lateral_jitter_fraction=args.bundle_lateral_jitter_fraction,
+            bundle_axial_jitter_fraction=args.bundle_axial_jitter_fraction,
             seed=args.seed,
             save_path=args.save,
             show=not args.no_show,

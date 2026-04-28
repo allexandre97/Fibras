@@ -40,10 +40,9 @@ The main scripts are:
 \begin{itemize}
     \item \texttt{analyze\_real\_sted.py}: measure real-image intensity, foreground, skeleton, noise, stripe, and vignette statistics.
     \item \texttt{generate\_dataset.py}: build train/validation/test \texttt{.pt} datasets.
-    \item \texttt{train.py}: train \texttt{STEDResUNet2D}.
-    \item \texttt{test.py}: evaluate a saved checkpoint on the held-out split.
-    \item \texttt{inference.py}: predict dense fields on a 2D image and export TIFF outputs.
-    \item \texttt{visual.py} and \texttt{visualize\_dataset.py}: inspect datasets, predictions, and STED synthesis debug views.
+    \item \texttt{train.py}: train or evaluate \texttt{STEDResUNet2D}.
+    \item \texttt{inference.py}: run single-image, batch, or decoder-calibration inference.
+    \item \texttt{visual.py}: inspect datasets, predictions, and STED synthesis debug views.
 \end{itemize}
 
 \section{Data Representation}
@@ -75,12 +74,10 @@ unstable.
 \section{Synthetic Geometry}
 
 The geometry layer is built from \texttt{FiberSegment} objects, each holding a
-start point, end point, and thickness multiplier. The project supports several
-generators in \texttt{src/synthesis.py}:
+start point, end point, and thickness multiplier. The current generator in
+\texttt{src/synthesis.py} is:
 \begin{itemize}
     \item \texttt{RandomWalkGenerator}: constrained short fibers with bounded turn angles.
-    \item \texttt{SpaceColonizationGenerator}: branching tree-like structures.
-    \item \texttt{CompositeGenerator}: mixtures of multiple generators.
 \end{itemize}
 
 The current 2D STED path primarily uses constrained 3D random walks. A synthetic
@@ -201,10 +198,8 @@ heads:
     f_{\theta}(X) =
     \left[\hat{D},\; \hat{C},\; \hat{S},\; \hat{L}_V\right],
 \end{equation}
-where $\hat{L}_V$ is a visibility logit. The older \texttt{FlexibleCVFUNet}
-class remains in the codebase as a generic 2D/3D U-Net, but the upgraded training,
-testing, and inference paths require \texttt{--dim 2} and use
-\texttt{STEDResUNet2D}.
+where $\hat{L}_V$ is a visibility logit. Training, evaluation, and inference are
+explicitly 2D and use \texttt{STEDResUNet2D}.
 
 \section{Training Objective}
 
@@ -281,15 +276,6 @@ preserve streamline momentum. The exported products include:
     \item \texttt{\_pred\_orient\_conf.tif}: orientation-channel confidence.
 \end{itemize}
 
-\section{Legacy and Supporting Modules}
-
-Some modules still support older or auxiliary workflows. The volume-generation
-branch can produce 3D samples with EDT and vector targets, and
-\texttt{src/analysis.py} still contains direct density, topology, Hessian, and
-structure-tensor analyzers. These are not the main upgraded STED training path.
-They are useful as reference utilities, but current model training, evaluation,
-and inference are explicitly 2D.
-
 \section{Validation Coverage}
 
 The test suite focuses on the behavior most likely to regress:
@@ -314,7 +300,7 @@ A calibrated end-to-end run starts by measuring real images:
 \begin{quote}
 \small
 \begin{verbatim}
-python analyze_real_sted.py \
+python analyze_real_sted.py profile-real \
   --real_dir /path/to/real \
   --output_dir reports/sted_real \
   --patch_size 512
@@ -328,7 +314,6 @@ python generate_dataset.py \
   --output_dir /path/to/sted2d \
   --bounds 1024 1024 \
   --synth_depth 16 \
-  --synthesis_mode calibrated \
   --calibration_profile reports/sted_real/sted_real_profile.json
 \end{verbatim}
 \end{quote}
@@ -336,14 +321,14 @@ Training then consumes the generated split directories:
 \begin{quote}
 \small
 \begin{verbatim}
-python train.py \
+python train.py fit \
   --gpus 0 \
   --data_dir /path/to/sted2d \
   --dim 2 \
   --crop_size 512
 \end{verbatim}
 \end{quote}
-A saved checkpoint can be evaluated with \texttt{test.py} or applied to new
-images with \texttt{inference.py}.
+A saved checkpoint can be evaluated with \texttt{train.py evaluate} or applied
+to new images with \texttt{inference.py single}.
 
 \end{document}

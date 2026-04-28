@@ -1,6 +1,6 @@
 import unittest
 
-from calibrate_inference import _combined_score, _pareto_front
+from src.inference_calibration import _combined_score, _pareto_front
 
 
 class CalibrateInferenceTests(unittest.TestCase):

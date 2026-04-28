@@ -676,8 +676,7 @@ def main(args):
         )
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Calibrate EDT+visibility decoder parameters against synthetic and real data.")
+def add_calibration_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--base_filters", type=int, default=32)
     parser.add_argument("--device", type=str, default="auto")
@@ -700,5 +699,10 @@ if __name__ == "__main__":
     parser.add_argument("--visibility_floor_values", type=float, nargs="+", default=[0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40])
     parser.add_argument("--max_blank_nonempty_rate", type=float, default=0.10)
     parser.add_argument("--max_blank_skeleton_fraction", type=float, default=0.00005)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Calibrate EDT+visibility decoder parameters against synthetic and real data.")
+    add_calibration_arguments(parser)
     args = parser.parse_args()
     main(args)

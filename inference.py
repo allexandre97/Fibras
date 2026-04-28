@@ -1,5 +1,8 @@
 import argparse
+import sys
 
+from src.batch_inference import add_batch_arguments, main as batch_main
+from src.inference_calibration import add_calibration_arguments, main as calibrate_main
 from src.real_inference import (
     add_inference_arguments,
     build_output_paths,
@@ -14,7 +17,7 @@ from src.real_inference import (
 )
 
 
-def main(args):
+def run_single(args):
     if args.dim != 2:
         raise ValueError("The upgraded STED inference path is 2D only. Use --dim 2.")
 
@@ -60,8 +63,40 @@ def main(args):
         show_interactive_result(result)
 
 
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="2D STED inference tools.")
+    subparsers = parser.add_subparsers(dest="mode")
+
+    single_parser = subparsers.add_parser("single", help="Run inference on one image")
+    add_inference_arguments(single_parser)
+
+    batch_parser = subparsers.add_parser("batch", help="Run inference on a directory of TIFF images")
+    add_batch_arguments(batch_parser)
+
+    calibrate_parser = subparsers.add_parser("calibrate-decoder", help="Calibrate decoder parameters")
+    add_calibration_arguments(calibrate_parser)
+
+    return parser
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    parser = build_parser()
+
+    # Preserve the old single-image invocation style: python inference.py --model_path ...
+    if argv and argv[0] not in {"single", "batch", "calibrate-decoder", "-h", "--help"}:
+        argv = ["single", *argv]
+
+    args = parser.parse_args(argv)
+    if args.mode == "single":
+        run_single(args)
+    elif args.mode == "batch":
+        batch_main(args)
+    elif args.mode == "calibrate-decoder":
+        calibrate_main(args)
+    else:
+        parser.print_help()
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    add_inference_arguments(parser)
-    args = parser.parse_args()
-    main(args)
+    main()

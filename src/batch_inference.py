@@ -397,8 +397,7 @@ def main(args):
         )
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run tiled inference on a directory of real 2D STED TIFF images.")
+def add_batch_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input_dir", type=str, required=True, help="Directory containing real TIFF images.")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory where inference artifacts will be written.")
     parser.add_argument("--recursive", action="store_true", help="Recursively discover TIFF files under --input_dir.")
@@ -432,5 +431,10 @@ if __name__ == "__main__":
         include_visualize=False,
         include_preview_options=False,
     )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run tiled inference on a directory of real 2D STED TIFF images.")
+    add_batch_arguments(parser)
     args = parser.parse_args()
     main(args)

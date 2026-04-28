@@ -1,15 +1,6 @@
 import numpy as np
 
 
-class VolumetricVisualizer:
-    """Handles true 3D scalar field rendering using Mayavi."""
-
-    def __init__(self, density_volume: np.ndarray):
-        if density_volume.ndim != 3:
-            raise ValueError(f"Expected 3D array, got {density_volume.ndim}D array.")
-        self.volume = density_volume
-
-
 class AdvancedVisualizer:
     """Advanced tools for spatial resolution of analysis results."""
 
@@ -189,15 +180,27 @@ class StedSynthesisVisualizer:
         slab_scale = float(debug_data.get("label_slab_scale", 1.0))
         annotation_weight_floor = float(debug_data.get("annotation_weight_floor", 0.25))
         soft_alpha = float(debug_data.get("soft_skeleton_alpha", 0.0))
+        bundle_details = debug_data.get("coherent_bundle_details", [])
+        coherent_details = [detail for detail in bundle_details if detail.get("mode") == "coherent"]
+        bundle_title = f"fibers={debug_data['fiber_count']}"
+        if coherent_details:
+            sizes = [int(detail.get("bundle_size", 1)) for detail in coherent_details]
+            separations = [float(detail.get("separation", 0.0)) for detail in coherent_details]
+            bundle_title = (
+                f"coherent={len(coherent_details)} | "
+                f"n={min(sizes)}-{max(sizes)} | sep={min(separations):.1f}-{max(separations):.1f}"
+            )
         edt_focus = debug_data.get("edt_focus", debug_data["edt_target"])
         edt_target = debug_data["edt_target"]
         visibility_target = debug_data["visibility_target"]
+        bundle_count_target = debug_data.get("bundle_count_target")
+        bundle_count_normalizer = float(debug_data.get("bundle_count_normalizer", 1.0))
         focus_core_mask = edt_focus > 0.85
         annotation_mask = edt_target > 0.15
         panels = [
             StedSynthesisVisualizer._make_pil_image_panel(
                 fiber_signal_volume.max(axis=2),
-                f"Fiber-Only MIP | fibers={debug_data['fiber_count']}",
+                f"Fiber-Only MIP | {bundle_title}",
             ),
             StedSynthesisVisualizer._make_pil_image_panel(
                 monomer_volume.max(axis=2),
@@ -227,6 +230,14 @@ class StedSynthesisVisualizer:
                     (focus_core_mask, (0, 255, 255)),
                 ],
             ),
+            StedSynthesisVisualizer._make_pil_image_panel(
+                np.zeros_like(visibility_target) if bundle_count_target is None else bundle_count_target * bundle_count_normalizer,
+                "Bundle Count Target",
+                mask_overlays=[
+                    (annotation_mask, (255, 255, 255)),
+                    (focus_core_mask, (0, 255, 255)),
+                ],
+            ),
             StedSynthesisVisualizer._make_pil_profile_panel(
                 debug_data["axial_signal_profile"],
                 debug_data["axial_weights"],
@@ -240,7 +251,7 @@ class StedSynthesisVisualizer:
 
         gap = 12
         tile_w, tile_h = panels[0].size
-        sheet = Image.new("RGB", (tile_w * 3 + gap * 4, tile_h * 2 + gap * 3), color=(8, 8, 8))
+        sheet = Image.new("RGB", (tile_w * 3 + gap * 4, tile_h * 3 + gap * 4), color=(8, 8, 8))
 
         for idx, panel in enumerate(panels):
             row = idx // 3
@@ -269,11 +280,23 @@ class StedSynthesisVisualizer:
         slab_scale = float(debug_data.get("label_slab_scale", 1.0))
         annotation_weight_floor = float(debug_data.get("annotation_weight_floor", 0.25))
         soft_alpha = float(debug_data.get("soft_skeleton_alpha", 0.0))
+        bundle_details = debug_data.get("coherent_bundle_details", [])
+        coherent_details = [detail for detail in bundle_details if detail.get("mode") == "coherent"]
+        bundle_title = f"{debug_data['fiber_count']} fibers"
+        if coherent_details:
+            sizes = [int(detail.get("bundle_size", 1)) for detail in coherent_details]
+            separations = [float(detail.get("separation", 0.0)) for detail in coherent_details]
+            bundle_title = (
+                f"{len(coherent_details)} coherent bundles, "
+                f"n={min(sizes)}-{max(sizes)}, sep={min(separations):.1f}-{max(separations):.1f}"
+            )
         weighted_slice = debug_data["weighted_slice"]
         final_slice = debug_data["final_slice"]
         edt_focus = debug_data.get("edt_focus", debug_data["edt_target"])
         edt_target = debug_data["edt_target"]
         visibility_target = debug_data["visibility_target"]
+        bundle_count_target = debug_data.get("bundle_count_target")
+        bundle_count_normalizer = float(debug_data.get("bundle_count_normalizer", 1.0))
         axial_weights = debug_data["axial_weights"]
         axial_signal = debug_data["axial_signal_profile"]
         lateral_sigmas = debug_data["lateral_sigmas"]
@@ -286,13 +309,13 @@ class StedSynthesisVisualizer:
         focus_core_mask = edt_focus > 0.85
         annotation_mask = edt_target > 0.15
 
-        fig, axes = plt.subplots(2, 3, figsize=(15, 9), constrained_layout=True)
+        fig, axes = plt.subplots(2, 4, figsize=(18, 9), constrained_layout=True)
         axes = axes.ravel()
 
         StedSynthesisVisualizer._show_xy(
             axes[0],
             fiber_mip_xy,
-            f"Fiber-Only MIP\n{debug_data['fiber_count']} fibers, z={signal_volume.shape[2]}",
+            f"Fiber-Only MIP\n{bundle_title}, z={signal_volume.shape[2]}",
         )
 
         StedSynthesisVisualizer._show_xy(
@@ -342,34 +365,52 @@ class StedSynthesisVisualizer:
         )
         axes[4].contour(focus_core_mask.T.astype(float), levels=[0.5], colors="cyan", linewidths=1.2)
 
+        StedSynthesisVisualizer._show_xy(
+            axes[5],
+            np.zeros_like(visibility_target) if bundle_count_target is None else bundle_count_target * bundle_count_normalizer,
+            "Bundle Count Target",
+            cmap="plasma",
+            vmin=0.0,
+            vmax=bundle_count_normalizer,
+        )
+        axes[5].contour(
+            annotation_mask.T.astype(float),
+            levels=[0.5],
+            colors="white",
+            linewidths=1.0,
+            linestyles="dashed",
+        )
+        axes[5].contour(focus_core_mask.T.astype(float), levels=[0.5], colors="cyan", linewidths=1.2)
+
         z_axis = np.arange(signal_volume.shape[2], dtype=float)
         normalized_signal = axial_signal / max(axial_signal.max(), 1e-8)
         normalized_weights = axial_weights / max(axial_weights.max(), 1e-8)
         normalized_blur = lateral_sigmas / max(lateral_sigmas.max(), 1e-8)
 
-        axes[5].plot(z_axis, normalized_signal, label="signal per z", color="tab:orange", linewidth=2.0)
-        axes[5].plot(z_axis, normalized_weights, label="axial weight", color="tab:blue", linewidth=2.0)
-        axes[5].plot(z_axis, normalized_blur, label="relative blur", color="tab:red", linewidth=2.0)
-        axes[5].axvline(slice_center, color="black", linestyle="--", linewidth=1.0, label="slice center")
-        axes[5].axvspan(
+        axes[6].plot(z_axis, normalized_signal, label="signal per z", color="tab:orange", linewidth=2.0)
+        axes[6].plot(z_axis, normalized_weights, label="axial weight", color="tab:blue", linewidth=2.0)
+        axes[6].plot(z_axis, normalized_blur, label="relative blur", color="tab:red", linewidth=2.0)
+        axes[6].axvline(slice_center, color="black", linestyle="--", linewidth=1.0, label="slice center")
+        axes[6].axvspan(
             slice_center - (axial_fwhm / 2.0),
             slice_center + (axial_fwhm / 2.0),
             color="gold",
             alpha=0.15,
             label="axial FWHM",
         )
-        axes[5].axvspan(
+        axes[6].axvspan(
             slice_center - (slab_thickness / 2.0),
             slice_center + (slab_thickness / 2.0),
             color="tab:green",
             alpha=0.2,
             label="focus slab",
         )
-        axes[5].set_title("Axial Profile")
-        axes[5].set_xlabel("z")
-        axes[5].set_ylabel("normalized value")
-        axes[5].set_ylim(0.0, 1.05)
-        axes[5].legend(loc="upper right")
+        axes[6].set_title("Axial Profile")
+        axes[6].set_xlabel("z")
+        axes[6].set_ylabel("normalized value")
+        axes[6].set_ylim(0.0, 1.05)
+        axes[6].legend(loc="upper right")
+        axes[7].axis("off")
 
         fig.suptitle("STED Synthesis Debug Summary", fontsize=14)
 

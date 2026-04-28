@@ -35,6 +35,7 @@ def evaluate_model(args):
         centerline_warmup_epochs=args.centerline_warmup_epochs,
         centerline_warmup_start_factor=args.centerline_warmup_start_factor,
         radius_weight=args.radius_loss_weight,
+        bundle_count_weight=args.bundle_count_loss_weight,
         centerline_threshold=args.centerline_threshold,
         score_stability_weight=args.score_stability_weight,
         stability_margin_weight=args.stability_margin_weight,
@@ -50,6 +51,7 @@ def evaluate_model(args):
         "orientation": 0.0,
         "traceability": 0.0,
         "radius": 0.0,
+        "bundle_count": 0.0,
         "threshold_sensitivity": 0.0,
     }
     
@@ -73,6 +75,7 @@ def evaluate_model(args):
             total_metrics["orientation"] += components["orientation"].item()
             total_metrics["traceability"] += components["traceability"].item()
             total_metrics["radius"] += components["radius"].item()
+            total_metrics["bundle_count"] += components["bundle_count"].item()
             total_metrics["threshold_sensitivity"] += components["threshold_sensitivity"].item()
 
     n_batches = len(test_loader)
@@ -87,11 +90,11 @@ def evaluate_model(args):
     print(f"Average Orientation: {total_metrics['orientation'] / n_batches:.4f}")
     print(f"Average Traceability: {total_metrics['traceability'] / n_batches:.4f}")
     print(f"Average Radius: {total_metrics['radius'] / n_batches:.4f}")
+    print(f"Average Bundle Count: {total_metrics['bundle_count'] / n_batches:.4f}")
     print(f"Average Threshold Sensitivity: {total_metrics['threshold_sensitivity'] / n_batches:.4f}")
     print("---------------------------------------------")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate CVFUNet on Test Set")
+def add_evaluate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--model_path', type=str, required=True, help="Path to the .pth file")
     parser.add_argument('--data_dir', type=str, required=True, help="Path to base dataset folder")
     parser.add_argument('--dim', type=int, choices=[2], default=2)
@@ -104,6 +107,7 @@ if __name__ == "__main__":
     parser.add_argument('--orientation_mask_floor', '--centerline_support_floor', dest='orientation_mask_floor', type=float, default=0.15)
     parser.add_argument('--loss_visibility_floor', type=float, default=0.25)
     parser.add_argument('--radius_loss_weight', type=float, default=0.15)
+    parser.add_argument('--bundle_count_loss_weight', type=float, default=0.15)
     parser.add_argument('--train_centerline_weight', type=float, default=1.0)
     parser.add_argument('--score_centerline_weight', '--skeleton_score_weight', dest='score_centerline_weight', type=float, default=1.0)
     parser.add_argument('--centerline_warmup_epochs', type=int, default=0)
@@ -111,6 +115,11 @@ if __name__ == "__main__":
     parser.add_argument('--centerline_threshold', type=float, default=0.5)
     parser.add_argument('--stability_margin_weight', type=float, default=0.2)
     parser.add_argument('--score_stability_weight', type=float, default=0.2)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Evaluate STEDResUNet2D on the test set")
+    add_evaluate_arguments(parser)
     
     args = parser.parse_args()
     evaluate_model(args)

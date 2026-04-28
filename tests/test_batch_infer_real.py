@@ -1,6 +1,6 @@
 import unittest
 
-from batch_infer_real import _select_image_paths
+from src.batch_inference import _select_image_paths
 
 
 class BatchInferSelectionTests(unittest.TestCase):

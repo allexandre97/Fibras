@@ -63,7 +63,7 @@ def _render_3d_numba(density_map, starts, ends, thicknesses, base_sigma):
                         density_map[i, j, k] = density
 
 
-class NDimRasterizer:
+class _SegmentRasterizer:
     def __init__(self, grid_shape: Tuple[int, ...], base_sigma: float):
         self.grid_shape = grid_shape
         self.dims = len(grid_shape)
@@ -276,7 +276,7 @@ class EmpiricalRasterizer:
 
     def _rasterize_signal_volume(self, list_of_segment_lists, dynamic_range):
         volume = np.zeros(self.bounds, dtype=np.float64)
-        base_rasterizer = NDimRasterizer(self.bounds, self.base_sigma)
+        base_rasterizer = _SegmentRasterizer(self.bounds, self.base_sigma)
         min_intensity, max_intensity = dynamic_range
 
         punctate_sigma = (

@@ -46,16 +46,6 @@ class BoundaryCondition:
     def apply_step(self, pos: np.ndarray, vec: np.ndarray, thickness: float) -> Tuple[List[FiberSegment], np.ndarray, np.ndarray, bool]:
         raise NotImplementedError
 
-class DissipativeBoundary(BoundaryCondition):
-    def apply_step(self, pos: np.ndarray, vec: np.ndarray, thickness: float):
-        t, _ = self._get_intersection(pos, vec)
-        if t >= 1.0:
-            end_pos = pos + vec
-            return [FiberSegment(pos.copy(), end_pos.copy(), thickness)], end_pos, vec / np.linalg.norm(vec), True
-        else:
-            hit_pos = pos + vec * t
-            return [FiberSegment(pos.copy(), hit_pos.copy(), thickness)], hit_pos, np.zeros_like(vec), False
-
 class ReflectiveBoundary(BoundaryCondition):
     def apply_step(self, pos: np.ndarray, vec: np.ndarray, thickness: float):
         segments = []
@@ -77,34 +67,6 @@ class ReflectiveBoundary(BoundaryCondition):
             curr_vec[hit_dim] *= -1.0       
             
             curr_pos = hit_pos
-            curr_pos[hit_dim] += np.sign(curr_vec[hit_dim]) * 1e-6
-            
-        return segments, curr_pos, curr_vec / np.linalg.norm(curr_vec), False
-
-class PeriodicBoundary(BoundaryCondition):
-    def apply_step(self, pos: np.ndarray, vec: np.ndarray, thickness: float):
-        segments = []
-        curr_pos = pos.copy()
-        curr_vec = vec.copy()
-        
-        for _ in range(10):
-            t, hit_dim = self._get_intersection(curr_pos, curr_vec)
-            if t >= 1.0:
-                end_pos = curr_pos + curr_vec
-                segments.append(FiberSegment(curr_pos.copy(), end_pos.copy(), thickness))
-                heading = curr_vec / np.linalg.norm(curr_vec)
-                return segments, end_pos, heading, True
-            
-            hit_pos = curr_pos + curr_vec * t
-            segments.append(FiberSegment(curr_pos.copy(), hit_pos.copy(), thickness))
-            
-            curr_pos = hit_pos.copy()
-            if curr_vec[hit_dim] > 0:
-                curr_pos[hit_dim] = 0.0
-            else:
-                curr_pos[hit_dim] = self.bounds[hit_dim]
-                
-            curr_vec = curr_vec * (1.0 - t)
             curr_pos[hit_dim] += np.sign(curr_vec[hit_dim]) * 1e-6
             
         return segments, curr_pos, curr_vec / np.linalg.norm(curr_vec), False

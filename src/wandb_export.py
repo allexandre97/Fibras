@@ -10,14 +10,14 @@ def _is_scalar(value):
     return isinstance(value, (str, int, float, bool)) or value is None
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Download a W&B sweep run table to CSV and JSON.")
+def add_export_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--entity", required=True)
     parser.add_argument("--project", required=True)
     parser.add_argument("--sweep_id", required=True)
     parser.add_argument("--output_dir", default="reports/wandb")
-    args = parser.parse_args()
 
+
+def export_runs(args) -> None:
     api = wandb.Api()
     sweep = api.sweep(f"{args.entity}/{args.project}/{args.sweep_id}")
 
@@ -66,6 +66,12 @@ def main():
     print(csv_path)
     print(json_path)
     print(json.dumps(meta, indent=2, sort_keys=True))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Download a W&B sweep run table to CSV and JSON.")
+    add_export_arguments(parser)
+    export_runs(parser.parse_args())
 
 
 if __name__ == "__main__":

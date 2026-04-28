@@ -16,12 +16,13 @@ def _logit(value: float) -> float:
 
 class StedOrientationTests(unittest.TestCase):
     def _make_target(self, width: int = 8, height: int = 8, row: int = 3, cols=range(2, 6)):
-        target = torch.zeros((1, 5, height, width), dtype=torch.float32)
+        target = torch.zeros((1, 6, height, width), dtype=torch.float32)
         for col in cols:
             target[:, 0, row, col] = 1.0
             target[:, 1, row, col] = 1.0  # cos(2theta)=1, sin(2theta)=0 for a horizontal tangent
             target[:, 3, row, col] = 1.0
             target[:, 4, row, col] = 0.6
+            target[:, 5, row, col] = 1.0 / 6.0
         return target
 
     def _make_prediction(
@@ -33,16 +34,19 @@ class StedOrientationTests(unittest.TestCase):
         centerline_prob: float = 0.97,
         traceability_prob: float = 0.95,
         radius_value: float = 0.6,
+        bundle_count_value: float = 1.0 / 6.0,
     ):
-        pred = torch.zeros((1, 5, height, width), dtype=torch.float32)
+        pred = torch.zeros((1, 6, height, width), dtype=torch.float32)
         pred[:, 0] = _logit(0.01)
         pred[:, 3] = _logit(0.02)
         pred[:, 4] = _logit(0.05)
+        pred[:, 5] = _logit(0.05)
         for col in cols:
             pred[:, 0, row, col] = _logit(centerline_prob)
             pred[:, 1, row, col] = 1.0
             pred[:, 3, row, col] = _logit(traceability_prob)
             pred[:, 4, row, col] = _logit(radius_value)
+            pred[:, 5, row, col] = _logit(bundle_count_value)
         return pred
 
     def test_double_angle_orientation_is_sign_invariant(self):
@@ -135,6 +139,7 @@ class StedOrientationTests(unittest.TestCase):
             orientation_weight=0.7,
             visibility_weight=0.3,
             radius_weight=0.4,
+            bundle_count_weight=0.6,
             train_centerline_weight=0.2,
             stability_margin_weight=0.5,
             centerline_warmup_epochs=0,
@@ -148,6 +153,7 @@ class StedOrientationTests(unittest.TestCase):
             + criterion.orientation_weight * components["orientation"]
             + criterion.traceability_weight * components["traceability"]
             + criterion.radius_weight * components["radius"]
+            + criterion.bundle_count_weight * components["bundle_count"]
             + criterion.stability_margin_weight * components["stability_margin"]
         )
 
@@ -176,11 +182,11 @@ class StedOrientationTests(unittest.TestCase):
             device=torch.device("cpu"),
             tile_size=32,
             overlap=8,
-            output_channels=5,
+            output_channels=6,
             use_amp=False,
         )
 
-        self.assertEqual(pred.shape, (5, 40, 52))
+        self.assertEqual(pred.shape, (6, 40, 52))
 
 
 if __name__ == "__main__":

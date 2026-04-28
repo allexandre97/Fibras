@@ -481,7 +481,8 @@ class CalibrationSampler:
         else:
             bundle_probs = (0.78, 0.20, 0.02)
 
-        base_sigma = _clip(width_median / 2.35, 0.55, 2.20)
+        apparent_width = max(width_median, 0.75 * width_p90)
+        base_sigma = _clip(apparent_width / 2.35, 0.90, 2.80)
         noise_level = _clip(0.005 + (bg_highfreq / 0.030) * 0.040, 0.005, 0.045)
         debris_density = component_count / max(float(self.profile.get("patch_size", DEFAULT_PATCH_SIZE)) ** 2, 1.0)
         debris_count = int(np.clip(area * debris_density * 0.15, 0, max(1, area / 1024.0)))

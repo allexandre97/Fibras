@@ -1,6 +1,7 @@
 import os
 import time
 import argparse
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,10 +32,10 @@ class PrecomputedFiberDataset(Dataset):
         target_schema = data.get("target_schema", "legacy")
         
         if self.dim == 2:
-            if target_schema != "structural_v1" or targets.shape[0] < 5:
+            if target_schema != "structural_v2" or targets.shape[0] != 6:
                 raise ValueError(
-                    "This training path expects 2D samples with target_schema='structural_v1' "
-                    "and 5 target channels (centerline, orientation, traceability, radius). "
+                    "This training path expects 2D samples with target_schema='structural_v2' "
+                    "and 6 target channels (centerline, orientation, traceability, radius, bundle count). "
                     "Regenerate the dataset with the upgraded structural target pipeline."
                 )
             vol = vol.squeeze(1)
@@ -62,79 +63,6 @@ class PrecomputedFiberDataset(Dataset):
 
         return vol[:, y0:y0 + crop_h, x0:x0 + crop_w], targets[:, y0:y0 + crop_h, x0:x0 + crop_w]
 
-class MaskedVectorLoss(nn.Module):
-    def __init__(
-        self,
-        vector_weight: float = 1.0,
-        visibility_weight: float = 0.35,
-        dim: int = 3,
-        vector_mask_floor: float = 0.05,
-        loss_visibility_floor: float = 0.25,
-    ):
-        super().__init__()
-        self.mse = nn.MSELoss(reduction='none')
-        self.vector_weight = vector_weight
-        self.visibility_weight = visibility_weight
-        self.dim = dim
-        if vector_mask_floor < 0.0:
-            raise ValueError("vector_mask_floor must be non-negative.")
-        if loss_visibility_floor < 0.0 or loss_visibility_floor > 1.0:
-            raise ValueError("loss_visibility_floor must be in the interval [0, 1].")
-        self.vector_mask_floor = vector_mask_floor
-        self.loss_visibility_floor = loss_visibility_floor
-
-    def compute_components(self, pred, target):
-        pred_edt, pred_vec = pred[:, 0:1], pred[:, 1:1+self.dim]
-        targ_edt, targ_vec = target[:, 0:1], target[:, 1:1+self.dim]
-        vis_conf = None
-
-        if self.dim == 2:
-            targ_visibility = target[:, 3:4]
-            vis_conf = torch.clamp(targ_visibility, self.loss_visibility_floor, 1.0)
-
-        # 1. EDT Regression (visibility-weighted in 2D STED)
-        edt_err = self.mse(pred_edt, targ_edt)
-        if vis_conf is None:
-            loss_edt = edt_err.mean()
-        else:
-            vis_sum = vis_conf.sum() + 1e-8
-            loss_edt = (edt_err * vis_conf).sum() / vis_sum
-
-        # 2. Sign-Agnostic Vector Regression (Symmetric MSE)
-        mask_conf = torch.clamp(targ_edt, 0.0, 1.0)
-        mask = (mask_conf > self.vector_mask_floor).float() * mask_conf
-        if vis_conf is not None:
-            mask = mask * vis_conf
-        
-        # Calculate squared errors for both orientations, averaged across channels to maintain scale
-        err_pos = torch.sum((pred_vec - targ_vec)**2, dim=1, keepdim=True) / self.dim
-        err_neg = torch.sum((pred_vec + targ_vec)**2, dim=1, keepdim=True) / self.dim
-        
-        # Backpropagate strictly through the orientation that yields the lowest error
-        loss_vec_raw = torch.min(err_pos, err_neg) * mask
-        
-        mask_sum = mask.sum() + 1e-8 
-        loss_vec = loss_vec_raw.sum() / mask_sum
-
-        components = {
-            "edt": loss_edt,
-            "vector": loss_vec,
-        }
-
-        if self.dim == 2:
-            pred_visibility = pred[:, 3:4]
-            components["visibility"] = F.binary_cross_entropy_with_logits(pred_visibility, targ_visibility)
-
-        return components
-
-    def forward(self, pred, target):
-        components = self.compute_components(pred, target)
-        total_loss = components["edt"] + self.vector_weight * components["vector"]
-        if self.dim == 2:
-            total_loss = total_loss + self.visibility_weight * components["visibility"]
-        return total_loss
-
-
 class StedFieldLoss2D(nn.Module):
     def __init__(
         self,
@@ -150,6 +78,7 @@ class StedFieldLoss2D(nn.Module):
         centerline_warmup_epochs: int = 0,
         centerline_warmup_start_factor: float = 1.0,
         radius_weight: float = 0.15,
+        bundle_count_weight: float = 0.15,
         centerline_threshold: float = 0.5,
         centerline_focal_weight: float = 1.0,
         centerline_dice_weight: float = 1.0,
@@ -182,6 +111,7 @@ class StedFieldLoss2D(nn.Module):
         self.centerline_warmup_start_factor = float(centerline_warmup_start_factor)
         self._current_train_centerline_weight = self.train_centerline_weight
         self.radius_weight = float(radius_weight)
+        self.bundle_count_weight = float(bundle_count_weight)
         self.centerline_threshold = float(centerline_threshold)
         self.centerline_focal_weight = float(centerline_focal_weight)
         self.centerline_dice_weight = float(centerline_dice_weight)
@@ -292,11 +222,13 @@ class StedFieldLoss2D(nn.Module):
         pred_orientation = pred[:, 1:3]
         pred_traceability_logits = pred[:, 3:4]
         pred_radius = torch.sigmoid(pred[:, 4:5])
+        pred_bundle_count = torch.sigmoid(pred[:, 5:6])
 
         target_centerline = target[:, 0:1]
         target_orientation = normalize_orientation_torch(target[:, 1:3])
         target_traceability = target[:, 3:4]
         target_radius = target[:, 4:5]
+        target_bundle_count = target[:, 5:6]
 
         centerline_prob = torch.sigmoid(pred_centerline_logits)
         traceability_conf = torch.clamp(target_traceability, self.traceability_floor, 1.0)
@@ -327,6 +259,8 @@ class StedFieldLoss2D(nn.Module):
         radius_mask = (centerline_conf > self.centerline_support_floor).to(pred.dtype)
         radius_err = F.smooth_l1_loss(pred_radius, target_radius, reduction="none")
         radius_loss = (radius_err * radius_mask).sum() / (radius_mask.sum() + 1e-8)
+        bundle_count_err = F.smooth_l1_loss(pred_bundle_count, target_bundle_count, reduction="none")
+        bundle_count_loss = (bundle_count_err * radius_mask).sum() / (radius_mask.sum() + 1e-8)
         stability_margin = self._stability_margin_loss(centerline_prob, target_centerline)
         threshold_sensitivity = self._threshold_sensitivity(centerline_prob, target_centerline)
 
@@ -338,6 +272,7 @@ class StedFieldLoss2D(nn.Module):
             "orientation": orientation_loss,
             "traceability": traceability_loss,
             "radius": radius_loss,
+            "bundle_count": bundle_count_loss,
             "stability_margin": stability_margin,
             "threshold_sensitivity": threshold_sensitivity,
         }
@@ -348,6 +283,7 @@ class StedFieldLoss2D(nn.Module):
             + self.fixed_orientation_weight * components["orientation"]
             + self.fixed_traceability_weight * components["traceability"]
             + self.radius_weight * components["radius"]
+            + self.bundle_count_weight * components["bundle_count"]
             + self.score_stability_weight * components["threshold_sensitivity"]
         )
 
@@ -358,6 +294,7 @@ class StedFieldLoss2D(nn.Module):
             + self.orientation_weight * components["orientation"]
             + self.traceability_weight * components["traceability"]
             + self.radius_weight * components["radius"]
+            + self.bundle_count_weight * components["bundle_count"]
             + self.stability_margin_weight * components["stability_margin"]
         )
 
@@ -373,6 +310,7 @@ def _empty_metric_totals():
         "orientation": 0.0,
         "traceability": 0.0,
         "radius": 0.0,
+        "bundle_count": 0.0,
         "stability_margin": 0.0,
         "threshold_sensitivity": 0.0,
     }
@@ -389,6 +327,7 @@ def _add_metric_batch(totals, criterion, loss, components):
         "orientation",
         "traceability",
         "radius",
+        "bundle_count",
         "stability_margin",
         "threshold_sensitivity",
     ):
@@ -471,6 +410,7 @@ def train_model(args):
         centerline_warmup_epochs=args.centerline_warmup_epochs,
         centerline_warmup_start_factor=args.centerline_warmup_start_factor,
         radius_weight=args.radius_loss_weight,
+        bundle_count_weight=args.bundle_count_loss_weight,
         centerline_threshold=args.centerline_threshold,
         score_stability_weight=args.score_stability_weight,
         stability_margin_weight=args.stability_margin_weight,
@@ -557,6 +497,7 @@ def train_model(args):
             "val_orientation": val_metrics["orientation"],
             "val_traceability": val_metrics["traceability"],
             "val_radius": val_metrics["radius"],
+            "val_bundle_count": val_metrics["bundle_count"],
             "val_threshold_sensitivity": val_metrics["threshold_sensitivity"],
             "train_centerline_weight": active_train_centerline_weight,
             "score_centerline_weight": criterion.score_centerline_weight,
@@ -569,6 +510,7 @@ def train_model(args):
             f"-> Epoch {epoch+1} Summary: Train: {train_metrics['loss']:.4f} | "
             f"Val Score: {val_metrics['score']:.4f} | Val Loss: {val_metrics['loss']:.4f} | "
             f"Centerline W: {active_train_centerline_weight:.4f} | "
+            f"Bundle: {val_metrics['bundle_count']:.4f} | "
             f"Sens: {val_metrics['threshold_sensitivity']:.4f} | Time: {t_elapsed:.1f}s"
         )
 
@@ -577,8 +519,7 @@ def train_model(args):
             state_dict = model.module.state_dict() if use_data_parallel else model.state_dict()
             torch.save(state_dict, save_path)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Final Training for 2D STED ResUNet")
+def add_train_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--gpus', type=str, default="0")
     parser.add_argument('--data_dir', type=str, required=True)
     parser.add_argument('--dim', type=int, choices=[2], default=2)
@@ -595,6 +536,7 @@ if __name__ == "__main__":
     parser.add_argument('--orientation_mask_floor', '--centerline_support_floor', dest='orientation_mask_floor', type=float, default=0.15)
     parser.add_argument('--loss_visibility_floor', type=float, default=0.25)
     parser.add_argument('--radius_loss_weight', type=float, default=0.15)
+    parser.add_argument('--bundle_count_loss_weight', type=float, default=0.15)
     parser.add_argument('--train_centerline_weight', type=float, default=1.0)
     parser.add_argument('--score_centerline_weight', '--skeleton_score_weight', dest='score_centerline_weight', type=float, default=1.0)
     parser.add_argument('--centerline_warmup_epochs', type=int, default=0)
@@ -608,6 +550,40 @@ if __name__ == "__main__":
     parser.add_argument('--nccl_ib_disable', action='store_true', help="Set NCCL_IB_DISABLE=1 when using --multi_gpu.")
     parser.add_argument('--nccl_debug', type=str, choices=['INFO', 'WARN'], default="", help="Set NCCL_DEBUG when using --multi_gpu.")
     parser.add_argument('--no_wandb', action='store_true')
-    
-    args = parser.parse_args()
-    train_model(args)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="2D STED ResUNet training and evaluation.")
+    subparsers = parser.add_subparsers(dest="mode")
+
+    fit_parser = subparsers.add_parser("fit", help="Train STEDResUNet2D")
+    add_train_arguments(fit_parser)
+
+    from src.evaluation import add_evaluate_arguments
+
+    eval_parser = subparsers.add_parser("evaluate", help="Evaluate STEDResUNet2D on the test split")
+    add_evaluate_arguments(eval_parser)
+    return parser
+
+
+def main(argv=None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    parser = build_parser()
+
+    # Preserve the old training invocation style: python train.py --data_dir ...
+    if argv and argv[0] not in {"fit", "evaluate", "-h", "--help"}:
+        argv = ["fit", *argv]
+
+    args = parser.parse_args(argv)
+    if args.mode == "fit":
+        train_model(args)
+    elif args.mode == "evaluate":
+        from src.evaluation import evaluate_model
+
+        evaluate_model(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

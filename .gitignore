@@ -6,3 +6,8 @@ weights
 reports
 .vscode
 *.npz
+*.tif
+*.tiff
+*.csv
+*_debug.log
+images/

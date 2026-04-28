@@ -28,10 +28,13 @@ OUTPUT_SUFFIXES = {
     "pred_centerline": "_pred_centerline.tif",
     "pred_traceability": "_pred_traceability.tif",
     "pred_radius": "_pred_radius.tif",
+    "pred_bundle_count": "_pred_bundle_count.tif",
     "pred_orient_conf": "_pred_orient_conf.tif",
     "preview": "_preview.png",
     "summary": "_summary.json",
 }
+
+BUNDLE_COUNT_NORMALIZER = 6.0
 
 
 @dataclass
@@ -45,6 +48,7 @@ class RealInferenceResult:
     orientation_confidence: np.ndarray
     traceability_map: np.ndarray
     radius_map: np.ndarray
+    bundle_count_map: np.ndarray
     decoder_score_map: np.ndarray
     decoder_candidate_mask: np.ndarray
     decoder_strong_seed_mask: np.ndarray
@@ -127,6 +131,11 @@ def load_sted_model(model_path: str, base_filters: int = 32, device_spec: str = 
                 "with the new structural centerline architecture. Train a new checkpoint with the "
                 "upgraded model before running inference."
             ) from error
+        if "bundle_count_head" in message or "size mismatch" in message:
+            raise RuntimeError(
+                f"Checkpoint '{model_path}' does not match the current 6-channel bundle-count model. "
+                "Train a new checkpoint with structural_v2 targets before running bundle-count inference."
+            ) from error
         raise
     model.to(device)
     model.eval()
@@ -180,7 +189,7 @@ def run_real_image_inference(
         device=device,
         tile_size=tile_size,
         overlap=tile_overlap,
-        output_channels=5,
+        output_channels=6,
         multiple=16,
         use_amp=use_amp,
     )
@@ -195,6 +204,8 @@ def run_real_image_inference(
     traceability_map = 1.0 / (1.0 + np.exp(-traceability_logits))
     radius_logits = np.clip(pred[4], -20.0, 20.0)
     radius_map = 1.0 / (1.0 + np.exp(-radius_logits))
+    bundle_count_logits = np.clip(pred[5], -20.0, 20.0)
+    bundle_count_map = 1.0 / (1.0 + np.exp(-bundle_count_logits))
 
     decode_start = time.perf_counter()
     decoder = CenterlineGraphDecoder(centerline_threshold=centerline_threshold)
@@ -216,6 +227,7 @@ def run_real_image_inference(
         orientation_confidence=orientation_confidence,
         traceability_map=traceability_map,
         radius_map=radius_map,
+        bundle_count_map=bundle_count_map,
         decoder_score_map=decoded.score_map,
         decoder_candidate_mask=decoded.candidate_mask,
         decoder_strong_seed_mask=decoded.strong_seed_mask,
@@ -258,7 +270,15 @@ def required_output_paths(base_path: str) -> Dict[str, str]:
     paths = build_output_paths(base_path)
     return {
         key: paths[key]
-        for key in ("skeleton", "pred_centerline", "pred_traceability", "pred_radius", "pred_orient_conf", "summary")
+        for key in (
+            "skeleton",
+            "pred_centerline",
+            "pred_traceability",
+            "pred_radius",
+            "pred_bundle_count",
+            "pred_orient_conf",
+            "summary",
+        )
     }
 
 
@@ -272,6 +292,7 @@ def save_inference_outputs(result: RealInferenceResult, base_path: str) -> Dict[
     tifffile.imwrite(paths["pred_centerline"], (np.clip(result.centerline_prob, 0.0, 1.0) * 255).astype(np.uint8))
     tifffile.imwrite(paths["pred_traceability"], (np.clip(result.traceability_map, 0.0, 1.0) * 255).astype(np.uint8))
     tifffile.imwrite(paths["pred_radius"], (np.clip(result.radius_map, 0.0, 1.0) * 255).astype(np.uint8))
+    tifffile.imwrite(paths["pred_bundle_count"], (np.clip(result.bundle_count_map, 0.0, 1.0) * 255).astype(np.uint8))
     tifffile.imwrite(paths["pred_orient_conf"], (np.clip(result.orientation_confidence, 0.0, 1.0) * 255).astype(np.uint8))
     return paths
 
@@ -283,6 +304,7 @@ def load_saved_output_arrays(base_path: str) -> Dict[str, np.ndarray]:
         "pred_centerline": tifffile.imread(paths["pred_centerline"]).astype(np.float32) / 255.0,
         "pred_traceability": tifffile.imread(paths["pred_traceability"]).astype(np.float32) / 255.0,
         "pred_radius": tifffile.imread(paths["pred_radius"]).astype(np.float32) / 255.0,
+        "pred_bundle_count": tifffile.imread(paths["pred_bundle_count"]).astype(np.float32) / 255.0,
         "pred_orient_conf": tifffile.imread(paths["pred_orient_conf"]).astype(np.float32) / 255.0,
     }
 
@@ -401,11 +423,13 @@ def summarize_inference_result(
         centerline_on = float(np.mean(result.centerline_prob[skeleton_mask]))
         traceability_on = float(np.mean(result.traceability_map[skeleton_mask]))
         radius_on = float(np.mean(result.radius_map[skeleton_mask]))
+        bundle_count_on = float(np.mean(result.bundle_count_map[skeleton_mask]) * BUNDLE_COUNT_NORMALIZER)
     else:
         raw_on = 0.0
         centerline_on = 0.0
         traceability_on = 0.0
         radius_on = 0.0
+        bundle_count_on = 0.0
 
     off_mask = ~skeleton_mask
     raw_off = float(np.mean(result.image_normalized[off_mask])) if np.any(off_mask) else 0.0
@@ -443,6 +467,9 @@ def summarize_inference_result(
         "pred_radius_mean": float(np.mean(result.radius_map)),
         "pred_radius_p95": float(np.percentile(result.radius_map, 95.0)),
         "pred_radius_p99": float(np.percentile(result.radius_map, 99.0)),
+        "pred_bundle_count_mean": float(np.mean(result.bundle_count_map) * BUNDLE_COUNT_NORMALIZER),
+        "pred_bundle_count_p95": float(np.percentile(result.bundle_count_map, 95.0) * BUNDLE_COUNT_NORMALIZER),
+        "pred_bundle_count_p99": float(np.percentile(result.bundle_count_map, 99.0) * BUNDLE_COUNT_NORMALIZER),
         "pred_orient_conf_mean": float(np.mean(result.orientation_confidence)),
         "pred_orient_conf_p95": float(np.percentile(result.orientation_confidence, 95.0)),
         "raw_on_skeleton_mean": raw_on,
@@ -451,6 +478,7 @@ def summarize_inference_result(
         "centerline_on_skeleton_mean": centerline_on,
         "traceability_on_skeleton_mean": traceability_on,
         "radius_on_skeleton_mean": radius_on,
+        "bundle_count_on_skeleton_mean": bundle_count_on,
         "decoder_self_consistency": _decoder_self_consistency(result),
         "pred_to_input_skeleton_ratio": _safe_ratio(float(np.mean(skeleton_mask)), float(input_metrics["skeleton_fraction"])),
         "pred_to_input_foreground_ratio": _safe_ratio(float(np.mean(decoder_score_mask)), float(input_metrics["foreground_fraction"])),
@@ -477,6 +505,7 @@ def render_preview_panel(
     centerline_prob: np.ndarray,
     traceability_map: np.ndarray,
     radius_map: np.ndarray,
+    bundle_count_map: np.ndarray,
     orientation_confidence: np.ndarray,
     out_path: str,
     title: str = "",
@@ -507,7 +536,13 @@ def render_preview_panel(
     axes[3].set_title("Traceability")
     axes[4].imshow(np.clip(radius_map, 0.0, 1.0), cmap="cividis", vmin=0.0, vmax=1.0)
     axes[4].set_title("Radius")
-    axes[5].axis("off")
+    axes[5].imshow(
+        np.clip(bundle_count_map, 0.0, 1.0) * BUNDLE_COUNT_NORMALIZER,
+        cmap="plasma",
+        vmin=0.0,
+        vmax=BUNDLE_COUNT_NORMALIZER,
+    )
+    axes[5].set_title("Bundle Count")
 
     if metrics:
         lines = [
@@ -522,9 +557,9 @@ def render_preview_panel(
         oob_count = int(metrics.get("input_profile_oob_count", -1))
         if oob_count >= 0:
             lines.append(f"profile_oob={oob_count} [{metrics.get('input_profile_oob_metrics', '')}]")
-        axes[5].text(0.0, 1.0, "\n".join(lines), va="top", ha="left", family="monospace")
+        axes[1].text(0.01, 0.99, "\n".join(lines), va="top", ha="left", family="monospace", color="white")
 
-    for ax in axes[:5]:
+    for ax in axes:
         ax.axis("off")
 
     fig.suptitle(title or os.path.basename(out_path), fontsize=10)
@@ -543,6 +578,7 @@ def save_preview_panel(result: RealInferenceResult, out_path: str, metrics: Opti
         centerline_prob=result.centerline_prob,
         traceability_map=result.traceability_map,
         radius_map=result.radius_map,
+        bundle_count_map=result.bundle_count_map,
         orientation_confidence=result.orientation_confidence,
         out_path=out_path,
         title=os.path.basename(title),

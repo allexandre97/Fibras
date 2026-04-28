@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import os
+import sys
 from typing import Dict, List
 
 import numpy as np
@@ -14,6 +15,7 @@ from src.sted_calibration import (
     iter_patches,
     parse_sted_filename,
 )
+from src.synthetic_comparison import add_compare_arguments, compare
 
 
 def _discover_tiffs(real_dir: str) -> List[str]:
@@ -148,8 +150,7 @@ def analyze_real_sted(args) -> None:
     print(f"  p99        q050={global_metrics['p99']['q050']:.6f}")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Analyze real 2D STED TIFFs and build a synthesizer calibration profile.")
+def add_profile_real_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--real_dir", type=str, required=True, help="Directory containing real STED TIFF images.")
     parser.add_argument("--output_dir", type=str, default="reports/sted_real")
     parser.add_argument("--patch_size", type=int, default=DEFAULT_PATCH_SIZE)
@@ -157,4 +158,37 @@ if __name__ == "__main__":
     parser.add_argument("--min_component_area", type=int, default=8)
     parser.add_argument("--max_files", type=int, default=0)
     parser.add_argument("--qa_samples", type=int, default=8)
-    analyze_real_sted(parser.parse_args())
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Real/synthetic STED calibration tools.")
+    subparsers = parser.add_subparsers(dest="mode")
+
+    profile_parser = subparsers.add_parser("profile-real", help="Analyze real STED TIFFs and build a calibration profile")
+    add_profile_real_arguments(profile_parser)
+
+    compare_parser = subparsers.add_parser("compare-synthetic", help="Compare generated synthetic samples against a profile")
+    add_compare_arguments(compare_parser)
+
+    return parser
+
+
+def main(argv=None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    parser = build_parser()
+
+    # Preserve the old profile-generation invocation style.
+    if argv and argv[0] not in {"profile-real", "compare-synthetic", "-h", "--help"}:
+        argv = ["profile-real", *argv]
+
+    args = parser.parse_args(argv)
+    if args.mode == "profile-real":
+        analyze_real_sted(args)
+    elif args.mode == "compare-synthetic":
+        compare(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

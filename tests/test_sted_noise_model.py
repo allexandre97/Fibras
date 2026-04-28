@@ -8,6 +8,7 @@ from generate_dataset import (
     SHORT_TURN_DEGREES,
     STED_2D_FIBER_DENSITY_RANGE,
     STED_2D_STEP_SCALE_RANGE,
+    apply_coherent_bundle,
     _build_2d_sample,
     _build_2d_focus_and_visibility_targets,
     _prepare_2d_sted_scene,
@@ -15,6 +16,7 @@ from generate_dataset import (
     _to_2d_tensors,
     build_sted_debug_sample,
 )
+from src.core import FiberSegment
 from src.rasterization import EmpiricalRasterizer
 from src.targets import TargetFieldGenerator, WeightedVisibilityTargetGenerator
 
@@ -430,7 +432,7 @@ class StedNoiseModelTests(unittest.TestCase):
             scene = _prepare_2d_sted_scene((64, 64, 16), None)
             self.assertGreaterEqual(scene["requested_fiber_count"], lower_fiber_count)
             self.assertLessEqual(scene["requested_fiber_count"], upper_fiber_count)
-            self.assertTrue(all(size in {1, 2, 3} for size in scene["bundle_sizes"]))
+            self.assertTrue(all(1 <= size <= 6 for size in scene["bundle_sizes"]))
 
             for walk_cfg in scene["walk_parameter_samples"]:
                 self.assertGreaterEqual(walk_cfg["num_steps"], SHORT_FIBER_STEPS[0])
@@ -439,6 +441,69 @@ class StedNoiseModelTests(unittest.TestCase):
                 self.assertLessEqual(walk_cfg["max_turn_degrees"], SHORT_TURN_DEGREES[1])
                 self.assertGreaterEqual(walk_cfg["step_length"], lower_step)
                 self.assertLessEqual(walk_cfg["step_length"], upper_step)
+
+    def test_coherent_bundle_preserves_shared_direction_with_separated_strands(self):
+        np.random.seed(11)
+        core_segments = [
+            FiberSegment(
+                start=np.array([10.0, 20.0, 4.0]),
+                end=np.array([20.0, 20.0, 4.0]),
+            ),
+            FiberSegment(
+                start=np.array([20.0, 20.0, 4.0]),
+                end=np.array([30.0, 20.0, 4.0]),
+            ),
+        ]
+
+        optical_segments = apply_coherent_bundle(
+            core_segments,
+            bundle_size=5,
+            separation=2.0,
+            direction_jitter_degrees=0.0,
+            lateral_jitter_fraction=0.0,
+            axial_jitter_fraction=0.0,
+            lock_z=True,
+            bounds=(64, 64, 16),
+        )
+
+        self.assertEqual(len(optical_segments), len(core_segments) * 5)
+        first_segment_starts = np.array([segment.start for segment in optical_segments[:: len(core_segments)]])
+        self.assertGreater(np.ptp(first_segment_starts[:, 1]), 6.0)
+        self.assertTrue(np.allclose(first_segment_starts[:, 2], 4.0))
+
+        reference = np.array([1.0, 0.0, 0.0])
+        for segment in optical_segments:
+            direction = segment.end - segment.start
+            direction /= max(np.linalg.norm(direction), 1e-8)
+            self.assertGreater(float(np.dot(direction, reference)), 0.98)
+
+    def test_sted_debug_can_force_coherent_bundle_phenotype(self):
+        config = {
+            "probability": 1.0,
+            "size_range": (4, 4),
+            "separation_range": (1.5, 1.5),
+            "direction_jitter_degrees": 3.0,
+            "lateral_jitter_fraction": 0.10,
+            "axial_jitter_fraction": 0.0,
+        }
+
+        debug_data = build_sted_debug_sample(
+            (48, 48),
+            synth_depth=14,
+            seed=12,
+            coherent_bundle_config=config,
+        )
+
+        details = debug_data["coherent_bundle_details"]
+        self.assertGreater(len(details), 0)
+        self.assertTrue(all(detail["mode"] == "coherent" for detail in details))
+        self.assertTrue(all(detail["bundle_size"] == 4 for detail in details))
+        self.assertTrue(all(abs(detail["separation"] - 1.5) < 1e-8 for detail in details))
+        self.assertEqual(debug_data["coherent_bundle_config"]["probability"], 1.0)
+        self.assertIn("bundle_count_target", debug_data)
+        self.assertGreater(float(debug_data["bundle_count_target"].max()), 0.0)
+        expected = 4.0 / float(debug_data["bundle_count_normalizer"])
+        self.assertLess(abs(float(debug_data["bundle_count_target"].max()) - expected), 1e-6)
 
     def test_deterministic_2d_smoke_preserves_target_channels(self):
         seen_haze_regimes = set()
@@ -452,9 +517,16 @@ class StedNoiseModelTests(unittest.TestCase):
             self.assertGreaterEqual(scene["requested_fiber_count"], lower_fiber_count)
             self.assertLessEqual(scene["requested_fiber_count"], upper_fiber_count)
 
-            image, centerline_target, vector_target, traceability_target, radius_target = _build_2d_sample((40, 40, 14), None)
-            _, targets_tensor = _to_2d_tensors(image, centerline_target, vector_target, traceability_target, radius_target)
-            self.assertEqual(targets_tensor.shape[0], 5)
+            image, centerline_target, vector_target, traceability_target, radius_target, bundle_count_target = _build_2d_sample((40, 40, 14), None)
+            _, targets_tensor = _to_2d_tensors(
+                image,
+                centerline_target,
+                vector_target,
+                traceability_target,
+                radius_target,
+                bundle_count_target,
+            )
+            self.assertEqual(targets_tensor.shape[0], 6)
 
         self.assertIn("none", seen_haze_regimes)
 

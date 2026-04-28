@@ -90,11 +90,15 @@ def compare(args) -> None:
         print("\nAll compared synthetic medians are inside the real q10-q90 band.")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compare generated synthetic STED samples against a real-data profile.")
+def add_compare_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--profile", type=str, required=True)
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--split", type=str, default="train")
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--output_csv", type=str, default="")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Compare generated synthetic STED samples against a real-data profile.")
+    add_compare_arguments(parser)
     compare(parser.parse_args())
