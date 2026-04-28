@@ -8,6 +8,7 @@ from functools import partial
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import tifffile
 
 from src.core import FiberSegment, ReflectiveBoundary
 from src.rasterization import EmpiricalRasterizer
@@ -78,6 +79,7 @@ DEFAULT_MAX_FIBERS = 0  # 0 means area-derived cap only.
 DEFAULT_APPARENT_WIDTH_P90_WEIGHT = 0.75
 DEFAULT_BASE_SIGMA_MIN = 0.90
 DEFAULT_BASE_SIGMA_MAX = 2.80
+TIFF_EXTENSIONS = (".tif", ".tiff")
 
 
 # -----------------------------------------------------------------------------
@@ -1170,6 +1172,157 @@ def _to_2d_tensors(
     return volume_tensor, torch.tensor(targets, dtype=torch.float32)
 
 
+def _discover_tiff_files(input_dir: str, recursive: bool = False) -> List[str]:
+    if not os.path.isdir(input_dir):
+        raise FileNotFoundError(f"Blank TIFF directory not found: {input_dir}")
+
+    paths: List[str] = []
+    if recursive:
+        for root, _, names in os.walk(input_dir):
+            for name in names:
+                if name.lower().endswith(TIFF_EXTENSIONS):
+                    paths.append(os.path.join(root, name))
+    else:
+        for name in os.listdir(input_dir):
+            path = os.path.join(input_dir, name)
+            if os.path.isfile(path) and name.lower().endswith(TIFF_EXTENSIONS):
+                paths.append(path)
+    return sorted(paths)
+
+
+def _normalize_blank_image(
+    image: np.ndarray,
+    source_dtype: np.dtype,
+    mode: str,
+    percentile_low: float,
+    percentile_high: float,
+) -> np.ndarray:
+    image = np.asarray(image, dtype=np.float32)
+    image = np.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
+    if image.size == 0:
+        raise ValueError("Blank image is empty.")
+
+    if mode == "none":
+        return image.astype(np.float32)
+
+    if mode == "dtype":
+        if np.issubdtype(source_dtype, np.integer):
+            dtype_max = float(np.iinfo(source_dtype).max)
+            if dtype_max > 0.0:
+                image = image / dtype_max
+        return np.clip(image, 0.0, 1.0).astype(np.float32)
+
+    if mode != "percentile":
+        raise ValueError(f"Unsupported blank normalization mode: {mode}")
+
+    if float(image.min()) >= 0.0 and float(image.max()) <= 1.0:
+        return np.clip(image, 0.0, 1.0).astype(np.float32)
+
+    p_low, p_high = np.percentile(image, (percentile_low, percentile_high))
+    if not np.isfinite(p_low) or not np.isfinite(p_high) or p_high <= p_low:
+        return np.zeros_like(image, dtype=np.float32)
+    image = (image - float(p_low)) / (float(p_high) - float(p_low) + 1e-8)
+    return np.clip(image, 0.0, 1.0).astype(np.float32)
+
+
+def _load_blank_tiff_image(
+    path: str,
+    normalization: str,
+    percentile_low: float,
+    percentile_high: float,
+) -> np.ndarray:
+    raw = tifffile.imread(path)
+    image = np.squeeze(raw)
+    if image.ndim != 2:
+        raise ValueError(f"{path} did not resolve to a 2D image after squeeze: {image.shape}")
+    return _normalize_blank_image(
+        image,
+        source_dtype=np.asarray(raw).dtype,
+        mode=normalization,
+        percentile_low=percentile_low,
+        percentile_high=percentile_high,
+    )
+
+
+def _pad_image_xy_to_min_shape(image_xy: np.ndarray, min_shape_xy: Tuple[int, int]) -> np.ndarray:
+    pad_x = max(0, int(min_shape_xy[0]) - int(image_xy.shape[0]))
+    pad_y = max(0, int(min_shape_xy[1]) - int(image_xy.shape[1]))
+    if pad_x == 0 and pad_y == 0:
+        return image_xy
+    mode = "reflect" if image_xy.shape[0] > 1 and image_xy.shape[1] > 1 else "edge"
+    return np.pad(image_xy, ((0, pad_x), (0, pad_y)), mode=mode)
+
+
+def _blank_target_arrays(shape_xy: Tuple[int, int]):
+    crop_x, crop_y = shape_xy
+    centerline = np.zeros((crop_x, crop_y), dtype=np.float32)
+    vector = np.zeros((2, crop_x, crop_y), dtype=np.float32)
+    traceability = np.zeros((crop_x, crop_y), dtype=np.float32)
+    radius = np.zeros((crop_x, crop_y), dtype=np.float32)
+    bundle_count = np.zeros((crop_x, crop_y), dtype=np.float32)
+    return centerline, vector, traceability, radius, bundle_count
+
+
+def save_blank_tiff_crops(
+    split_name: str,
+    base_dir: str,
+    blank_tiff_paths: Sequence[str],
+    crop_bounds: Tuple[int, int],
+    crops_per_image: int,
+    normalization: str,
+    percentile_low: float,
+    percentile_high: float,
+) -> int:
+    import torch
+
+    if not blank_tiff_paths:
+        return 0
+
+    split_dir = os.path.join(base_dir, split_name)
+    os.makedirs(split_dir, exist_ok=True)
+    print(
+        f"Adding {len(blank_tiff_paths)} blank TIFF image(s) to '{split_name}' "
+        f"({crops_per_image} crop(s) per image) at {split_dir}..."
+    )
+
+    saved_count = 0
+    zero_targets = _blank_target_arrays(crop_bounds)
+    for image_index, path in enumerate(blank_tiff_paths):
+        image_yx = _load_blank_tiff_image(
+            path,
+            normalization=normalization,
+            percentile_low=percentile_low,
+            percentile_high=percentile_high,
+        )
+        image_xy = _pad_image_xy_to_min_shape(image_yx.T, crop_bounds)
+        for crop_index in range(int(crops_per_image)):
+            x0, y0 = _random_crop_origin((int(image_xy.shape[0]), int(image_xy.shape[1])), crop_bounds)
+            image_crop = _crop_array(image_xy, x0, y0, int(crop_bounds[0]), int(crop_bounds[1]))
+            volume_tensor, targets_tensor = _to_2d_tensors(image_crop, *zero_targets)
+            record = {
+                "volume": volume_tensor,
+                "targets": targets_tensor,
+                "target_schema": "structural_v2",
+                "metadata": {
+                    "sample_type": "blank",
+                    "source_path": os.path.abspath(path),
+                    "source_shape_yx": tuple(int(v) for v in image_yx.shape),
+                    "source_image_index": int(image_index),
+                    "crop_index_within_source": int(crop_index),
+                    "crop_origin_xy": (int(x0), int(y0)),
+                    "crop_bounds_xy": tuple(int(v) for v in crop_bounds),
+                    "blank_normalization": normalization,
+                },
+            }
+            out_name = f"blank_{saved_count:06d}.pt"
+            torch_path = os.path.join(split_dir, out_name)
+            torch.save(record, torch_path)
+            saved_count += 1
+
+    print(f"  Added {saved_count} blank sample(s) to '{split_name}'.")
+    return saved_count
+
+
 def process_scene_and_save_crops(
     parent_idx: int,
     file_offset: int,
@@ -1348,9 +1501,9 @@ def build_dataset_split(
             if completed_scenes % max(1, parent_count // 10) == 0 or completed_scenes == parent_count:
                 print(f"  [{completed_samples}/{size}] samples saved ({completed_scenes}/{parent_count} scenes).")
 
-    actual_files = len([f for f in os.listdir(split_dir) if f.endswith(".pt")])
+    actual_files = len([f for f in os.listdir(split_dir) if f.startswith("sample_") and f.endswith(".pt")])
     if actual_files != size:
-        raise RuntimeError(f"Split '{split_name}' expected {size} .pt files, found {actual_files}.")
+        raise RuntimeError(f"Split '{split_name}' expected {size} synthetic .pt files, found {actual_files}.")
 
 
 # -----------------------------------------------------------------------------
@@ -1417,6 +1570,38 @@ def _parse_args():
     parser.add_argument("--test_size", type=int, default=1000)
     parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
     parser.add_argument("--emit_synthesis_metadata", action="store_true")
+
+    parser.add_argument(
+        "--blank_tiff_dir",
+        type=str,
+        default=None,
+        help="Optional directory of real blank/negative-control STED TIFFs to append as zero-target samples.",
+    )
+    parser.add_argument(
+        "--blank_splits",
+        type=str,
+        nargs="+",
+        choices=["train", "val", "test"],
+        default=["train"],
+        help="Dataset split(s) that receive blank TIFF crops when --blank_tiff_dir is set. Default: train.",
+    )
+    parser.add_argument("--blank_recursive", action="store_true", help="Recursively discover blank TIFFs.")
+    parser.add_argument("--blank_crops_per_image", type=int, default=1)
+    parser.add_argument(
+        "--blank_max_images",
+        type=int,
+        default=0,
+        help="Maximum blank TIFFs to use. 0 means all discovered TIFFs.",
+    )
+    parser.add_argument(
+        "--blank_normalization",
+        type=str,
+        choices=["percentile", "dtype", "none"],
+        default="percentile",
+        help="How to normalize blank TIFF intensities before saving. Default matches inference percentile scaling.",
+    )
+    parser.add_argument("--blank_percentile_low", type=float, default=0.5)
+    parser.add_argument("--blank_percentile_high", type=float, default=99.9)
     return parser.parse_args()
 
 
@@ -1429,6 +1614,16 @@ def _validate_args(args) -> None:
         raise ValueError("--workers must be at least 1.")
     if args.train_size < 0 or args.val_size < 0 or args.test_size < 0:
         raise ValueError("Split sizes must be non-negative.")
+    if args.blank_crops_per_image < 1:
+        raise ValueError("--blank_crops_per_image must be at least 1.")
+    if args.blank_max_images < 0:
+        raise ValueError("--blank_max_images must be non-negative.")
+    if args.blank_percentile_low < 0.0 or args.blank_percentile_high > 100.0:
+        raise ValueError("--blank_percentile_low/high must be within [0, 100].")
+    if args.blank_percentile_low >= args.blank_percentile_high:
+        raise ValueError("--blank_percentile_low must be smaller than --blank_percentile_high.")
+    if args.blank_tiff_dir is not None and not os.path.isdir(args.blank_tiff_dir):
+        raise FileNotFoundError(f"Blank TIFF directory not found: {args.blank_tiff_dir}")
 
     _validate_positive("label_slab_scale", args.label_slab_scale)
     _validate_probability("soft_skeleton_alpha", args.soft_skeleton_alpha)
@@ -1468,6 +1663,14 @@ def main() -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    blank_tiff_paths: List[str] = []
+    if args.blank_tiff_dir is not None:
+        blank_tiff_paths = _discover_tiff_files(args.blank_tiff_dir, recursive=args.blank_recursive)
+        if args.blank_max_images > 0:
+            blank_tiff_paths = blank_tiff_paths[: int(args.blank_max_images)]
+        if not blank_tiff_paths:
+            raise FileNotFoundError(f"No TIFF files found under {args.blank_tiff_dir}")
+
     config_summary = {
         "target_schema": "structural_v2",
         "scene_bounds": scene_bounds,
@@ -1483,6 +1686,13 @@ def main() -> None:
         "coherent_bundle_probability": float(args.coherent_bundle_probability),
         "coherent_bundle_size_range": tuple(int(v) for v in args.coherent_bundle_size_range),
         "coherent_bundle_separation_range": tuple(float(v) for v in args.coherent_bundle_separation_range),
+        "blank_tiff_dir": args.blank_tiff_dir,
+        "blank_tiff_count": len(blank_tiff_paths),
+        "blank_splits": list(args.blank_splits),
+        "blank_crops_per_image": int(args.blank_crops_per_image),
+        "blank_normalization": args.blank_normalization,
+        "blank_percentile_low": float(args.blank_percentile_low),
+        "blank_percentile_high": float(args.blank_percentile_high),
     }
     with open(os.path.join(args.output_dir, "generation_config.json"), "w", encoding="utf-8") as handle:
         json.dump(config_summary, handle, indent=2)
@@ -1552,6 +1762,19 @@ def main() -> None:
         crops_per_scene=args.crops_per_scene,
         **common_kwargs,
     )
+
+    if blank_tiff_paths:
+        for split_name in args.blank_splits:
+            save_blank_tiff_crops(
+                split_name=split_name,
+                base_dir=args.output_dir,
+                blank_tiff_paths=blank_tiff_paths,
+                crop_bounds=crop_bounds,
+                crops_per_image=args.blank_crops_per_image,
+                normalization=args.blank_normalization,
+                percentile_low=args.blank_percentile_low,
+                percentile_high=args.blank_percentile_high,
+            )
 
 
 if __name__ == "__main__":

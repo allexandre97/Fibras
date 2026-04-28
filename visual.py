@@ -62,8 +62,7 @@ def main():
     args = parser.parse_args()
 
     if args.mode == "inference":
-        from inference import main as run_single_image_inference
-
+        from inference import run_single as run_single_image_inference
         run_single_image_inference(args)
     elif args.mode == "dataset":
         if args.file:

@@ -79,15 +79,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _normalize_programmatic_args(args):
+    """Normalize already-parsed arguments passed by another entrypoint."""
+    if getattr(args, "mode", None) in {None, "inference"}:
+        args.mode = "single"
+    return args
+
+
 def main(argv=None):
-    argv = sys.argv[1:] if argv is None else argv
     parser = build_parser()
 
-    # Preserve the old single-image invocation style: python inference.py --model_path ...
-    if argv and argv[0] not in {"single", "batch", "calibrate-decoder", "-h", "--help"}:
-        argv = ["single", *argv]
+    if isinstance(argv, argparse.Namespace):
+        args = _normalize_programmatic_args(argv)
+    elif isinstance(argv, dict):
+        args = _normalize_programmatic_args(argparse.Namespace(**argv))
+    else:
+        argv = sys.argv[1:] if argv is None else list(argv)
 
-    args = parser.parse_args(argv)
+        # Preserve the old single-image invocation style: python inference.py --model_path ...
+        if argv and argv[0] not in {"single", "batch", "calibrate-decoder", "-h", "--help"}:
+            argv = ["single", *argv]
+
+        args = parser.parse_args(argv)
+
     if args.mode == "single":
         run_single(args)
     elif args.mode == "batch":
