@@ -304,74 +304,84 @@ def _build_sweep_config(args: argparse.Namespace) -> dict[str, Any]:
             "eta": 2,
         },
         "parameters": {
-            # Best first-sweep value was ~9.7e-5, close to the old upper bound.
-            # Expand upward, but keep the lower end near the useful region.
+            # The current model is no longer the fixed 4-level U-Net from the
+            # earlier sweep results.  Use an exploratory range that covers the
+            # old useful band but also allows the shallower/head-refined model
+            # to settle at a lower or higher AdamW step size.
             "learning_rate": {
                 "distribution": "log_uniform_values",
-                "min": 1.5e-4,
-                "max": 3.0e-4,
+                "min": 7.5e-5,
+                "max": 4.0e-4,
             },
 
-            # Best value was ~1.35e-4, fairly high.
-            # Search around that, allowing stronger regularization.
+            # Re-open the low-decay region because the default model is much
+            # smaller than the old 48/56-filter depth-4 model, while keeping
+            # enough upper range for the extra prediction-head parameters.
             "weight_decay": {
                 "distribution": "log_uniform_values",
-                "min": 1e-5,
-                "max": 1.5e-4,
+                "min": 3e-6,
+                "max": 3e-4,
             },
 
-            # Best value was ~0.92, well inside the old range.
-            # Narrow around the useful region.
+            # Old sweep optima are no longer architecture-invariant.  Keep the
+            # training defaults inside the search instead of only exploiting the
+            # previous top band.
             "orientation_loss_weight": {
                 "distribution": "uniform",
-                "min": 0.75,
-                "max": 1.15,
+                "min": 0.50,
+                "max": 1.40,
             },
 
-            # Best value was ~0.57, close to the old upper bound.
-            # Expand upward.
+            # Include the standalone-training default again; the task-specific
+            # traceability head may not need the old high weighting.
             "visibility_loss_weight": {
                 "distribution": "uniform",
-                "min": 0.45,
+                "min": 0.25,
+                "max": 0.75,
+            },
+
+            # The support threshold controls which centerline pixels supervise
+            # orientation/radius/bundle count.  Cover the old low band and the
+            # train.py default so the new heads can choose their masking regime.
+            "orientation_mask_floor": {
+                "distribution": "uniform",
+                "min": 0.04,
+                "max": 0.18,
+            },
+
+            # This is a lower clamp on target traceability during orientation
+            # loss, not a prediction threshold.  Re-open the range after the
+            # architecture change instead of assuming the old low clamp is best.
+            "loss_visibility_floor": {
+                "distribution": "uniform",
+                "min": 0.04,
+                "max": 0.25,
+            },
+
+            # Radius supervision moved from a 1x1 projection to a shallow
+            # task-specific head.  Keep both the train.py default and the old
+            # stronger-radius region in play.
+            "radius_loss_weight": {
+                "distribution": "uniform",
+                "min": 0.10,
                 "max": 0.70,
             },
 
-            # Best value was ~0.072, toward the lower end.
-            # Keep the floor low so orientation supervision is not too narrowly masked.
-            "orientation_mask_floor": {
-                "distribution": "uniform",
-                "min": 0.07,
-                "max": 0.14,
-            },
-
-            # Best value was ~0.116, comfortably inside this narrower range.
-            "loss_visibility_floor": {
-                "distribution": "uniform",
-                "min": 0.06,
-                "max": 0.13,
-            },
-
-            # Best value was ~0.365, near the old upper bound.
-            # Expand upward because radius is clearly important for the thick-fiber dataset.
-            "radius_loss_weight": {
-                "distribution": "uniform",
-                "min": 0.25,
-                "max": 0.60,
-            },
-
-            # Best value was ~0.221.
-            # Keep moderate range, but still allow higher values in case bundle count was underweighted.
+            # Bundle-count behavior is one of the outputs most likely to move
+            # after the head change, so do not keep this narrowly centered on
+            # the previous architecture.
             "bundle_count_loss_weight": {
                 "distribution": "uniform",
-                "min": 0.15,
+                "min": 0.05,
                 "max": 0.50,
             },
 
-            # Best value was ~1.17, near the old upper bound.
-            # Expand upward.
+            # Centerline loss already combines focal, Dice, and clDice terms.
+            # Include neutral weighting again before pushing the new model into
+            # the old centerline-heavy region.
             "train_centerline_weight": {
                 "distribution": "uniform",
-                "min": 1.20,
+                "min": 0.80,
                 "max": 1.70,
             },
 
@@ -397,8 +407,9 @@ def _build_sweep_config(args: argparse.Namespace) -> dict[str, Any]:
             "early_stop_patience": {"value": 10},
             "min_epochs_before_stop": {"value": 25},
 
-            # For the second sweep, I would usually restrict this to [40, 48].
-            # If args.base_filters_values is already [40, 48], keep this.
+            # Default architecture search is centered on the new shallow model.
+            # Pass --unet_depth_values 3 4 or --aspp_dilation_values 2,4,8 at
+            # launch time for a deliberate legacy-depth comparison.
             "base_filters": {
                 "values": args.base_filters_values,
             },
@@ -422,10 +433,10 @@ def add_train_sweep_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--base_batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--project", type=str, default="fibras-sted-resunet2d-sweep-v3")
-    parser.add_argument("--base_filters_values", type=int, nargs="+", default=[32, 40])
-    parser.add_argument("--unet_depth_values", type=int, nargs="+", default=[3, 4])
-    parser.add_argument("--aspp_dilation_values", type=str, nargs="+", default=["1,2,4", "1,2,3", "2,4,8"])
+    parser.add_argument("--project", type=str, default="fibras-sted-resunet2d-newmodel-sweep-v1")
+    parser.add_argument("--base_filters_values", type=int, nargs="+", default=[32, 40, 48])
+    parser.add_argument("--unet_depth_values", type=int, nargs="+", default=[3])
+    parser.add_argument("--aspp_dilation_values", type=str, nargs="+", default=["1,2,4", "1,2,3"])
     parser.add_argument("--amp_dtype", type=str, choices=["bf16", "fp16", "off"], default="bf16")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0)
     parser.add_argument("--check_samples", type=int, default=16)
