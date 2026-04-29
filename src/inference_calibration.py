@@ -537,6 +537,7 @@ def main(args):
         model_path=args.model_path,
         base_filters=args.base_filters,
         device_spec=args.device,
+        aspp_dilations=args.aspp_dilations,
     )
     use_amp = not args.no_amp
     _ = load_optional_profile(args.profile)
@@ -679,6 +680,12 @@ def main(args):
 def add_calibration_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--base_filters", type=int, default=32)
+    parser.add_argument(
+        "--aspp_dilations",
+        type=str,
+        default="",
+        help="Optional comma-separated ASPP dilation override. Defaults to checkpoint config, or legacy 2,4,8 for old checkpoints.",
+    )
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--tile_size", type=int, default=512)

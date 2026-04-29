@@ -21,7 +21,7 @@ from src.sted_calibration import (
     parse_sted_filename,
 )
 from src.visualization import AdvancedVisualizer
-from train import extract_model_state_dict
+from train import checkpoint_aspp_dilations, extract_model_state_dict, format_aspp_dilations
 
 
 OUTPUT_SUFFIXES = {
@@ -78,6 +78,12 @@ def add_inference_arguments(
         parser.add_argument("--image_path", type=str, required=True)
     parser.add_argument("--dim", type=int, choices=[2], default=2)
     parser.add_argument("--base_filters", type=int, default=32)
+    parser.add_argument(
+        "--aspp_dilations",
+        type=str,
+        default="",
+        help="Optional comma-separated ASPP dilation override. Defaults to checkpoint config, or legacy 2,4,8 for old checkpoints.",
+    )
     parser.add_argument("--centerline_threshold", type=float, default=0.5)
     parser.add_argument("--tile_size", type=int, default=512)
     parser.add_argument("--tile_overlap", type=int, default=128)
@@ -117,10 +123,20 @@ def resolve_device(device_spec: str = "auto") -> torch.device:
     return device
 
 
-def load_sted_model(model_path: str, base_filters: int = 32, device_spec: str = "auto"):
+def load_sted_model(
+    model_path: str,
+    base_filters: int = 32,
+    device_spec: str = "auto",
+    aspp_dilations=None,
+):
     device = resolve_device(device_spec)
-    model = STEDResUNet2D(in_channels=1, base_filters=base_filters)
     checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+    resolved_aspp_dilations = checkpoint_aspp_dilations(checkpoint, override=aspp_dilations)
+    model = STEDResUNet2D(
+        in_channels=1,
+        base_filters=base_filters,
+        aspp_dilations=resolved_aspp_dilations,
+    )
     state_dict = extract_model_state_dict(checkpoint)
     try:
         model.load_state_dict(state_dict)
@@ -140,6 +156,7 @@ def load_sted_model(model_path: str, base_filters: int = 32, device_spec: str = 
         raise
     model.to(device)
     model.eval()
+    print(f"Loaded model ASPP dilations: {format_aspp_dilations(resolved_aspp_dilations)}")
     return model, device
 
 

@@ -34,6 +34,8 @@ from train import (
     _make_criterion,
     _set_seed,
     _validate_dataset,
+    format_aspp_dilations,
+    parse_aspp_dilations,
 )
 
 
@@ -106,6 +108,9 @@ def train_sweep() -> None:
         "seed": args.seed,
     }
     wandb.config.update(static_config, allow_val_change=True)
+    aspp_dilations = parse_aspp_dilations(config.aspp_dilations)
+    aspp_dilations_config = format_aspp_dilations(aspp_dilations)
+    wandb.config.update({"aspp_dilations": aspp_dilations_config}, allow_val_change=True)
 
     train_dir = os.path.join(args.data_dir, "train")
     val_dir = os.path.join(args.data_dir, "val")
@@ -130,7 +135,11 @@ def train_sweep() -> None:
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
 
-    model = STEDResUNet2D(in_channels=1, base_filters=int(config.base_filters))
+    model = STEDResUNet2D(
+        in_channels=1,
+        base_filters=int(config.base_filters),
+        aspp_dilations=aspp_dilations,
+    )
     if use_data_parallel:
         model = nn.DataParallel(model)
     model = model.to(device)
@@ -148,7 +157,7 @@ def train_sweep() -> None:
     print(
         f"Run {run.id if run is not None else '<no-run>'}: "
         f"device={device}, batch_size={batch_size}, train={len(train_ds)}, val={len(val_ds)}, "
-        f"base_filters={int(config.base_filters)}"
+        f"base_filters={int(config.base_filters)}, aspp_dilations={aspp_dilations_config}"
     )
 
     for epoch in range(args.epochs):
@@ -386,6 +395,9 @@ def _build_sweep_config(args: argparse.Namespace) -> dict[str, Any]:
             "base_filters": {
                 "values": args.base_filters_values,
             },
+            "aspp_dilations": {
+                "values": args.aspp_dilation_values,
+            },
         },
     }
 
@@ -402,6 +414,7 @@ def add_train_sweep_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--project", type=str, default="fibras-sted-resunet2d-sweep-v3")
     parser.add_argument("--base_filters_values", type=int, nargs="+", default=[32, 40])
+    parser.add_argument("--aspp_dilation_values", type=str, nargs="+", default=["1,2,4", "1,2,3", "2,4,8"])
     parser.add_argument("--amp_dtype", type=str, choices=["bf16", "fp16", "off"], default="bf16")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0)
     parser.add_argument("--check_samples", type=int, default=16)

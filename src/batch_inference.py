@@ -311,6 +311,7 @@ def main(args):
         model_path=args.model_path,
         base_filters=args.base_filters,
         device_spec=args.device,
+        aspp_dilations=args.aspp_dilations,
     )
     print(f"Executing batch inference on: {device}")
     calibration_profile = load_optional_profile(args.profile)

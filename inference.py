@@ -28,6 +28,7 @@ def run_single(args):
         model_path=args.model_path,
         base_filters=args.base_filters,
         device_spec=args.device,
+        aspp_dilations=args.aspp_dilations,
     )
     print(f"Executing inference on: {device}")
 

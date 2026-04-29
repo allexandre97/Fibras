@@ -1,5 +1,32 @@
+from numbers import Integral
+
 import torch
 import torch.nn as nn
+
+
+DEFAULT_ASPP_DILATIONS = (1, 2, 4)
+LEGACY_ASPP_DILATIONS = (2, 4, 8)
+
+
+def normalize_aspp_dilations(aspp_dilations):
+    if isinstance(aspp_dilations, str):
+        raise ValueError("aspp_dilations must be an iterable of positive integers, not a string.")
+    try:
+        values = tuple(aspp_dilations)
+    except TypeError as error:
+        raise ValueError("aspp_dilations must be an iterable of positive integers.") from error
+    if not values:
+        raise ValueError("aspp_dilations must contain at least one dilation.")
+
+    normalized = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise ValueError("aspp_dilations must contain only positive integers.")
+        value = int(value)
+        if value <= 0:
+            raise ValueError("aspp_dilations must contain only positive integers.")
+        normalized.append(value)
+    return tuple(normalized)
 
 
 class ResidualBlock2D(nn.Module):
@@ -24,31 +51,26 @@ class ResidualBlock2D(nn.Module):
 
 
 class ASPPBottleneck2D(nn.Module):
-    def __init__(self, channels, groups=8):
+    def __init__(self, channels, groups=8, aspp_dilations=DEFAULT_ASPP_DILATIONS):
         super().__init__()
-        branch_channels = max(channels // 4, 16)
-        self.branches = nn.ModuleList([
+        self.aspp_dilations = normalize_aspp_dilations(aspp_dilations)
+        branch_channels = max(channels // (len(self.aspp_dilations) + 1), 16)
+        branches = [
             nn.Sequential(
                 nn.Conv2d(channels, branch_channels, kernel_size=1),
                 nn.GroupNorm(min(groups, branch_channels), branch_channels),
                 nn.GELU(),
-            ),
-            nn.Sequential(
-                nn.Conv2d(channels, branch_channels, kernel_size=3, padding=2, dilation=2),
-                nn.GroupNorm(min(groups, branch_channels), branch_channels),
-                nn.GELU(),
-            ),
-            nn.Sequential(
-                nn.Conv2d(channels, branch_channels, kernel_size=3, padding=4, dilation=4),
-                nn.GroupNorm(min(groups, branch_channels), branch_channels),
-                nn.GELU(),
-            ),
-            nn.Sequential(
-                nn.Conv2d(channels, branch_channels, kernel_size=3, padding=8, dilation=8),
-                nn.GroupNorm(min(groups, branch_channels), branch_channels),
-                nn.GELU(),
-            ),
-        ])
+            )
+        ]
+        for dilation in self.aspp_dilations:
+            branches.append(
+                nn.Sequential(
+                    nn.Conv2d(channels, branch_channels, kernel_size=3, padding=dilation, dilation=dilation),
+                    nn.GroupNorm(min(groups, branch_channels), branch_channels),
+                    nn.GELU(),
+                )
+            )
+        self.branches = nn.ModuleList(branches)
         self.project = nn.Sequential(
             nn.Conv2d(branch_channels * len(self.branches), channels, kernel_size=1),
             nn.GroupNorm(min(groups, channels), channels),
@@ -67,7 +89,14 @@ class STEDResUNet2D(nn.Module):
     traceability logits, normalized radius logits, and normalized bundle-count logits.
     """
 
-    def __init__(self, in_channels=1, base_filters=32, out_channels=6, groups=8):
+    def __init__(
+        self,
+        in_channels=1,
+        base_filters=32,
+        out_channels=6,
+        groups=8,
+        aspp_dilations=DEFAULT_ASPP_DILATIONS,
+    ):
         super().__init__()
         widths = [base_filters, base_filters * 2, base_filters * 4, base_filters * 8, base_filters * 12]
 
@@ -79,7 +108,7 @@ class STEDResUNet2D(nn.Module):
 
         self.bottleneck = nn.Sequential(
             ResidualBlock2D(widths[3], widths[4], groups=groups),
-            ASPPBottleneck2D(widths[4], groups=groups),
+            ASPPBottleneck2D(widths[4], groups=groups, aspp_dilations=aspp_dilations),
         )
 
         self.up4 = nn.ConvTranspose2d(widths[4], widths[3], kernel_size=2, stride=2)

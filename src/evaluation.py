@@ -4,7 +4,13 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.model import STEDResUNet2D
-from train import PrecomputedFiberDataset, StedFieldLoss2D, extract_model_state_dict
+from train import (
+    PrecomputedFiberDataset,
+    StedFieldLoss2D,
+    checkpoint_aspp_dilations,
+    extract_model_state_dict,
+    format_aspp_dilations,
+)
 
 def evaluate_model(args):
     if args.dim != 2:
@@ -16,9 +22,9 @@ def evaluate_model(args):
     test_ds = PrecomputedFiberDataset(test_dir, dim=2, crop_size=args.crop_size, random_crop=False)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
-    model = STEDResUNet2D(in_channels=1, base_filters=args.base_filters)
-    
     checkpoint = torch.load(args.model_path, map_location=device, weights_only=True)
+    aspp_dilations = checkpoint_aspp_dilations(checkpoint, override=args.aspp_dilations)
+    model = STEDResUNet2D(in_channels=1, base_filters=args.base_filters, aspp_dilations=aspp_dilations)
     model.load_state_dict(extract_model_state_dict(checkpoint))
     model.to(device)
     model.eval()
@@ -84,6 +90,7 @@ def evaluate_model(args):
     n_batches = len(test_loader)
     print(f"\n--- Unseen Test Set Evaluation ({args.dim}D Model) ---")
     print(f"Target Checkpoint: {args.model_path}")
+    print(f"ASPP Dilations: {format_aspp_dilations(aspp_dilations)}")
     print(f"Average Total Loss: {total_metrics['loss'] / n_batches:.4f}")
     print(f"Average Fixed Score: {total_metrics['score'] / n_batches:.4f}")
     print(f"Average Centerline Loss: {total_metrics['centerline'] / n_batches:.4f}")
@@ -102,6 +109,7 @@ def add_evaluate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--data_dir', type=str, required=True, help="Path to base dataset folder")
     parser.add_argument('--dim', type=int, choices=[2], default=2)
     parser.add_argument('--base_filters', type=int, default=32)
+    parser.add_argument('--aspp_dilations', type=str, default="")
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--crop_size', type=int, default=0)
     parser.add_argument('--num_workers', type=int, default=4)

@@ -15,7 +15,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import wandb
 
-from src.model import STEDResUNet2D
+from src.model import DEFAULT_ASPP_DILATIONS, LEGACY_ASPP_DILATIONS, STEDResUNet2D, normalize_aspp_dilations
 from src.sted import normalize_orientation_torch
 
 
@@ -25,6 +25,35 @@ def _torch_load(path: str | os.PathLike[str]) -> dict[str, Any]:
         return torch.load(path, weights_only=True, map_location="cpu")
     except TypeError:
         return torch.load(path, map_location="cpu")
+
+
+def format_aspp_dilations(aspp_dilations) -> str:
+    return ",".join(str(value) for value in normalize_aspp_dilations(aspp_dilations))
+
+
+def parse_aspp_dilations(value) -> tuple[int, ...]:
+    if value is None:
+        return DEFAULT_ASPP_DILATIONS
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",")]
+        if not parts or any(part == "" for part in parts):
+            raise ValueError("ASPP dilations must be a comma-separated list of positive integers.")
+        try:
+            return normalize_aspp_dilations(tuple(int(part) for part in parts))
+        except ValueError as error:
+            raise ValueError("ASPP dilations must be a comma-separated list of positive integers.") from error
+    return normalize_aspp_dilations(value)
+
+
+def checkpoint_aspp_dilations(checkpoint, override=None) -> tuple[int, ...]:
+    if override not in (None, ""):
+        return parse_aspp_dilations(override)
+    if isinstance(checkpoint, dict):
+        config = checkpoint.get("config")
+        if isinstance(config, dict) and "aspp_dilations" in config:
+            return parse_aspp_dilations(config["aspp_dilations"])
+    return LEGACY_ASPP_DILATIONS
+
 
 class PrecomputedFiberDataset(Dataset):
     """Strict structural_v2 2D STED dataset used by standalone and sweep training."""
@@ -571,6 +600,8 @@ def train_model(args):
             "Training on a single GPU to avoid NCCL/DataParallel issues."
         )
 
+    aspp_dilations = parse_aspp_dilations(args.aspp_dilations)
+    aspp_dilations_config = format_aspp_dilations(aspp_dilations)
     _validate_dataset(args.data_dir, args.check_samples)
 
     static_config = {
@@ -587,6 +618,7 @@ def train_model(args):
         "augment_geometric": args.augment_geometric,
         "augment_intensity": args.augment_intensity,
         "seed": args.seed,
+        "aspp_dilations": aspp_dilations_config,
     }
 
     wandb_run = None
@@ -621,7 +653,7 @@ def train_model(args):
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
 
-    model = STEDResUNet2D(in_channels=1, base_filters=args.base_filters)
+    model = STEDResUNet2D(in_channels=1, base_filters=args.base_filters, aspp_dilations=aspp_dilations)
 
     if use_data_parallel:
         model = nn.DataParallel(model)
@@ -645,7 +677,7 @@ def train_model(args):
     print(
         "\nStarting 2D STED ResUNet Training Loop... "
         f"device={device}, batch_size={batch_size}, train={len(train_ds)}, val={len(val_ds)}, "
-        f"base_filters={int(args.base_filters)}"
+        f"base_filters={int(args.base_filters)}, aspp_dilations={aspp_dilations_config}"
     )
     for epoch in range(args.epochs):
         active_train_centerline_weight = criterion.set_epoch(epoch)
@@ -784,6 +816,7 @@ def add_train_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--project', type=str, default="fibras-sted-resunet2d")
     parser.add_argument('--base_filters', type=int, default=32)
+    parser.add_argument('--aspp_dilations', type=str, default=format_aspp_dilations(DEFAULT_ASPP_DILATIONS))
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--amp_dtype', type=str, choices=['bf16', 'fp16', 'off'], default='bf16')
