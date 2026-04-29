@@ -538,6 +538,7 @@ def main(args):
         base_filters=args.base_filters,
         device_spec=args.device,
         aspp_dilations=args.aspp_dilations,
+        unet_depth=args.unet_depth,
     )
     use_amp = not args.no_amp
     _ = load_optional_profile(args.profile)
@@ -680,6 +681,12 @@ def main(args):
 def add_calibration_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--base_filters", type=int, default=32)
+    parser.add_argument(
+        "--unet_depth",
+        type=int,
+        default=0,
+        help="Optional U-Net depth override. Defaults to checkpoint config, or legacy depth 4 for old checkpoints.",
+    )
     parser.add_argument(
         "--aspp_dilations",
         type=str,

@@ -29,6 +29,7 @@ def run_single(args):
         base_filters=args.base_filters,
         device_spec=args.device,
         aspp_dilations=args.aspp_dilations,
+        unet_depth=args.unet_depth,
     )
     print(f"Executing inference on: {device}")
 

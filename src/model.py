@@ -6,6 +6,9 @@ import torch.nn as nn
 
 DEFAULT_ASPP_DILATIONS = (1, 2, 4)
 LEGACY_ASPP_DILATIONS = (2, 4, 8)
+DEFAULT_UNET_DEPTH = 3
+LEGACY_UNET_DEPTH = 4
+PREDICTION_HEAD_TYPE = "shallow_3x3_gn_gelu"
 
 
 def normalize_aspp_dilations(aspp_dilations):
@@ -27,6 +30,15 @@ def normalize_aspp_dilations(aspp_dilations):
             raise ValueError("aspp_dilations must contain only positive integers.")
         normalized.append(value)
     return tuple(normalized)
+
+
+def normalize_unet_depth(unet_depth):
+    if isinstance(unet_depth, bool) or not isinstance(unet_depth, Integral):
+        raise ValueError("unet_depth must be an integer in [3, 4].")
+    unet_depth = int(unet_depth)
+    if unet_depth not in (3, 4):
+        raise ValueError("unet_depth must be an integer in [3, 4].")
+    return unet_depth
 
 
 class ResidualBlock2D(nn.Module):
@@ -82,6 +94,20 @@ class ASPPBottleneck2D(nn.Module):
         return self.project(torch.cat([branch(x) for branch in self.branches], dim=1))
 
 
+class ShallowPredictionHead2D(nn.Module):
+    def __init__(self, in_channels, out_channels, groups=8, hidden_channels=None):
+        super().__init__()
+        hidden_channels = in_channels if hidden_channels is None else hidden_channels
+        self.spatial = nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1)
+        self.norm = nn.GroupNorm(min(groups, hidden_channels), hidden_channels)
+        self.act = nn.GELU()
+        self.project = nn.Conv2d(hidden_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        x = self.act(self.norm(self.spatial(x)))
+        return self.project(x)
+
+
 class STEDResUNet2D(nn.Module):
     """Residual 2D U-Net for structural STED fiber reconstruction.
 
@@ -96,36 +122,42 @@ class STEDResUNet2D(nn.Module):
         out_channels=6,
         groups=8,
         aspp_dilations=DEFAULT_ASPP_DILATIONS,
+        unet_depth=DEFAULT_UNET_DEPTH,
     ):
         super().__init__()
-        widths = [base_filters, base_filters * 2, base_filters * 4, base_filters * 8, base_filters * 12]
+        self.unet_depth = normalize_unet_depth(unet_depth)
+        width_multipliers = [1, 2, 4, 8] if self.unet_depth == 3 else [1, 2, 4, 8, 12]
+        widths = [base_filters * multiplier for multiplier in width_multipliers]
 
-        self.e1 = ResidualBlock2D(in_channels, widths[0], groups=groups)
-        self.e2 = ResidualBlock2D(widths[0], widths[1], groups=groups)
-        self.e3 = ResidualBlock2D(widths[1], widths[2], groups=groups)
-        self.e4 = ResidualBlock2D(widths[2], widths[3], groups=groups)
+        encoder_blocks = []
+        prev_channels = in_channels
+        for width in widths[:-1]:
+            encoder_blocks.append(ResidualBlock2D(prev_channels, width, groups=groups))
+            prev_channels = width
+        self.encoder_blocks = nn.ModuleList(encoder_blocks)
         self.pool = nn.MaxPool2d(2)
 
         self.bottleneck = nn.Sequential(
-            ResidualBlock2D(widths[3], widths[4], groups=groups),
-            ASPPBottleneck2D(widths[4], groups=groups, aspp_dilations=aspp_dilations),
+            ResidualBlock2D(widths[-2], widths[-1], groups=groups),
+            ASPPBottleneck2D(widths[-1], groups=groups, aspp_dilations=aspp_dilations),
         )
 
-        self.up4 = nn.ConvTranspose2d(widths[4], widths[3], kernel_size=2, stride=2)
-        self.d4 = ResidualBlock2D(widths[3] + widths[3], widths[3], groups=groups)
-        self.up3 = nn.ConvTranspose2d(widths[3], widths[2], kernel_size=2, stride=2)
-        self.d3 = ResidualBlock2D(widths[2] + widths[2], widths[2], groups=groups)
-        self.up2 = nn.ConvTranspose2d(widths[2], widths[1], kernel_size=2, stride=2)
-        self.d2 = ResidualBlock2D(widths[1] + widths[1], widths[1], groups=groups)
-        self.up1 = nn.ConvTranspose2d(widths[1], widths[0], kernel_size=2, stride=2)
-        self.d1 = ResidualBlock2D(widths[0] + widths[0], widths[0], groups=groups)
+        upsamplers = []
+        decoder_blocks = []
+        current_width = widths[-1]
+        for skip_width in reversed(widths[:-1]):
+            upsamplers.append(nn.ConvTranspose2d(current_width, skip_width, kernel_size=2, stride=2))
+            decoder_blocks.append(ResidualBlock2D(skip_width + skip_width, skip_width, groups=groups))
+            current_width = skip_width
+        self.upsamplers = nn.ModuleList(upsamplers)
+        self.decoder_blocks = nn.ModuleList(decoder_blocks)
         self.head_refinement = ResidualBlock2D(widths[0], widths[0], groups=groups)
 
-        self.centerline_head = nn.Conv2d(widths[0], 1, kernel_size=1)
-        self.orientation_head = nn.Conv2d(widths[0], 2, kernel_size=1)
-        self.traceability_head = nn.Conv2d(widths[0], 1, kernel_size=1)
-        self.radius_head = nn.Conv2d(widths[0], 1, kernel_size=1)
-        self.bundle_count_head = nn.Conv2d(widths[0], 1, kernel_size=1)
+        self.centerline_head = ShallowPredictionHead2D(widths[0], 1, groups=groups)
+        self.orientation_head = ShallowPredictionHead2D(widths[0], 2, groups=groups)
+        self.traceability_head = ShallowPredictionHead2D(widths[0], 1, groups=groups)
+        self.radius_head = ShallowPredictionHead2D(widths[0], 1, groups=groups)
+        self.bundle_count_head = ShallowPredictionHead2D(widths[0], 1, groups=groups)
         self.out_channels = out_channels
 
     @staticmethod
@@ -140,17 +172,17 @@ class STEDResUNet2D(nn.Module):
         return torch.cat([skip, upsampled], dim=1)
 
     def forward(self, x):
-        e1 = self.e1(x)
-        e2 = self.e2(self.pool(e1))
-        e3 = self.e3(self.pool(e2))
-        e4 = self.e4(self.pool(e3))
-        b = self.bottleneck(self.pool(e4))
+        skips = []
+        for block in self.encoder_blocks:
+            x = block(x)
+            skips.append(x)
+            x = self.pool(x)
 
-        d4 = self.d4(self._concat_skip(e4, self.up4(b)))
-        d3 = self.d3(self._concat_skip(e3, self.up3(d4)))
-        d2 = self.d2(self._concat_skip(e2, self.up2(d3)))
-        d1 = self.d1(self._concat_skip(e1, self.up1(d2)))
-        refined = self.head_refinement(d1)
+        x = self.bottleneck(x)
+
+        for skip, upsample, decoder in zip(reversed(skips), self.upsamplers, self.decoder_blocks):
+            x = decoder(self._concat_skip(skip, upsample(x)))
+        refined = self.head_refinement(x)
 
         return torch.cat(
             [

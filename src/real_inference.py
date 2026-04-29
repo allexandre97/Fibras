@@ -12,7 +12,7 @@ import torch
 
 from src.decoder import CenterlineGraphDecoder
 from src.inference_utils import normalize_image_percentile, predict_tiled_2d
-from src.model import STEDResUNet2D
+from src.model import PREDICTION_HEAD_TYPE, STEDResUNet2D
 from src.sted import orientation_confidence_np, orientation_to_vector_map_np
 from src.sted_calibration import (
     COMPARISON_METRICS,
@@ -21,7 +21,7 @@ from src.sted_calibration import (
     parse_sted_filename,
 )
 from src.visualization import AdvancedVisualizer
-from train import checkpoint_aspp_dilations, extract_model_state_dict, format_aspp_dilations
+from train import checkpoint_aspp_dilations, checkpoint_unet_depth, extract_model_state_dict, format_aspp_dilations
 
 
 OUTPUT_SUFFIXES = {
@@ -79,6 +79,12 @@ def add_inference_arguments(
     parser.add_argument("--dim", type=int, choices=[2], default=2)
     parser.add_argument("--base_filters", type=int, default=32)
     parser.add_argument(
+        "--unet_depth",
+        type=int,
+        default=0,
+        help="Optional U-Net depth override. Defaults to checkpoint config, or legacy depth 4 for old checkpoints.",
+    )
+    parser.add_argument(
         "--aspp_dilations",
         type=str,
         default="",
@@ -128,14 +134,17 @@ def load_sted_model(
     base_filters: int = 32,
     device_spec: str = "auto",
     aspp_dilations=None,
+    unet_depth=None,
 ):
     device = resolve_device(device_spec)
     checkpoint = torch.load(model_path, map_location=device, weights_only=True)
     resolved_aspp_dilations = checkpoint_aspp_dilations(checkpoint, override=aspp_dilations)
+    resolved_unet_depth = checkpoint_unet_depth(checkpoint, override=unet_depth)
     model = STEDResUNet2D(
         in_channels=1,
         base_filters=base_filters,
         aspp_dilations=resolved_aspp_dilations,
+        unet_depth=resolved_unet_depth,
     )
     state_dict = extract_model_state_dict(checkpoint)
     try:
@@ -148,6 +157,20 @@ def load_sted_model(
                 "with the new structural centerline architecture. Train a new checkpoint with the "
                 "upgraded model before running inference."
             ) from error
+        if any(
+            head_name in message
+            for head_name in (
+                "centerline_head",
+                "orientation_head",
+                "traceability_head",
+                "radius_head",
+                "bundle_count_head",
+            )
+        ):
+            raise RuntimeError(
+                f"Checkpoint '{model_path}' does not match the current {PREDICTION_HEAD_TYPE} prediction-head "
+                "architecture. Train a new checkpoint with the current model before running inference."
+            ) from error
         if "bundle_count_head" in message or "size mismatch" in message:
             raise RuntimeError(
                 f"Checkpoint '{model_path}' does not match the current 6-channel bundle-count model. "
@@ -157,6 +180,7 @@ def load_sted_model(
     model.to(device)
     model.eval()
     print(f"Loaded model ASPP dilations: {format_aspp_dilations(resolved_aspp_dilations)}")
+    print(f"Loaded model U-Net depth: {resolved_unet_depth}")
     return model, device
 
 

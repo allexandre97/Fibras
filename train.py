@@ -15,7 +15,16 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import wandb
 
-from src.model import DEFAULT_ASPP_DILATIONS, LEGACY_ASPP_DILATIONS, STEDResUNet2D, normalize_aspp_dilations
+from src.model import (
+    DEFAULT_ASPP_DILATIONS,
+    DEFAULT_UNET_DEPTH,
+    LEGACY_ASPP_DILATIONS,
+    LEGACY_UNET_DEPTH,
+    PREDICTION_HEAD_TYPE,
+    STEDResUNet2D,
+    normalize_aspp_dilations,
+    normalize_unet_depth,
+)
 from src.sted import normalize_orientation_torch
 
 
@@ -53,6 +62,16 @@ def checkpoint_aspp_dilations(checkpoint, override=None) -> tuple[int, ...]:
         if isinstance(config, dict) and "aspp_dilations" in config:
             return parse_aspp_dilations(config["aspp_dilations"])
     return LEGACY_ASPP_DILATIONS
+
+
+def checkpoint_unet_depth(checkpoint, override=None) -> int:
+    if override not in (None, "", 0):
+        return normalize_unet_depth(override)
+    if isinstance(checkpoint, dict):
+        config = checkpoint.get("config")
+        if isinstance(config, dict) and "unet_depth" in config:
+            return normalize_unet_depth(config["unet_depth"])
+    return LEGACY_UNET_DEPTH
 
 
 class PrecomputedFiberDataset(Dataset):
@@ -602,6 +621,7 @@ def train_model(args):
 
     aspp_dilations = parse_aspp_dilations(args.aspp_dilations)
     aspp_dilations_config = format_aspp_dilations(aspp_dilations)
+    unet_depth = normalize_unet_depth(args.unet_depth)
     _validate_dataset(args.data_dir, args.check_samples)
 
     static_config = {
@@ -619,6 +639,8 @@ def train_model(args):
         "augment_intensity": args.augment_intensity,
         "seed": args.seed,
         "aspp_dilations": aspp_dilations_config,
+        "unet_depth": unet_depth,
+        "prediction_head_type": PREDICTION_HEAD_TYPE,
     }
 
     wandb_run = None
@@ -653,7 +675,12 @@ def train_model(args):
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
 
-    model = STEDResUNet2D(in_channels=1, base_filters=args.base_filters, aspp_dilations=aspp_dilations)
+    model = STEDResUNet2D(
+        in_channels=1,
+        base_filters=args.base_filters,
+        aspp_dilations=aspp_dilations,
+        unet_depth=unet_depth,
+    )
 
     if use_data_parallel:
         model = nn.DataParallel(model)
@@ -677,7 +704,8 @@ def train_model(args):
     print(
         "\nStarting 2D STED ResUNet Training Loop... "
         f"device={device}, batch_size={batch_size}, train={len(train_ds)}, val={len(val_ds)}, "
-        f"base_filters={int(args.base_filters)}, aspp_dilations={aspp_dilations_config}"
+        f"base_filters={int(args.base_filters)}, unet_depth={unet_depth}, "
+        f"aspp_dilations={aspp_dilations_config}"
     )
     for epoch in range(args.epochs):
         active_train_centerline_weight = criterion.set_epoch(epoch)
@@ -816,6 +844,7 @@ def add_train_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--project', type=str, default="fibras-sted-resunet2d")
     parser.add_argument('--base_filters', type=int, default=32)
+    parser.add_argument('--unet_depth', type=int, default=DEFAULT_UNET_DEPTH)
     parser.add_argument('--aspp_dilations', type=str, default=format_aspp_dilations(DEFAULT_ASPP_DILATIONS))
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-4)

@@ -21,7 +21,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import wandb
 
-from src.model import STEDResUNet2D
+from src.model import PREDICTION_HEAD_TYPE, STEDResUNet2D
 from train import (
     PrecomputedFiberDataset,
     _add_metric_batch,
@@ -106,11 +106,16 @@ def train_sweep() -> None:
         "augment_geometric": args.augment_geometric,
         "augment_intensity": args.augment_intensity,
         "seed": args.seed,
+        "prediction_head_type": PREDICTION_HEAD_TYPE,
     }
     wandb.config.update(static_config, allow_val_change=True)
     aspp_dilations = parse_aspp_dilations(config.aspp_dilations)
     aspp_dilations_config = format_aspp_dilations(aspp_dilations)
-    wandb.config.update({"aspp_dilations": aspp_dilations_config}, allow_val_change=True)
+    unet_depth = int(config.unet_depth)
+    wandb.config.update(
+        {"aspp_dilations": aspp_dilations_config, "unet_depth": unet_depth},
+        allow_val_change=True,
+    )
 
     train_dir = os.path.join(args.data_dir, "train")
     val_dir = os.path.join(args.data_dir, "val")
@@ -139,6 +144,7 @@ def train_sweep() -> None:
         in_channels=1,
         base_filters=int(config.base_filters),
         aspp_dilations=aspp_dilations,
+        unet_depth=unet_depth,
     )
     if use_data_parallel:
         model = nn.DataParallel(model)
@@ -157,7 +163,8 @@ def train_sweep() -> None:
     print(
         f"Run {run.id if run is not None else '<no-run>'}: "
         f"device={device}, batch_size={batch_size}, train={len(train_ds)}, val={len(val_ds)}, "
-        f"base_filters={int(config.base_filters)}, aspp_dilations={aspp_dilations_config}"
+        f"base_filters={int(config.base_filters)}, unet_depth={unet_depth}, "
+        f"aspp_dilations={aspp_dilations_config}"
     )
 
     for epoch in range(args.epochs):
@@ -398,6 +405,9 @@ def _build_sweep_config(args: argparse.Namespace) -> dict[str, Any]:
             "aspp_dilations": {
                 "values": args.aspp_dilation_values,
             },
+            "unet_depth": {
+                "values": args.unet_depth_values,
+            },
         },
     }
 
@@ -414,6 +424,7 @@ def add_train_sweep_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--project", type=str, default="fibras-sted-resunet2d-sweep-v3")
     parser.add_argument("--base_filters_values", type=int, nargs="+", default=[32, 40])
+    parser.add_argument("--unet_depth_values", type=int, nargs="+", default=[3, 4])
     parser.add_argument("--aspp_dilation_values", type=str, nargs="+", default=["1,2,4", "1,2,3", "2,4,8"])
     parser.add_argument("--amp_dtype", type=str, choices=["bf16", "fp16", "off"], default="bf16")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0)

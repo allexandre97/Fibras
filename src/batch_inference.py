@@ -312,6 +312,7 @@ def main(args):
         base_filters=args.base_filters,
         device_spec=args.device,
         aspp_dilations=args.aspp_dilations,
+        unet_depth=args.unet_depth,
     )
     print(f"Executing batch inference on: {device}")
     calibration_profile = load_optional_profile(args.profile)

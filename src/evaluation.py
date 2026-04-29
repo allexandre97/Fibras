@@ -8,6 +8,7 @@ from train import (
     PrecomputedFiberDataset,
     StedFieldLoss2D,
     checkpoint_aspp_dilations,
+    checkpoint_unet_depth,
     extract_model_state_dict,
     format_aspp_dilations,
 )
@@ -24,7 +25,13 @@ def evaluate_model(args):
 
     checkpoint = torch.load(args.model_path, map_location=device, weights_only=True)
     aspp_dilations = checkpoint_aspp_dilations(checkpoint, override=args.aspp_dilations)
-    model = STEDResUNet2D(in_channels=1, base_filters=args.base_filters, aspp_dilations=aspp_dilations)
+    unet_depth = checkpoint_unet_depth(checkpoint, override=args.unet_depth)
+    model = STEDResUNet2D(
+        in_channels=1,
+        base_filters=args.base_filters,
+        aspp_dilations=aspp_dilations,
+        unet_depth=unet_depth,
+    )
     model.load_state_dict(extract_model_state_dict(checkpoint))
     model.to(device)
     model.eval()
@@ -90,6 +97,7 @@ def evaluate_model(args):
     n_batches = len(test_loader)
     print(f"\n--- Unseen Test Set Evaluation ({args.dim}D Model) ---")
     print(f"Target Checkpoint: {args.model_path}")
+    print(f"U-Net Depth: {unet_depth}")
     print(f"ASPP Dilations: {format_aspp_dilations(aspp_dilations)}")
     print(f"Average Total Loss: {total_metrics['loss'] / n_batches:.4f}")
     print(f"Average Fixed Score: {total_metrics['score'] / n_batches:.4f}")
@@ -109,6 +117,7 @@ def add_evaluate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--data_dir', type=str, required=True, help="Path to base dataset folder")
     parser.add_argument('--dim', type=int, choices=[2], default=2)
     parser.add_argument('--base_filters', type=int, default=32)
+    parser.add_argument('--unet_depth', type=int, default=0)
     parser.add_argument('--aspp_dilations', type=str, default="")
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--crop_size', type=int, default=0)
