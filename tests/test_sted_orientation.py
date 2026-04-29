@@ -173,6 +173,15 @@ class StedOrientationTests(unittest.TestCase):
         self.assertAlmostEqual(weights[4], 0.40, places=6)
         self.assertTrue(all(a <= b for a, b in zip(weights, weights[1:])))
 
+    def test_model_refinement_preserves_full_resolution_output_shape(self):
+        model = STEDResUNet2D(base_filters=8)
+        self.assertTrue(hasattr(model, "head_refinement"))
+
+        with torch.no_grad():
+            pred = model(torch.zeros((2, 1, 41, 53), dtype=torch.float32))
+
+        self.assertEqual(tuple(pred.shape), (2, 6, 41, 53))
+
     def test_tiled_prediction_preserves_input_shape(self):
         model = STEDResUNet2D(base_filters=8)
         image = np.zeros((40, 52), dtype=np.float32)

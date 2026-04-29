@@ -90,6 +90,7 @@ class STEDResUNet2D(nn.Module):
         self.d2 = ResidualBlock2D(widths[1] + widths[1], widths[1], groups=groups)
         self.up1 = nn.ConvTranspose2d(widths[1], widths[0], kernel_size=2, stride=2)
         self.d1 = ResidualBlock2D(widths[0] + widths[0], widths[0], groups=groups)
+        self.head_refinement = ResidualBlock2D(widths[0], widths[0], groups=groups)
 
         self.centerline_head = nn.Conv2d(widths[0], 1, kernel_size=1)
         self.orientation_head = nn.Conv2d(widths[0], 2, kernel_size=1)
@@ -120,14 +121,15 @@ class STEDResUNet2D(nn.Module):
         d3 = self.d3(self._concat_skip(e3, self.up3(d4)))
         d2 = self.d2(self._concat_skip(e2, self.up2(d3)))
         d1 = self.d1(self._concat_skip(e1, self.up1(d2)))
+        refined = self.head_refinement(d1)
 
         return torch.cat(
             [
-                self.centerline_head(d1),
-                self.orientation_head(d1),
-                self.traceability_head(d1),
-                self.radius_head(d1),
-                self.bundle_count_head(d1),
+                self.centerline_head(refined),
+                self.orientation_head(refined),
+                self.traceability_head(refined),
+                self.radius_head(refined),
+                self.bundle_count_head(refined),
             ],
             dim=1,
         )
