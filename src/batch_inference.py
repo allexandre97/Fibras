@@ -8,6 +8,7 @@ from typing import Dict, List, Sequence
 import numpy as np
 
 from src.real_inference import (
+    OUTPUT_SUFFIXES,
     add_inference_arguments,
     build_output_paths,
     load_image_for_inference,
@@ -27,6 +28,11 @@ from src.sted_calibration import parse_sted_filename
 
 
 def _discover_tiff_files(input_dir: str, recursive: bool) -> List[str]:
+    generated_suffixes = tuple(
+        suffix
+        for key, suffix in OUTPUT_SUFFIXES.items()
+        if key != "summary" and suffix.lower().endswith((".tif", ".tiff"))
+    )
     files = []
     if recursive:
         walker = os.walk(input_dir)
@@ -35,7 +41,10 @@ def _discover_tiff_files(input_dir: str, recursive: bool) -> List[str]:
 
     for root, _, names in walker:
         for name in names:
-            if name.lower().endswith((".tif", ".tiff")):
+            lower_name = name.lower()
+            if lower_name.endswith(generated_suffixes):
+                continue
+            if lower_name.endswith((".tif", ".tiff")):
                 files.append(os.path.join(root, name))
     files.sort()
     return files
@@ -367,6 +376,7 @@ def main(args):
             centerline_prob=arrays["pred_centerline"],
             traceability_map=arrays["pred_traceability"],
             radius_map=arrays["pred_radius"],
+            bundle_count_map=arrays["pred_bundle_count"],
             orientation_confidence=arrays["pred_orient_conf"],
             out_path=preview_path,
             title=os.path.basename(row["source"]),
