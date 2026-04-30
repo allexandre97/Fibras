@@ -80,6 +80,8 @@ DEFAULT_APPARENT_WIDTH_P90_WEIGHT = 0.75
 DEFAULT_BASE_SIGMA_MIN = 0.90
 DEFAULT_BASE_SIGMA_MAX = 2.80
 TIFF_EXTENSIONS = (".tif", ".tiff")
+BLANK_SPLIT_NAMES = ("train", "val", "test")
+DEFAULT_BLANK_SPLIT_SEED = 1234
 
 
 # -----------------------------------------------------------------------------
@@ -1276,6 +1278,161 @@ def _discover_tiff_files(input_dir: str, recursive: bool = False) -> List[str]:
     return sorted(paths)
 
 
+def _split_triple_to_map(values: Optional[Sequence[float]], value_type=float) -> Optional[Dict[str, object]]:
+    if values is None:
+        return None
+    if len(values) != len(BLANK_SPLIT_NAMES):
+        raise ValueError(f"Expected {len(BLANK_SPLIT_NAMES)} values for train/val/test.")
+    return {name: value_type(value) for name, value in zip(BLANK_SPLIT_NAMES, values)}
+
+
+def _allocate_counts_by_weight(
+    total: int,
+    split_names: Sequence[str],
+    weights: Sequence[float],
+    *,
+    ensure_each: bool,
+) -> Dict[str, int]:
+    if total < 0:
+        raise ValueError("Cannot allocate a negative number of blank sources.")
+    if not split_names:
+        return {}
+    if len(split_names) != len(weights):
+        raise ValueError("split_names and weights must have matching lengths.")
+    if ensure_each and total < len(split_names):
+        raise ValueError(
+            f"Need at least {len(split_names)} blank TIFFs for disjoint assignment to "
+            f"{', '.join(split_names)}; found {total}."
+        )
+
+    weight_array = np.asarray([float(w) for w in weights], dtype=np.float64)
+    if np.any(weight_array < 0.0):
+        raise ValueError("Blank split weights/fractions must be non-negative.")
+    if not np.isfinite(weight_array).all():
+        raise ValueError("Blank split weights/fractions must be finite.")
+    if float(weight_array.sum()) <= 0.0:
+        weight_array = np.ones(len(split_names), dtype=np.float64)
+
+    raw_counts = weight_array / float(weight_array.sum()) * float(total)
+    counts = np.floor(raw_counts).astype(int)
+    remainder = int(total - int(counts.sum()))
+    order = sorted(range(len(split_names)), key=lambda i: (-(raw_counts[i] - counts[i]), i))
+    for index in order[:remainder]:
+        counts[index] += 1
+
+    if ensure_each:
+        for index, count in enumerate(list(counts)):
+            if count > 0:
+                continue
+            donor = int(np.argmax(counts))
+            if counts[donor] <= 1:
+                break
+            counts[donor] -= 1
+            counts[index] += 1
+
+    return {split_name: int(count) for split_name, count in zip(split_names, counts)}
+
+
+def plan_blank_tiff_splits(
+    blank_tiff_paths: Sequence[str],
+    split_names: Sequence[str],
+    split_sizes: Dict[str, int],
+    policy: str,
+    seed: int,
+    split_counts: Optional[Dict[str, int]] = None,
+    split_fractions: Optional[Dict[str, float]] = None,
+) -> Tuple[Dict[str, List[str]], List[str]]:
+    """Assign blank TIFF source files to dataset splits.
+
+    The default policy is source-file disjointness. Reuse is intentionally
+    explicit because crop-level separation from the same blank image is not a
+    meaningful validation/test negative-control split.
+    """
+    split_names = list(split_names)
+    if policy not in {"disjoint", "reuse"}:
+        raise ValueError("--blank_split_policy must be either 'disjoint' or 'reuse'.")
+    if split_counts is not None and split_fractions is not None:
+        raise ValueError("Use either --blank_split_counts or --blank_split_fractions, not both.")
+    if len(set(split_names)) != len(split_names):
+        raise ValueError("--blank_splits cannot contain duplicate split names.")
+    unknown_splits = sorted(set(split_names) - set(BLANK_SPLIT_NAMES))
+    if unknown_splits:
+        raise ValueError(f"Unsupported blank split name(s): {', '.join(unknown_splits)}")
+
+    paths = [os.path.abspath(path) for path in blank_tiff_paths]
+    rng = np.random.default_rng(int(seed))
+    if paths:
+        order = np.arange(len(paths))
+        rng.shuffle(order)
+        paths = [paths[int(index)] for index in order]
+
+    if split_counts is not None:
+        counts = {split: int(split_counts.get(split, 0)) for split in split_names}
+        if any(count < 0 for count in counts.values()):
+            raise ValueError("--blank_split_counts values must be non-negative.")
+    elif split_fractions is not None:
+        if policy == "reuse":
+            raise ValueError("--blank_split_fractions is only supported with --blank_split_policy disjoint.")
+        weights = [float(split_fractions.get(split, 0.0)) for split in split_names]
+        counts = _allocate_counts_by_weight(len(paths), split_names, weights, ensure_each=False)
+    elif policy == "reuse":
+        counts = {split: len(paths) for split in split_names}
+    elif len(split_names) == 1:
+        counts = {split_names[0]: len(paths)}
+    else:
+        weights = [float(max(int(split_sizes.get(split, 0)), 1)) for split in split_names]
+        counts = _allocate_counts_by_weight(len(paths), split_names, weights, ensure_each=True)
+
+    if policy == "disjoint" and sum(counts.values()) > len(paths):
+        raise ValueError(
+            f"Requested {sum(counts.values())} disjoint blank TIFF source(s), but only {len(paths)} were found."
+        )
+    if policy == "reuse" and paths and any(count > len(paths) for count in counts.values()):
+        raise ValueError("Each --blank_split_counts value must be <= the number of discovered blank TIFFs.")
+    if any(count > 0 for count in counts.values()) and not paths:
+        raise ValueError("Cannot assign blank TIFFs because none were discovered.")
+
+    allocations = {split: [] for split in split_names}
+    unused_paths: List[str] = []
+    if policy == "reuse":
+        for split in split_names:
+            allocations[split] = list(paths[: counts[split]])
+        used = set(path for split in split_names for path in allocations[split])
+        unused_paths = [path for path in paths if path not in used]
+        return allocations, unused_paths
+
+    offset = 0
+    for split in split_names:
+        count = int(counts[split])
+        allocations[split] = list(paths[offset : offset + count])
+        offset += count
+    unused_paths = list(paths[offset:])
+    return allocations, unused_paths
+
+
+def _blank_source_intensity_summary(
+    image: np.ndarray,
+    source_dtype: np.dtype,
+    percentile_low: float,
+    percentile_high: float,
+) -> Dict[str, object]:
+    image = np.asarray(image, dtype=np.float32)
+    finite = image[np.isfinite(image)]
+    if finite.size == 0:
+        raise ValueError("Blank image contains no finite pixels.")
+    p_low, p_high = np.percentile(finite, (percentile_low, percentile_high))
+    return {
+        "source_dtype": str(source_dtype),
+        "raw_min": float(np.min(finite)),
+        "raw_max": float(np.max(finite)),
+        "raw_mean": float(np.mean(finite)),
+        "raw_std": float(np.std(finite)),
+        "raw_percentile_low": float(p_low),
+        "raw_percentile_high": float(p_high),
+        "raw_dynamic_range": float(np.max(finite) - np.min(finite)),
+    }
+
+
 def _normalize_blank_image(
     image: np.ndarray,
     source_dtype: np.dtype,
@@ -1316,18 +1473,45 @@ def _load_blank_tiff_image(
     normalization: str,
     percentile_low: float,
     percentile_high: float,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, Dict[str, object], List[str]]:
     raw = tifffile.imread(path)
     image = np.squeeze(raw)
     if image.ndim != 2:
         raise ValueError(f"{path} did not resolve to a 2D image after squeeze: {image.shape}")
-    return _normalize_blank_image(
+    source_dtype = np.asarray(raw).dtype
+    summary = _blank_source_intensity_summary(
         image,
-        source_dtype=np.asarray(raw).dtype,
+        source_dtype=source_dtype,
+        percentile_low=percentile_low,
+        percentile_high=percentile_high,
+    )
+    normalized = _normalize_blank_image(
+        image,
+        source_dtype=source_dtype,
         mode=normalization,
         percentile_low=percentile_low,
         percentile_high=percentile_high,
     )
+    if not np.isfinite(normalized).all():
+        raise ValueError(f"{path} produced non-finite normalized blank pixels.")
+
+    summary.update(
+        {
+            "normalized_min": float(np.min(normalized)),
+            "normalized_max": float(np.max(normalized)),
+            "normalized_mean": float(np.mean(normalized)),
+            "normalized_std": float(np.std(normalized)),
+            "normalized_dynamic_range": float(np.max(normalized) - np.min(normalized)),
+        }
+    )
+    warnings: List[str] = []
+    if float(summary["raw_dynamic_range"]) <= 1e-6:
+        warnings.append("source image has near-zero raw dynamic range")
+    if normalization == "percentile" and float(summary["raw_percentile_high"]) <= float(summary["raw_percentile_low"]):
+        warnings.append("percentile normalization collapsed because high percentile <= low percentile")
+    if float(summary["normalized_dynamic_range"]) <= 1e-6:
+        warnings.append("normalized image has near-zero dynamic range")
+    return normalized, summary, warnings
 
 
 def _pad_image_xy_to_min_shape(image_xy: np.ndarray, min_shape_xy: Tuple[int, int]) -> np.ndarray:
@@ -1349,6 +1533,17 @@ def _blank_target_arrays(shape_xy: Tuple[int, int]):
     return centerline, vector, traceability, radius, bundle_count
 
 
+def _clear_existing_blank_samples(split_dir: str) -> int:
+    if not os.path.isdir(split_dir):
+        return 0
+    removed = 0
+    for name in os.listdir(split_dir):
+        if name.startswith("blank_") and name.endswith(".pt"):
+            os.remove(os.path.join(split_dir, name))
+            removed += 1
+    return removed
+
+
 def save_blank_tiff_crops(
     split_name: str,
     base_dir: str,
@@ -1358,14 +1553,19 @@ def save_blank_tiff_crops(
     normalization: str,
     percentile_low: float,
     percentile_high: float,
+    source_file_ids: Optional[Dict[str, str]] = None,
 ) -> int:
     import torch
+
+    split_dir = os.path.join(base_dir, split_name)
+    os.makedirs(split_dir, exist_ok=True)
+    removed = _clear_existing_blank_samples(split_dir)
+    if removed:
+        print(f"  Removed {removed} stale blank sample(s) from '{split_name}'.")
 
     if not blank_tiff_paths:
         return 0
 
-    split_dir = os.path.join(base_dir, split_name)
-    os.makedirs(split_dir, exist_ok=True)
     print(
         f"Adding {len(blank_tiff_paths)} blank TIFF image(s) to '{split_name}' "
         f"({crops_per_image} crop(s) per image) at {split_dir}..."
@@ -1374,30 +1574,53 @@ def save_blank_tiff_crops(
     saved_count = 0
     zero_targets = _blank_target_arrays(crop_bounds)
     for image_index, path in enumerate(blank_tiff_paths):
-        image_yx = _load_blank_tiff_image(
+        image_yx, source_summary, source_warnings = _load_blank_tiff_image(
             path,
             normalization=normalization,
             percentile_low=percentile_low,
             percentile_high=percentile_high,
         )
+        for warning in source_warnings:
+            print(f"  Warning: blank source {path}: {warning}.")
         image_xy = _pad_image_xy_to_min_shape(image_yx.T, crop_bounds)
         for crop_index in range(int(crops_per_image)):
             x0, y0 = _random_crop_origin((int(image_xy.shape[0]), int(image_xy.shape[1])), crop_bounds)
             image_crop = _crop_array(image_xy, x0, y0, int(crop_bounds[0]), int(crop_bounds[1]))
+            if not np.isfinite(image_crop).all():
+                raise ValueError(f"{path} produced non-finite pixels in blank crop {crop_index}.")
             volume_tensor, targets_tensor = _to_2d_tensors(image_crop, *zero_targets)
+            expected_hw = (int(crop_bounds[1]), int(crop_bounds[0]))
+            if tuple(volume_tensor.shape) != (1, 1, expected_hw[0], expected_hw[1]):
+                raise ValueError(
+                    f"Blank crop from {path} produced volume shape {tuple(volume_tensor.shape)}; "
+                    f"expected {(1, 1, expected_hw[0], expected_hw[1])}."
+                )
+            if tuple(targets_tensor.shape) != (6, 1, expected_hw[0], expected_hw[1]):
+                raise ValueError(
+                    f"Blank crop from {path} produced target shape {tuple(targets_tensor.shape)}; "
+                    f"expected {(6, 1, expected_hw[0], expected_hw[1])}."
+                )
+            if not torch.isfinite(volume_tensor).all() or not torch.isfinite(targets_tensor).all():
+                raise ValueError(f"Blank crop from {path} produced non-finite tensors.")
+            abs_path = os.path.abspath(path)
             record = {
                 "volume": volume_tensor,
                 "targets": targets_tensor,
                 "target_schema": "structural_v2",
                 "metadata": {
                     "sample_type": "blank",
-                    "source_path": os.path.abspath(path),
+                    "blank_split": split_name,
+                    "source_path": abs_path,
+                    "source_file_id": (source_file_ids or {}).get(abs_path, f"blank_source_{image_index:06d}"),
                     "source_shape_yx": tuple(int(v) for v in image_yx.shape),
                     "source_image_index": int(image_index),
                     "crop_index_within_source": int(crop_index),
                     "crop_origin_xy": (int(x0), int(y0)),
                     "crop_bounds_xy": tuple(int(v) for v in crop_bounds),
                     "blank_normalization": normalization,
+                    "blank_percentile_low": float(percentile_low),
+                    "blank_percentile_high": float(percentile_high),
+                    "source_intensity_summary": source_summary,
                 },
             }
             out_name = f"blank_{saved_count:06d}.pt"
@@ -1406,6 +1629,12 @@ def save_blank_tiff_crops(
             saved_count += 1
 
     print(f"  Added {saved_count} blank sample(s) to '{split_name}'.")
+    actual_blank_files = len([name for name in os.listdir(split_dir) if name.startswith("blank_") and name.endswith(".pt")])
+    expected_blank_files = len(blank_tiff_paths) * int(crops_per_image)
+    if actual_blank_files != expected_blank_files:
+        raise RuntimeError(
+            f"Split '{split_name}' expected {expected_blank_files} blank .pt files, found {actual_blank_files}."
+        )
     return saved_count
 
 
@@ -1592,6 +1821,41 @@ def build_dataset_split(
         raise RuntimeError(f"Split '{split_name}' expected {size} synthetic .pt files, found {actual_files}.")
 
 
+def _dataset_split_counts(base_dir: str, split_names: Sequence[str]) -> Dict[str, Dict[str, object]]:
+    counts: Dict[str, Dict[str, object]] = {}
+    for split_name in split_names:
+        split_dir = os.path.join(base_dir, split_name)
+        if not os.path.isdir(split_dir):
+            sample_count = 0
+            blank_count = 0
+            total_count = 0
+        else:
+            names = [name for name in os.listdir(split_dir) if name.endswith(".pt")]
+            sample_count = sum(1 for name in names if name.startswith("sample_"))
+            blank_count = sum(1 for name in names if name.startswith("blank_"))
+            total_count = len(names)
+        counts[split_name] = {
+            "synthetic_count": int(sample_count),
+            "blank_count": int(blank_count),
+            "total_count": int(total_count),
+            "blank_fraction": float(blank_count / total_count) if total_count else 0.0,
+        }
+    return counts
+
+
+def _print_dataset_split_counts(counts: Dict[str, Dict[str, object]]) -> None:
+    print("Dataset split counts:")
+    for split_name in BLANK_SPLIT_NAMES:
+        split_counts = counts.get(split_name, {})
+        print(
+            "  "
+            f"{split_name}: synthetic={int(split_counts.get('synthetic_count', 0))}, "
+            f"blank={int(split_counts.get('blank_count', 0))}, "
+            f"total={int(split_counts.get('total_count', 0))}, "
+            f"blank_fraction={float(split_counts.get('blank_fraction', 0.0)):.4f}"
+        )
+
+
 # -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
@@ -1688,6 +1952,35 @@ def _parse_args():
     )
     parser.add_argument("--blank_percentile_low", type=float, default=0.5)
     parser.add_argument("--blank_percentile_high", type=float, default=99.9)
+    parser.add_argument(
+        "--blank_split_seed",
+        type=int,
+        default=DEFAULT_BLANK_SPLIT_SEED,
+        help="Seed for deterministic blank TIFF source-file assignment. Default: 1234.",
+    )
+    parser.add_argument(
+        "--blank_split_policy",
+        type=str,
+        choices=["disjoint", "reuse"],
+        default="disjoint",
+        help="Whether blank TIFF source files must be disjoint across requested splits. Default: disjoint.",
+    )
+    parser.add_argument(
+        "--blank_split_counts",
+        type=int,
+        nargs=3,
+        default=None,
+        metavar=("TRAIN", "VAL", "TEST"),
+        help="Exact blank source-file counts for train/val/test. Counts for unrequested splits are ignored.",
+    )
+    parser.add_argument(
+        "--blank_split_fractions",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("TRAIN", "VAL", "TEST"),
+        help="Fractions used to divide discovered blanks across train/val/test in disjoint mode.",
+    )
     return parser.parse_args()
 
 
@@ -1704,12 +1997,22 @@ def _validate_args(args) -> None:
         raise ValueError("--blank_crops_per_image must be at least 1.")
     if args.blank_max_images < 0:
         raise ValueError("--blank_max_images must be non-negative.")
+    if args.blank_split_counts is not None and args.blank_split_fractions is not None:
+        raise ValueError("Use either --blank_split_counts or --blank_split_fractions, not both.")
+    if args.blank_split_counts is not None and any(value < 0 for value in args.blank_split_counts):
+        raise ValueError("--blank_split_counts values must be non-negative.")
+    if args.blank_split_fractions is not None and any(value < 0.0 for value in args.blank_split_fractions):
+        raise ValueError("--blank_split_fractions values must be non-negative.")
+    if args.blank_split_policy == "reuse" and args.blank_split_fractions is not None:
+        raise ValueError("--blank_split_fractions is only supported with --blank_split_policy disjoint.")
     if args.blank_percentile_low < 0.0 or args.blank_percentile_high > 100.0:
         raise ValueError("--blank_percentile_low/high must be within [0, 100].")
     if args.blank_percentile_low >= args.blank_percentile_high:
         raise ValueError("--blank_percentile_low must be smaller than --blank_percentile_high.")
     if args.blank_tiff_dir is not None and not os.path.isdir(args.blank_tiff_dir):
         raise FileNotFoundError(f"Blank TIFF directory not found: {args.blank_tiff_dir}")
+    if len(set(args.blank_splits)) != len(args.blank_splits):
+        raise ValueError("--blank_splits cannot contain duplicate split names.")
 
     _validate_positive("label_slab_scale", args.label_slab_scale)
     _validate_probability("soft_skeleton_alpha", args.soft_skeleton_alpha)
@@ -1757,6 +2060,26 @@ def main() -> None:
         if not blank_tiff_paths:
             raise FileNotFoundError(f"No TIFF files found under {args.blank_tiff_dir}")
 
+    blank_split_counts = _split_triple_to_map(args.blank_split_counts, int)
+    blank_split_fractions = _split_triple_to_map(args.blank_split_fractions, float)
+    blank_source_ids = {os.path.abspath(path): f"blank_source_{index:06d}" for index, path in enumerate(blank_tiff_paths)}
+    blank_allocations: Dict[str, List[str]] = {split_name: [] for split_name in args.blank_splits}
+    blank_unused_paths: List[str] = []
+    if blank_tiff_paths:
+        blank_allocations, blank_unused_paths = plan_blank_tiff_splits(
+            blank_tiff_paths=blank_tiff_paths,
+            split_names=args.blank_splits,
+            split_sizes={
+                "train": int(args.train_size),
+                "val": int(args.val_size),
+                "test": int(args.test_size),
+            },
+            policy=args.blank_split_policy,
+            seed=int(args.blank_split_seed),
+            split_counts=blank_split_counts,
+            split_fractions=blank_split_fractions,
+        )
+
     config_summary = {
         "target_schema": "structural_v2",
         "scene_bounds": scene_bounds,
@@ -1779,9 +2102,26 @@ def main() -> None:
         "blank_normalization": args.blank_normalization,
         "blank_percentile_low": float(args.blank_percentile_low),
         "blank_percentile_high": float(args.blank_percentile_high),
+        "blank_split_seed": int(args.blank_split_seed),
+        "blank_split_policy": args.blank_split_policy,
+        "blank_split_counts": blank_split_counts,
+        "blank_split_fractions": blank_split_fractions,
+        "blank_allocation": {
+            split_name: {
+                "source_count": len(paths),
+                "crop_count": len(paths) * int(args.blank_crops_per_image),
+                "source_paths": [os.path.abspath(path) for path in paths],
+            }
+            for split_name, paths in blank_allocations.items()
+        },
+        "blank_unused_source_count": len(blank_unused_paths),
+        "blank_unused_source_paths": [os.path.abspath(path) for path in blank_unused_paths],
+        "synthetic_split_sizes": {
+            "train": int(args.train_size),
+            "val": int(args.val_size),
+            "test": int(args.test_size),
+        },
     }
-    with open(os.path.join(args.output_dir, "generation_config.json"), "w", encoding="utf-8") as handle:
-        json.dump(config_summary, handle, indent=2)
 
     common_kwargs = dict(
         label_slab_thickness=args.label_slab_thickness,
@@ -1850,17 +2190,30 @@ def main() -> None:
     )
 
     if blank_tiff_paths:
+        for split_name in BLANK_SPLIT_NAMES:
+            if split_name in args.blank_splits:
+                continue
+            removed = _clear_existing_blank_samples(os.path.join(args.output_dir, split_name))
+            if removed:
+                print(f"  Removed {removed} stale blank sample(s) from unrequested split '{split_name}'.")
         for split_name in args.blank_splits:
             save_blank_tiff_crops(
                 split_name=split_name,
                 base_dir=args.output_dir,
-                blank_tiff_paths=blank_tiff_paths,
+                blank_tiff_paths=blank_allocations.get(split_name, []),
                 crop_bounds=crop_bounds,
                 crops_per_image=args.blank_crops_per_image,
                 normalization=args.blank_normalization,
                 percentile_low=args.blank_percentile_low,
                 percentile_high=args.blank_percentile_high,
+                source_file_ids=blank_source_ids,
             )
+
+    split_counts = _dataset_split_counts(args.output_dir, BLANK_SPLIT_NAMES)
+    config_summary["split_counts"] = split_counts
+    with open(os.path.join(args.output_dir, "generation_config.json"), "w", encoding="utf-8") as handle:
+        json.dump(config_summary, handle, indent=2)
+    _print_dataset_split_counts(split_counts)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ import time
 import argparse
 import sys
 import random
+import json
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -516,24 +517,127 @@ def _autocast_context(device: torch.device, dtype):
     return nullcontext()
 
 
+def _split_pt_files(split_dir: Path) -> tuple[list[Path], list[Path], list[Path]]:
+    files = sorted(split_dir.glob("*.pt"))
+    sample_files = [path for path in files if path.name.startswith("sample_")]
+    blank_files = [path for path in files if path.name.startswith("blank_")]
+    other_files = [path for path in files if path not in sample_files and path not in blank_files]
+    return sample_files, blank_files, other_files
+
+
+def _validate_dataset_record(path: Path) -> dict[str, Any]:
+    record = _torch_load(path)
+    schema = record.get("target_schema", "legacy")
+    if schema != "structural_v2":
+        raise ValueError(f"{path} has target_schema={schema!r}; expected 'structural_v2'.")
+    targets = record.get("targets")
+    if targets is None:
+        raise KeyError(f"{path} is missing the 'targets' tensor.")
+    if targets.shape[0] != 6:
+        raise ValueError(f"{path} has target shape {tuple(targets.shape)}; expected 6 target channels.")
+    if "volume" not in record:
+        raise KeyError(f"{path} is missing the 'volume' tensor.")
+    return record
+
+
+def _dataset_config_allows_blank_reuse(data_dir: Path) -> bool:
+    config_path = data_dir / "generation_config.json"
+    if not config_path.exists():
+        return False
+    with open(config_path, "r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    return config.get("blank_split_policy") == "reuse"
+
+
+def _print_dataset_validation_counts(split_counts: dict[str, dict[str, int]]) -> None:
+    print("Dataset validation counts:")
+    for split in ("train", "val", "test"):
+        if split not in split_counts:
+            continue
+        counts = split_counts[split]
+        print(
+            "  "
+            f"{split}: synthetic={counts['synthetic']}, "
+            f"blank={counts['blank']}, "
+            f"other={counts['other']}, "
+            f"total={counts['total']}"
+        )
+
+
 def _validate_dataset(data_dir: str, check_samples: int) -> None:
-    for split in ("train", "val"):
+    data_root = Path(data_dir)
+    split_counts: dict[str, dict[str, int]] = {}
+    blank_sources_by_split: dict[str, set[str]] = {}
+    splits_to_validate = ("train", "val")
+
+    for split in splits_to_validate:
         split_dir = Path(data_dir) / split
-        files = sorted(split_dir.glob("*.pt"))
+        sample_files, blank_files, other_files = _split_pt_files(split_dir)
+        files = sample_files + blank_files + other_files
         if not files:
             raise FileNotFoundError(f"No .pt files found in {split_dir}")
 
-        n_check = min(int(check_samples), len(files))
-        for path in files[:n_check]:
-            record = _torch_load(path)
-            schema = record.get("target_schema", "legacy")
-            if schema != "structural_v2":
-                raise ValueError(f"{path} has target_schema={schema!r}; expected 'structural_v2'.")
-            targets = record.get("targets")
-            if targets is None:
-                raise KeyError(f"{path} is missing the 'targets' tensor.")
-            if targets.shape[0] != 6:
-                raise ValueError(f"{path} has target shape {tuple(targets.shape)}; expected 6 target channels.")
+        split_counts[split] = {
+            "synthetic": len(sample_files),
+            "blank": len(blank_files),
+            "other": len(other_files),
+            "total": len(files),
+        }
+        n_check = max(0, int(check_samples))
+        if n_check > 0:
+            check_paths = (
+                sample_files[: min(n_check, len(sample_files))]
+                + blank_files[: min(n_check, len(blank_files))]
+                + other_files[: min(n_check, len(other_files))]
+            )
+            for path in check_paths:
+                _validate_dataset_record(path)
+
+        blank_sources: set[str] = set()
+        for path in blank_files:
+            record = _validate_dataset_record(path)
+            metadata = record.get("metadata", {})
+            if not isinstance(metadata, dict) or metadata.get("sample_type") != "blank":
+                raise ValueError(f"{path} is named as a blank sample but is missing blank metadata.")
+            source_path = metadata.get("source_path")
+            if not source_path:
+                raise ValueError(f"{path} is missing metadata['source_path']; cannot check blank split leakage.")
+            blank_sources.add(os.path.abspath(str(source_path)))
+        blank_sources_by_split[split] = blank_sources
+
+    test_dir = data_root / "test"
+    if test_dir.exists():
+        sample_files, blank_files, other_files = _split_pt_files(test_dir)
+        split_counts["test"] = {
+            "synthetic": len(sample_files),
+            "blank": len(blank_files),
+            "other": len(other_files),
+            "total": len(sample_files) + len(blank_files) + len(other_files),
+        }
+        blank_sources: set[str] = set()
+        for path in blank_files:
+            record = _validate_dataset_record(path)
+            metadata = record.get("metadata", {})
+            if isinstance(metadata, dict) and metadata.get("source_path"):
+                blank_sources.add(os.path.abspath(str(metadata["source_path"])))
+            else:
+                raise ValueError(f"{path} is missing metadata['source_path']; cannot check blank split leakage.")
+        blank_sources_by_split["test"] = blank_sources
+
+    _print_dataset_validation_counts(split_counts)
+
+    if not _dataset_config_allows_blank_reuse(data_root):
+        split_names = sorted(blank_sources_by_split)
+        for index, left in enumerate(split_names):
+            for right in split_names[index + 1:]:
+                overlap = blank_sources_by_split[left] & blank_sources_by_split[right]
+                if overlap:
+                    examples = ", ".join(sorted(overlap)[:3])
+                    raise ValueError(
+                        f"Blank TIFF source leakage detected between '{left}' and '{right}' splits. "
+                        f"Shared source(s): {examples}. Regenerate with disjoint blanks or set "
+                        "--blank_split_policy reuse explicitly."
+                    )
 
 
 def _make_criterion(config) -> StedFieldLoss2D:
