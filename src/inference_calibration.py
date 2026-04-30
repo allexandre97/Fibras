@@ -539,6 +539,9 @@ def main(args):
         device_spec=args.device,
         aspp_dilations=args.aspp_dilations,
         unet_depth=args.unet_depth,
+        head_type=args.head_type,
+        head_hidden_channels=args.head_hidden_channels,
+        use_head_refinement=args.use_head_refinement,
     )
     use_amp = not args.no_amp
     _ = load_optional_profile(args.profile)
@@ -692,6 +695,24 @@ def add_calibration_arguments(parser: argparse.ArgumentParser) -> None:
         type=str,
         default="",
         help="Optional comma-separated ASPP dilation override. Defaults to checkpoint config, or legacy 2,4,8 for old checkpoints.",
+    )
+    parser.add_argument(
+        "--head_type",
+        type=str,
+        default="",
+        help="Optional prediction-head type override. Defaults to checkpoint config.",
+    )
+    parser.add_argument(
+        "--head_hidden_channels",
+        type=int,
+        default=0,
+        help="Optional bottleneck head width override. Defaults to checkpoint config.",
+    )
+    parser.add_argument(
+        "--use_head_refinement",
+        type=str,
+        default="auto",
+        help="Optional head-refinement override: auto, true, or false.",
     )
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--no_amp", action="store_true")

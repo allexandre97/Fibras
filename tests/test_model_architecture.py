@@ -6,14 +6,28 @@ import torch.nn as nn
 
 import sweep
 from src.model import (
+    BottleneckPredictionHead2D,
+    DEFAULT_HEAD_HIDDEN_CHANNELS,
+    DEFAULT_HEAD_TYPE,
     DEFAULT_UNET_DEPTH,
+    DEFAULT_USE_HEAD_REFINEMENT,
+    FULL_WIDTH_HEAD_TYPE,
+    HEAD_TYPES,
+    LEGACY_HEAD_TYPE,
     LEGACY_ASPP_DILATIONS,
     LEGACY_UNET_DEPTH,
     PREDICTION_HEAD_TYPE,
     STEDResUNet2D,
     ShallowPredictionHead2D,
 )
-from train import checkpoint_aspp_dilations, checkpoint_unet_depth, parse_aspp_dilations
+from train import (
+    checkpoint_aspp_dilations,
+    checkpoint_head_hidden_channels,
+    checkpoint_head_type,
+    checkpoint_unet_depth,
+    checkpoint_use_head_refinement,
+    parse_aspp_dilations,
+)
 
 
 def _aspp_dilated_convs(model):
@@ -55,7 +69,7 @@ class ModelArchitectureTests(unittest.TestCase):
                     pred = model(torch.zeros((1, 1, 41, 53), dtype=torch.float32))
                 self.assertEqual(tuple(pred.shape), (1, 6, 41, 53))
 
-    def test_prediction_heads_are_task_specific_shallow_heads(self):
+    def test_default_prediction_heads_are_bottleneck_spatial_heads(self):
         model = STEDResUNet2D(base_filters=8)
         head_specs = [
             ("centerline_head", 1),
@@ -65,19 +79,43 @@ class ModelArchitectureTests(unittest.TestCase):
             ("bundle_count_head", 1),
         ]
 
+        self.assertEqual(model.head_type, DEFAULT_HEAD_TYPE)
+        self.assertEqual(model.head_hidden_channels, DEFAULT_HEAD_HIDDEN_CHANNELS)
+        self.assertEqual(model.use_head_refinement, DEFAULT_USE_HEAD_REFINEMENT)
         for head_name, out_channels in head_specs:
             with self.subTest(head_name=head_name):
                 head = getattr(model, head_name)
-                self.assertIsInstance(head, ShallowPredictionHead2D)
+                self.assertIsInstance(head, BottleneckPredictionHead2D)
+                self.assertIsInstance(head.reduce, nn.Conv2d)
+                self.assertEqual(head.reduce.kernel_size, (1, 1))
+                self.assertEqual(head.reduce.out_channels, DEFAULT_HEAD_HIDDEN_CHANNELS)
                 self.assertIsInstance(head.spatial, nn.Conv2d)
                 self.assertEqual(head.spatial.kernel_size, (3, 3))
                 self.assertEqual(head.spatial.padding, (1, 1))
+                self.assertEqual(head.spatial.in_channels, DEFAULT_HEAD_HIDDEN_CHANNELS)
+                self.assertEqual(head.spatial.out_channels, DEFAULT_HEAD_HIDDEN_CHANNELS)
                 self.assertIsInstance(head.norm, nn.GroupNorm)
                 self.assertIsInstance(head.act, nn.GELU)
                 self.assertIsInstance(head.project, nn.Conv2d)
                 self.assertEqual(head.project.kernel_size, (1, 1))
                 self.assertEqual(head.project.out_channels, out_channels)
                 self.assertIs(list(head.children())[-1], head.project)
+
+    def test_full_width_and_linear_prediction_heads_are_available(self):
+        full_model = STEDResUNet2D(base_filters=8, head_type=FULL_WIDTH_HEAD_TYPE)
+        self.assertIsInstance(full_model.centerline_head, ShallowPredictionHead2D)
+        self.assertTrue(hasattr(full_model, "head_refinement"))
+
+        linear_model = STEDResUNet2D(
+            base_filters=8,
+            head_type=LEGACY_HEAD_TYPE,
+            use_head_refinement=False,
+        )
+        self.assertIsInstance(linear_model.centerline_head, nn.Conv2d)
+        self.assertIsInstance(linear_model.head_refinement, nn.Identity)
+        with torch.no_grad():
+            pred = linear_model(torch.zeros((1, 1, 41, 53), dtype=torch.float32))
+        self.assertEqual(tuple(pred.shape), (1, 6, 41, 53))
 
     def test_invalid_aspp_dilations_are_rejected(self):
         invalid_values = [
@@ -97,6 +135,14 @@ class ModelArchitectureTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     STEDResUNet2D(base_filters=8, unet_depth=value)
+
+    def test_invalid_head_options_are_rejected(self):
+        with self.assertRaises(ValueError):
+            STEDResUNet2D(base_filters=8, head_type="wide")
+        for value in [0, -1, 1.5, True, "16"]:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    STEDResUNet2D(base_filters=8, head_hidden_channels=value)
 
     def test_parse_aspp_dilations_accepts_comma_separated_values(self):
         self.assertEqual(parse_aspp_dilations("1,2,4"), (1, 2, 4))
@@ -121,11 +167,35 @@ class ModelArchitectureTests(unittest.TestCase):
         self.assertEqual(checkpoint_unet_depth({"model_state_dict": {}}), LEGACY_UNET_DEPTH)
         self.assertEqual(checkpoint_unet_depth({}, override=4), 4)
 
+    def test_checkpoint_head_settings_prefer_config_and_legacy_fallback(self):
+        checkpoint = {
+            "config": {
+                "head_type": DEFAULT_HEAD_TYPE,
+                "head_hidden_channels": 24,
+                "use_head_refinement": True,
+            }
+        }
+        self.assertEqual(checkpoint_head_type(checkpoint), DEFAULT_HEAD_TYPE)
+        self.assertEqual(checkpoint_head_hidden_channels(checkpoint), 24)
+        self.assertTrue(checkpoint_use_head_refinement(checkpoint))
+
+        previous_new_model = {"config": {"prediction_head_type": "shallow_3x3_gn_gelu"}}
+        self.assertEqual(checkpoint_head_type(previous_new_model), FULL_WIDTH_HEAD_TYPE)
+        self.assertTrue(checkpoint_use_head_refinement(previous_new_model))
+
+        self.assertEqual(checkpoint_head_type({"model_state_dict": {}}), LEGACY_HEAD_TYPE)
+        self.assertFalse(checkpoint_use_head_refinement({"model_state_dict": {}}))
+        self.assertEqual(checkpoint_head_type({}, override=FULL_WIDTH_HEAD_TYPE), FULL_WIDTH_HEAD_TYPE)
+        self.assertEqual(checkpoint_head_hidden_channels({}, override=8), 8)
+        self.assertTrue(checkpoint_use_head_refinement({}, override="true"))
+
     def test_sweep_config_includes_aspp_dilation_values(self):
         args = argparse.Namespace(
             base_filters_values=[32],
             unet_depth_values=[3, 4],
             aspp_dilation_values=["1,2,4", "1,2,3", "2,4,8"],
+            head_variant_values=["bottleneck_3x3_8", "linear_1x1"],
+            use_head_refinement_values=[True, False],
         )
 
         config = sweep._build_sweep_config(args)
@@ -135,9 +205,12 @@ class ModelArchitectureTests(unittest.TestCase):
             ["1,2,4", "1,2,3", "2,4,8"],
         )
         self.assertEqual(config["parameters"]["unet_depth"]["values"], [3, 4])
+        self.assertEqual(config["parameters"]["head_variant"]["values"], ["bottleneck_3x3_8", "linear_1x1"])
+        self.assertEqual(config["parameters"]["use_head_refinement"]["values"], [True, False])
 
     def test_sweep_static_config_records_prediction_head_type(self):
-        self.assertEqual(PREDICTION_HEAD_TYPE, "shallow_3x3_gn_gelu")
+        self.assertEqual(PREDICTION_HEAD_TYPE, "bottleneck_3x3_gn_gelu")
+        self.assertIn(DEFAULT_HEAD_TYPE, HEAD_TYPES)
 
 
 if __name__ == "__main__":

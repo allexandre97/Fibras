@@ -30,6 +30,9 @@ def run_single(args):
         device_spec=args.device,
         aspp_dilations=args.aspp_dilations,
         unet_depth=args.unet_depth,
+        head_type=args.head_type,
+        head_hidden_channels=args.head_hidden_channels,
+        use_head_refinement=args.use_head_refinement,
     )
     print(f"Executing inference on: {device}")
 

@@ -18,12 +18,20 @@ import wandb
 
 from src.model import (
     DEFAULT_ASPP_DILATIONS,
+    DEFAULT_HEAD_HIDDEN_CHANNELS,
+    DEFAULT_HEAD_TYPE,
     DEFAULT_UNET_DEPTH,
+    DEFAULT_USE_HEAD_REFINEMENT,
+    FULL_WIDTH_HEAD_TYPE,
+    HEAD_TYPES,
+    LEGACY_HEAD_TYPE,
     LEGACY_ASPP_DILATIONS,
     LEGACY_UNET_DEPTH,
     PREDICTION_HEAD_TYPE,
     STEDResUNet2D,
+    normalize_head_hidden_channels,
     normalize_aspp_dilations,
+    normalize_prediction_head_type,
     normalize_unet_depth,
 )
 from src.sted import normalize_orientation_torch
@@ -55,6 +63,19 @@ def parse_aspp_dilations(value) -> tuple[int, ...]:
     return normalize_aspp_dilations(value)
 
 
+def parse_optional_bool(value):
+    if value in (None, "", "auto"):
+        return None
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError("Boolean value must be true, false, or auto.")
+
+
 def checkpoint_aspp_dilations(checkpoint, override=None) -> tuple[int, ...]:
     if override not in (None, ""):
         return parse_aspp_dilations(override)
@@ -73,6 +94,46 @@ def checkpoint_unet_depth(checkpoint, override=None) -> int:
         if isinstance(config, dict) and "unet_depth" in config:
             return normalize_unet_depth(config["unet_depth"])
     return LEGACY_UNET_DEPTH
+
+
+def checkpoint_head_type(checkpoint, override=None) -> str:
+    if override not in (None, ""):
+        return normalize_prediction_head_type(override)
+    if isinstance(checkpoint, dict):
+        config = checkpoint.get("config")
+        if isinstance(config, dict):
+            if "head_type" in config:
+                return normalize_prediction_head_type(config["head_type"])
+            prediction_head_type = config.get("prediction_head_type")
+            if prediction_head_type == "shallow_3x3_gn_gelu":
+                return FULL_WIDTH_HEAD_TYPE
+            if prediction_head_type == PREDICTION_HEAD_TYPE:
+                return DEFAULT_HEAD_TYPE
+    return LEGACY_HEAD_TYPE
+
+
+def checkpoint_head_hidden_channels(checkpoint, override=None) -> int:
+    if override not in (None, "", 0):
+        return normalize_head_hidden_channels(override)
+    if isinstance(checkpoint, dict):
+        config = checkpoint.get("config")
+        if isinstance(config, dict) and "head_hidden_channels" in config:
+            return normalize_head_hidden_channels(config["head_hidden_channels"])
+    return DEFAULT_HEAD_HIDDEN_CHANNELS
+
+
+def checkpoint_use_head_refinement(checkpoint, override=None) -> bool:
+    override = parse_optional_bool(override)
+    if override is not None:
+        return override
+    if isinstance(checkpoint, dict):
+        config = checkpoint.get("config")
+        if isinstance(config, dict):
+            if "use_head_refinement" in config:
+                return bool(parse_optional_bool(config["use_head_refinement"]))
+            if config.get("prediction_head_type") == "shallow_3x3_gn_gelu":
+                return True
+    return False
 
 
 class PrecomputedFiberDataset(Dataset):
@@ -454,10 +515,38 @@ def _empty_metric_totals():
         "bundle_count": 0.0,
         "stability_margin": 0.0,
         "threshold_sensitivity": 0.0,
+        "pred_centerline_prob_mean": 0.0,
+        "pred_centerline_prob_max": 0.0,
+        "pred_centerline_positive_fraction": 0.0,
+        "pred_traceability_prob_mean": 0.0,
+        "pred_radius_on_target_mean": 0.0,
+        "pred_bundle_count_on_target_mean": 0.0,
     }
 
 
-def _add_metric_batch(totals, criterion, loss, components):
+def _prediction_diagnostics(outputs, targets, centerline_threshold: float = 0.5):
+    centerline_prob = torch.sigmoid(outputs[:, 0:1])
+    traceability_prob = torch.sigmoid(outputs[:, 3:4])
+    radius = torch.sigmoid(outputs[:, 4:5])
+    bundle_count = torch.sigmoid(outputs[:, 5:6])
+    target_centerline = (targets[:, 0:1] > 0.5).to(outputs.dtype)
+    target_pixels = target_centerline.sum()
+
+    return {
+        "pred_centerline_prob_mean": centerline_prob.mean(),
+        "pred_centerline_prob_max": centerline_prob.amax(),
+        "pred_centerline_positive_fraction": (centerline_prob > centerline_threshold).to(outputs.dtype).mean(),
+        "pred_traceability_prob_mean": traceability_prob.mean(),
+        "pred_radius_on_target_mean": (radius * target_centerline).sum() / (target_pixels + 1e-8),
+        "pred_bundle_count_on_target_mean": (bundle_count * target_centerline).sum() / (target_pixels + 1e-8),
+    }
+
+
+def _count_parameters(model: nn.Module) -> int:
+    return sum(parameter.numel() for parameter in model.parameters())
+
+
+def _add_metric_batch(totals, criterion, loss, components, outputs=None, targets=None):
     totals["loss"] += float(loss.detach().cpu())
     totals["score"] += float(criterion.fixed_score(components).detach().cpu())
     for key in (
@@ -473,6 +562,9 @@ def _add_metric_batch(totals, criterion, loss, components):
         "threshold_sensitivity",
     ):
         totals[key] += float(components[key].detach().cpu())
+    if outputs is not None and targets is not None:
+        for key, value in _prediction_diagnostics(outputs.detach(), targets.detach(), criterion.centerline_threshold).items():
+            totals[key] += float(value.detach().cpu())
 
 
 def _average_metrics(totals, n_batches):
@@ -726,6 +818,9 @@ def train_model(args):
     aspp_dilations = parse_aspp_dilations(args.aspp_dilations)
     aspp_dilations_config = format_aspp_dilations(aspp_dilations)
     unet_depth = normalize_unet_depth(args.unet_depth)
+    head_type = normalize_prediction_head_type(args.head_type)
+    head_hidden_channels = normalize_head_hidden_channels(args.head_hidden_channels)
+    use_head_refinement = bool(args.use_head_refinement)
     _validate_dataset(args.data_dir, args.check_samples)
 
     static_config = {
@@ -744,6 +839,9 @@ def train_model(args):
         "seed": args.seed,
         "aspp_dilations": aspp_dilations_config,
         "unet_depth": unet_depth,
+        "head_type": head_type,
+        "head_hidden_channels": head_hidden_channels,
+        "use_head_refinement": use_head_refinement,
         "prediction_head_type": PREDICTION_HEAD_TYPE,
     }
 
@@ -784,12 +882,19 @@ def train_model(args):
         base_filters=args.base_filters,
         aspp_dilations=aspp_dilations,
         unet_depth=unet_depth,
+        head_type=head_type,
+        head_hidden_channels=head_hidden_channels,
+        use_head_refinement=use_head_refinement,
     )
+    model_num_parameters = _count_parameters(model)
+    static_config["model_num_parameters"] = model_num_parameters
 
     if use_data_parallel:
         model = nn.DataParallel(model)
         
     model = model.to(device)
+    if wandb_run is not None:
+        wandb.config.update({"model_num_parameters": model_num_parameters}, allow_val_change=True)
     
     criterion = _make_criterion(args)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -809,7 +914,9 @@ def train_model(args):
         "\nStarting 2D STED ResUNet Training Loop... "
         f"device={device}, batch_size={batch_size}, train={len(train_ds)}, val={len(val_ds)}, "
         f"base_filters={int(args.base_filters)}, unet_depth={unet_depth}, "
-        f"aspp_dilations={aspp_dilations_config}"
+        f"aspp_dilations={aspp_dilations_config}, head_type={head_type}, "
+        f"head_hidden_channels={head_hidden_channels}, use_head_refinement={use_head_refinement}, "
+        f"parameters={model_num_parameters:,}"
     )
     for epoch in range(args.epochs):
         active_train_centerline_weight = criterion.set_epoch(epoch)
@@ -843,7 +950,7 @@ def train_model(args):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
                 optimizer.step()
             
-            _add_metric_batch(train_totals, criterion, loss, components)
+            _add_metric_batch(train_totals, criterion, loss, components, outputs=outputs, targets=targets)
 
         train_metrics = _average_metrics(train_totals, len(train_loader))
         
@@ -861,7 +968,7 @@ def train_model(args):
                         loss = loss.mean()
                     components = criterion.compute_components(outputs, targets)
                 
-                _add_metric_batch(val_totals, criterion, loss, components)
+                _add_metric_batch(val_totals, criterion, loss, components, outputs=outputs, targets=targets)
 
         val_metrics = _average_metrics(val_totals, len(val_loader))
         t_elapsed = time.time() - t0
@@ -887,6 +994,8 @@ def train_model(args):
         log_data = {
             "epoch": epoch + 1,
             "epoch_time_seconds": t_elapsed,
+            "epoch_images_per_second": (len(train_ds) + len(val_ds)) / max(t_elapsed, 1e-8),
+            "model_num_parameters": model_num_parameters,
             "train_loss": train_metrics["loss"],
             "train_score": train_metrics["score"],
             "train_centerline": train_metrics["centerline"],
@@ -898,6 +1007,12 @@ def train_model(args):
             "train_radius": train_metrics["radius"],
             "train_bundle_count": train_metrics["bundle_count"],
             "train_threshold_sensitivity": train_metrics["threshold_sensitivity"],
+            "train_pred_centerline_prob_mean": train_metrics["pred_centerline_prob_mean"],
+            "train_pred_centerline_prob_max": train_metrics["pred_centerline_prob_max"],
+            "train_pred_centerline_positive_fraction": train_metrics["pred_centerline_positive_fraction"],
+            "train_pred_traceability_prob_mean": train_metrics["pred_traceability_prob_mean"],
+            "train_pred_radius_on_target_mean": train_metrics["pred_radius_on_target_mean"],
+            "train_pred_bundle_count_on_target_mean": train_metrics["pred_bundle_count_on_target_mean"],
             "val_loss": val_metrics["loss"],
             "val_score": val_metrics["score"],
             "best_val_score": best_val_score,
@@ -911,6 +1026,12 @@ def train_model(args):
             "val_radius": val_metrics["radius"],
             "val_bundle_count": val_metrics["bundle_count"],
             "val_threshold_sensitivity": val_metrics["threshold_sensitivity"],
+            "val_pred_centerline_prob_mean": val_metrics["pred_centerline_prob_mean"],
+            "val_pred_centerline_prob_max": val_metrics["pred_centerline_prob_max"],
+            "val_pred_centerline_positive_fraction": val_metrics["pred_centerline_positive_fraction"],
+            "val_pred_traceability_prob_mean": val_metrics["pred_traceability_prob_mean"],
+            "val_pred_radius_on_target_mean": val_metrics["pred_radius_on_target_mean"],
+            "val_pred_bundle_count_on_target_mean": val_metrics["pred_bundle_count_on_target_mean"],
             "active_train_centerline_weight": active_train_centerline_weight,
             "train_radius_loss_weight": criterion.radius_weight,
             "train_bundle_count_loss_weight": criterion.bundle_count_weight,
@@ -950,6 +1071,11 @@ def add_train_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--base_filters', type=int, default=32)
     parser.add_argument('--unet_depth', type=int, default=DEFAULT_UNET_DEPTH)
     parser.add_argument('--aspp_dilations', type=str, default=format_aspp_dilations(DEFAULT_ASPP_DILATIONS))
+    parser.add_argument('--head_type', type=str, choices=HEAD_TYPES, default=DEFAULT_HEAD_TYPE)
+    parser.add_argument('--head_hidden_channels', type=int, default=DEFAULT_HEAD_HIDDEN_CHANNELS)
+    parser.set_defaults(use_head_refinement=DEFAULT_USE_HEAD_REFINEMENT)
+    parser.add_argument('--use_head_refinement', dest='use_head_refinement', action='store_true')
+    parser.add_argument('--no_head_refinement', dest='use_head_refinement', action='store_false')
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--amp_dtype', type=str, choices=['bf16', 'fp16', 'off'], default='bf16')

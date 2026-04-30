@@ -8,7 +8,20 @@ DEFAULT_ASPP_DILATIONS = (1, 2, 4)
 LEGACY_ASPP_DILATIONS = (2, 4, 8)
 DEFAULT_UNET_DEPTH = 3
 LEGACY_UNET_DEPTH = 4
-PREDICTION_HEAD_TYPE = "shallow_3x3_gn_gelu"
+DEFAULT_HEAD_TYPE = "bottleneck_3x3"
+LEGACY_HEAD_TYPE = "linear_1x1"
+FULL_WIDTH_HEAD_TYPE = "full_3x3"
+HEAD_TYPES = (DEFAULT_HEAD_TYPE, LEGACY_HEAD_TYPE, FULL_WIDTH_HEAD_TYPE)
+DEFAULT_HEAD_HIDDEN_CHANNELS = 16
+DEFAULT_USE_HEAD_REFINEMENT = True
+PREDICTION_HEAD_TYPE = "bottleneck_3x3_gn_gelu"
+
+
+def _group_count(groups, channels):
+    groups = min(int(groups), int(channels))
+    while groups > 1 and channels % groups != 0:
+        groups -= 1
+    return groups
 
 
 def normalize_aspp_dilations(aspp_dilations):
@@ -41,15 +54,35 @@ def normalize_unet_depth(unet_depth):
     return unet_depth
 
 
+def normalize_prediction_head_type(head_type):
+    if head_type is None:
+        return DEFAULT_HEAD_TYPE
+    if not isinstance(head_type, str):
+        raise ValueError(f"head_type must be one of {', '.join(HEAD_TYPES)}.")
+    normalized = head_type.strip()
+    if normalized not in HEAD_TYPES:
+        raise ValueError(f"head_type must be one of {', '.join(HEAD_TYPES)}.")
+    return normalized
+
+
+def normalize_head_hidden_channels(head_hidden_channels):
+    if isinstance(head_hidden_channels, bool) or not isinstance(head_hidden_channels, Integral):
+        raise ValueError("head_hidden_channels must be a positive integer.")
+    head_hidden_channels = int(head_hidden_channels)
+    if head_hidden_channels <= 0:
+        raise ValueError("head_hidden_channels must be a positive integer.")
+    return head_hidden_channels
+
+
 class ResidualBlock2D(nn.Module):
     def __init__(self, in_channels, out_channels, groups=8, dilation=1):
         super().__init__()
         padding = dilation
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=padding, dilation=dilation)
-        self.norm1 = nn.GroupNorm(min(groups, out_channels), out_channels)
+        self.norm1 = nn.GroupNorm(_group_count(groups, out_channels), out_channels)
         self.act = nn.GELU()
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=padding, dilation=dilation)
-        self.norm2 = nn.GroupNorm(min(groups, out_channels), out_channels)
+        self.norm2 = nn.GroupNorm(_group_count(groups, out_channels), out_channels)
         if in_channels == out_channels:
             self.skip = nn.Identity()
         else:
@@ -70,7 +103,7 @@ class ASPPBottleneck2D(nn.Module):
         branches = [
             nn.Sequential(
                 nn.Conv2d(channels, branch_channels, kernel_size=1),
-                nn.GroupNorm(min(groups, branch_channels), branch_channels),
+                nn.GroupNorm(_group_count(groups, branch_channels), branch_channels),
                 nn.GELU(),
             )
         ]
@@ -78,14 +111,14 @@ class ASPPBottleneck2D(nn.Module):
             branches.append(
                 nn.Sequential(
                     nn.Conv2d(channels, branch_channels, kernel_size=3, padding=dilation, dilation=dilation),
-                    nn.GroupNorm(min(groups, branch_channels), branch_channels),
+                    nn.GroupNorm(_group_count(groups, branch_channels), branch_channels),
                     nn.GELU(),
                 )
             )
         self.branches = nn.ModuleList(branches)
         self.project = nn.Sequential(
             nn.Conv2d(branch_channels * len(self.branches), channels, kernel_size=1),
-            nn.GroupNorm(min(groups, channels), channels),
+            nn.GroupNorm(_group_count(groups, channels), channels),
             nn.GELU(),
             ResidualBlock2D(channels, channels, groups=groups),
         )
@@ -95,17 +128,46 @@ class ASPPBottleneck2D(nn.Module):
 
 
 class ShallowPredictionHead2D(nn.Module):
-    def __init__(self, in_channels, out_channels, groups=8, hidden_channels=None):
+    def __init__(self, in_channels, out_channels, groups=8):
         super().__init__()
-        hidden_channels = in_channels if hidden_channels is None else hidden_channels
-        self.spatial = nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1)
-        self.norm = nn.GroupNorm(min(groups, hidden_channels), hidden_channels)
+        self.spatial = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.norm = nn.GroupNorm(_group_count(groups, in_channels), in_channels)
         self.act = nn.GELU()
-        self.project = nn.Conv2d(hidden_channels, out_channels, kernel_size=1)
+        self.project = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
     def forward(self, x):
         x = self.act(self.norm(self.spatial(x)))
         return self.project(x)
+
+
+class BottleneckPredictionHead2D(nn.Module):
+    def __init__(self, in_channels, out_channels, groups=8, hidden_channels=DEFAULT_HEAD_HIDDEN_CHANNELS):
+        super().__init__()
+        hidden_channels = normalize_head_hidden_channels(hidden_channels)
+        self.reduce = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
+        self.spatial = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1)
+        self.norm = nn.GroupNorm(_group_count(groups, hidden_channels), hidden_channels)
+        self.act = nn.GELU()
+        self.project = nn.Conv2d(hidden_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        x = self.reduce(x)
+        x = self.act(self.norm(self.spatial(x)))
+        return self.project(x)
+
+
+def build_prediction_head(in_channels, out_channels, groups=8, head_type=DEFAULT_HEAD_TYPE, head_hidden_channels=DEFAULT_HEAD_HIDDEN_CHANNELS):
+    head_type = normalize_prediction_head_type(head_type)
+    if head_type == LEGACY_HEAD_TYPE:
+        return nn.Conv2d(in_channels, out_channels, kernel_size=1)
+    if head_type == FULL_WIDTH_HEAD_TYPE:
+        return ShallowPredictionHead2D(in_channels, out_channels, groups=groups)
+    return BottleneckPredictionHead2D(
+        in_channels,
+        out_channels,
+        groups=groups,
+        hidden_channels=normalize_head_hidden_channels(head_hidden_channels),
+    )
 
 
 class STEDResUNet2D(nn.Module):
@@ -123,9 +185,15 @@ class STEDResUNet2D(nn.Module):
         groups=8,
         aspp_dilations=DEFAULT_ASPP_DILATIONS,
         unet_depth=DEFAULT_UNET_DEPTH,
+        head_type=DEFAULT_HEAD_TYPE,
+        head_hidden_channels=DEFAULT_HEAD_HIDDEN_CHANNELS,
+        use_head_refinement=DEFAULT_USE_HEAD_REFINEMENT,
     ):
         super().__init__()
         self.unet_depth = normalize_unet_depth(unet_depth)
+        self.head_type = normalize_prediction_head_type(head_type)
+        self.head_hidden_channels = normalize_head_hidden_channels(head_hidden_channels)
+        self.use_head_refinement = bool(use_head_refinement)
         width_multipliers = [1, 2, 4, 8] if self.unet_depth == 3 else [1, 2, 4, 8, 12]
         widths = [base_filters * multiplier for multiplier in width_multipliers]
 
@@ -151,13 +219,27 @@ class STEDResUNet2D(nn.Module):
             current_width = skip_width
         self.upsamplers = nn.ModuleList(upsamplers)
         self.decoder_blocks = nn.ModuleList(decoder_blocks)
-        self.head_refinement = ResidualBlock2D(widths[0], widths[0], groups=groups)
+        self.head_refinement = (
+            ResidualBlock2D(widths[0], widths[0], groups=groups)
+            if self.use_head_refinement
+            else nn.Identity()
+        )
 
-        self.centerline_head = ShallowPredictionHead2D(widths[0], 1, groups=groups)
-        self.orientation_head = ShallowPredictionHead2D(widths[0], 2, groups=groups)
-        self.traceability_head = ShallowPredictionHead2D(widths[0], 1, groups=groups)
-        self.radius_head = ShallowPredictionHead2D(widths[0], 1, groups=groups)
-        self.bundle_count_head = ShallowPredictionHead2D(widths[0], 1, groups=groups)
+        self.centerline_head = build_prediction_head(
+            widths[0], 1, groups=groups, head_type=self.head_type, head_hidden_channels=self.head_hidden_channels
+        )
+        self.orientation_head = build_prediction_head(
+            widths[0], 2, groups=groups, head_type=self.head_type, head_hidden_channels=self.head_hidden_channels
+        )
+        self.traceability_head = build_prediction_head(
+            widths[0], 1, groups=groups, head_type=self.head_type, head_hidden_channels=self.head_hidden_channels
+        )
+        self.radius_head = build_prediction_head(
+            widths[0], 1, groups=groups, head_type=self.head_type, head_hidden_channels=self.head_hidden_channels
+        )
+        self.bundle_count_head = build_prediction_head(
+            widths[0], 1, groups=groups, head_type=self.head_type, head_hidden_channels=self.head_hidden_channels
+        )
         self.out_channels = out_channels
 
     @staticmethod

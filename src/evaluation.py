@@ -8,7 +8,10 @@ from train import (
     PrecomputedFiberDataset,
     StedFieldLoss2D,
     checkpoint_aspp_dilations,
+    checkpoint_head_hidden_channels,
+    checkpoint_head_type,
     checkpoint_unet_depth,
+    checkpoint_use_head_refinement,
     extract_model_state_dict,
     format_aspp_dilations,
 )
@@ -26,11 +29,17 @@ def evaluate_model(args):
     checkpoint = torch.load(args.model_path, map_location=device, weights_only=True)
     aspp_dilations = checkpoint_aspp_dilations(checkpoint, override=args.aspp_dilations)
     unet_depth = checkpoint_unet_depth(checkpoint, override=args.unet_depth)
+    head_type = checkpoint_head_type(checkpoint, override=args.head_type)
+    head_hidden_channels = checkpoint_head_hidden_channels(checkpoint, override=args.head_hidden_channels)
+    use_head_refinement = checkpoint_use_head_refinement(checkpoint, override=args.use_head_refinement)
     model = STEDResUNet2D(
         in_channels=1,
         base_filters=args.base_filters,
         aspp_dilations=aspp_dilations,
         unet_depth=unet_depth,
+        head_type=head_type,
+        head_hidden_channels=head_hidden_channels,
+        use_head_refinement=use_head_refinement,
     )
     model.load_state_dict(extract_model_state_dict(checkpoint))
     model.to(device)
@@ -99,6 +108,9 @@ def evaluate_model(args):
     print(f"Target Checkpoint: {args.model_path}")
     print(f"U-Net Depth: {unet_depth}")
     print(f"ASPP Dilations: {format_aspp_dilations(aspp_dilations)}")
+    print(f"Head Type: {head_type}")
+    print(f"Head Hidden Channels: {head_hidden_channels}")
+    print(f"Use Head Refinement: {use_head_refinement}")
     print(f"Average Total Loss: {total_metrics['loss'] / n_batches:.4f}")
     print(f"Average Fixed Score: {total_metrics['score'] / n_batches:.4f}")
     print(f"Average Centerline Loss: {total_metrics['centerline'] / n_batches:.4f}")
@@ -119,6 +131,9 @@ def add_evaluate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--base_filters', type=int, default=32)
     parser.add_argument('--unet_depth', type=int, default=0)
     parser.add_argument('--aspp_dilations', type=str, default="")
+    parser.add_argument('--head_type', type=str, default="")
+    parser.add_argument('--head_hidden_channels', type=int, default=0)
+    parser.add_argument('--use_head_refinement', type=str, default="auto")
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--crop_size', type=int, default=0)
     parser.add_argument('--num_workers', type=int, default=4)

@@ -21,17 +21,30 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import wandb
 
-from src.model import PREDICTION_HEAD_TYPE, STEDResUNet2D
+from src.model import (
+    DEFAULT_HEAD_HIDDEN_CHANNELS,
+    DEFAULT_HEAD_TYPE,
+    DEFAULT_USE_HEAD_REFINEMENT,
+    FULL_WIDTH_HEAD_TYPE,
+    HEAD_TYPES,
+    LEGACY_HEAD_TYPE,
+    PREDICTION_HEAD_TYPE,
+    STEDResUNet2D,
+    normalize_head_hidden_channels,
+    normalize_prediction_head_type,
+)
 from train import (
     PrecomputedFiberDataset,
     _add_metric_batch,
     _amp_settings,
     _autocast_context,
     _average_metrics,
+    _count_parameters,
     _checkpoint_payload,
     _empty_metric_totals,
     _loader_kwargs,
     _make_criterion,
+    parse_optional_bool,
     _set_seed,
     _validate_dataset,
     format_aspp_dilations,
@@ -59,6 +72,31 @@ class StaticSweepArgs:
 
 
 GLOBAL_ARGS: StaticSweepArgs | None = None
+
+
+def _parse_bool_value(value: str) -> bool:
+    parsed = parse_optional_bool(value)
+    if parsed is None:
+        raise argparse.ArgumentTypeError("Expected true or false.")
+    return parsed
+
+
+def _parse_head_variant(value: str) -> tuple[str, int]:
+    normalized = value.strip()
+    if normalized in HEAD_TYPES:
+        return normalized, DEFAULT_HEAD_HIDDEN_CHANNELS
+    prefix = f"{DEFAULT_HEAD_TYPE}_"
+    if normalized.startswith(prefix):
+        hidden_channels = normalized[len(prefix):]
+        try:
+            return DEFAULT_HEAD_TYPE, normalize_head_hidden_channels(int(hidden_channels))
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(
+                f"Invalid head variant '{value}'. Expected values like {DEFAULT_HEAD_TYPE}_16."
+            ) from error
+    raise argparse.ArgumentTypeError(
+        f"Invalid head variant '{value}'. Use one of {', '.join(HEAD_TYPES)} or {DEFAULT_HEAD_TYPE}_<channels>."
+    )
 
 
 def _save_checkpoint(
@@ -112,8 +150,20 @@ def train_sweep() -> None:
     aspp_dilations = parse_aspp_dilations(config.aspp_dilations)
     aspp_dilations_config = format_aspp_dilations(aspp_dilations)
     unet_depth = int(config.unet_depth)
+    if "head_variant" in config:
+        head_type, head_hidden_channels = _parse_head_variant(str(config.head_variant))
+    else:
+        head_type = normalize_prediction_head_type(config.head_type)
+        head_hidden_channels = normalize_head_hidden_channels(config.head_hidden_channels)
+    use_head_refinement = bool(config.use_head_refinement)
     wandb.config.update(
-        {"aspp_dilations": aspp_dilations_config, "unet_depth": unet_depth},
+        {
+            "aspp_dilations": aspp_dilations_config,
+            "unet_depth": unet_depth,
+            "head_type": head_type,
+            "head_hidden_channels": head_hidden_channels,
+            "use_head_refinement": use_head_refinement,
+        },
         allow_val_change=True,
     )
 
@@ -145,10 +195,15 @@ def train_sweep() -> None:
         base_filters=int(config.base_filters),
         aspp_dilations=aspp_dilations,
         unet_depth=unet_depth,
+        head_type=head_type,
+        head_hidden_channels=head_hidden_channels,
+        use_head_refinement=use_head_refinement,
     )
+    model_num_parameters = _count_parameters(model)
     if use_data_parallel:
         model = nn.DataParallel(model)
     model = model.to(device)
+    wandb.config.update({"model_num_parameters": model_num_parameters}, allow_val_change=True)
 
     criterion = _make_criterion(config)
     optimizer = optim.AdamW(model.parameters(), lr=float(config.learning_rate), weight_decay=float(config.weight_decay))
@@ -164,7 +219,9 @@ def train_sweep() -> None:
         f"Run {run.id if run is not None else '<no-run>'}: "
         f"device={device}, batch_size={batch_size}, train={len(train_ds)}, val={len(val_ds)}, "
         f"base_filters={int(config.base_filters)}, unet_depth={unet_depth}, "
-        f"aspp_dilations={aspp_dilations_config}"
+        f"aspp_dilations={aspp_dilations_config}, head_type={head_type}, "
+        f"head_hidden_channels={head_hidden_channels}, use_head_refinement={use_head_refinement}, "
+        f"parameters={model_num_parameters:,}"
     )
 
     for epoch in range(args.epochs):
@@ -198,7 +255,7 @@ def train_sweep() -> None:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
                 optimizer.step()
 
-            _add_metric_batch(train_totals, criterion, loss, components)
+            _add_metric_batch(train_totals, criterion, loss, components, outputs=outputs, targets=targets)
 
         train_metrics = _average_metrics(train_totals, len(train_loader))
 
@@ -214,7 +271,7 @@ def train_sweep() -> None:
                     if use_data_parallel:
                         loss = loss.mean()
                     components = criterion.compute_components(outputs, targets)
-                _add_metric_batch(val_totals, criterion, loss, components)
+                _add_metric_batch(val_totals, criterion, loss, components, outputs=outputs, targets=targets)
 
         val_metrics = _average_metrics(val_totals, len(val_loader))
         epoch_time = time.time() - t0
@@ -240,6 +297,8 @@ def train_sweep() -> None:
         log_data = {
             "epoch": epoch + 1,
             "epoch_time_seconds": epoch_time,
+            "epoch_images_per_second": (len(train_ds) + len(val_ds)) / max(epoch_time, 1e-8),
+            "model_num_parameters": model_num_parameters,
             "train_loss": train_metrics["loss"],
             "train_score": train_metrics["score"],
             "train_centerline": train_metrics["centerline"],
@@ -251,6 +310,12 @@ def train_sweep() -> None:
             "train_radius": train_metrics["radius"],
             "train_bundle_count": train_metrics["bundle_count"],
             "train_threshold_sensitivity": train_metrics["threshold_sensitivity"],
+            "train_pred_centerline_prob_mean": train_metrics["pred_centerline_prob_mean"],
+            "train_pred_centerline_prob_max": train_metrics["pred_centerline_prob_max"],
+            "train_pred_centerline_positive_fraction": train_metrics["pred_centerline_positive_fraction"],
+            "train_pred_traceability_prob_mean": train_metrics["pred_traceability_prob_mean"],
+            "train_pred_radius_on_target_mean": train_metrics["pred_radius_on_target_mean"],
+            "train_pred_bundle_count_on_target_mean": train_metrics["pred_bundle_count_on_target_mean"],
             "val_loss": val_metrics["loss"],
             "val_score": val_metrics["score"],
             "best_val_score": best_val_score,
@@ -264,6 +329,12 @@ def train_sweep() -> None:
             "val_radius": val_metrics["radius"],
             "val_bundle_count": val_metrics["bundle_count"],
             "val_threshold_sensitivity": val_metrics["threshold_sensitivity"],
+            "val_pred_centerline_prob_mean": val_metrics["pred_centerline_prob_mean"],
+            "val_pred_centerline_prob_max": val_metrics["pred_centerline_prob_max"],
+            "val_pred_centerline_positive_fraction": val_metrics["pred_centerline_positive_fraction"],
+            "val_pred_traceability_prob_mean": val_metrics["pred_traceability_prob_mean"],
+            "val_pred_radius_on_target_mean": val_metrics["pred_radius_on_target_mean"],
+            "val_pred_bundle_count_on_target_mean": val_metrics["pred_bundle_count_on_target_mean"],
             "active_train_centerline_weight": active_train_centerline_weight,
             "train_radius_loss_weight": criterion.radius_weight,
             "train_bundle_count_loss_weight": criterion.bundle_count_weight,
@@ -304,86 +375,29 @@ def _build_sweep_config(args: argparse.Namespace) -> dict[str, Any]:
             "eta": 2,
         },
         "parameters": {
-            # The current model is no longer the fixed 4-level U-Net from the
-            # earlier sweep results.  Use an exploratory range that covers the
-            # old useful band but also allows the shallower/head-refined model
-            # to settle at a lower or higher AdamW step size.
+            # Keep the next sweep focused on the architecture/runtime question.
+            # The first new sweep showed that broad loss-weight sampling mostly
+            # collapsed to the same centerline-dominated validation score.
             "learning_rate": {
                 "distribution": "log_uniform_values",
-                "min": 7.5e-5,
-                "max": 4.0e-4,
+                "min": 1.0e-4,
+                "max": 3.0e-4,
             },
 
-            # Re-open the low-decay region because the default model is much
-            # smaller than the old 48/56-filter depth-4 model, while keeping
-            # enough upper range for the extra prediction-head parameters.
             "weight_decay": {
                 "distribution": "log_uniform_values",
                 "min": 3e-6,
-                "max": 3e-4,
+                "max": 5e-5,
             },
 
-            # Old sweep optima are no longer architecture-invariant.  Keep the
-            # training defaults inside the search instead of only exploiting the
-            # previous top band.
-            "orientation_loss_weight": {
-                "distribution": "uniform",
-                "min": 0.50,
-                "max": 1.40,
-            },
-
-            # Include the standalone-training default again; the task-specific
-            # traceability head may not need the old high weighting.
-            "visibility_loss_weight": {
-                "distribution": "uniform",
-                "min": 0.25,
-                "max": 0.75,
-            },
-
-            # The support threshold controls which centerline pixels supervise
-            # orientation/radius/bundle count.  Cover the old low band and the
-            # train.py default so the new heads can choose their masking regime.
-            "orientation_mask_floor": {
-                "distribution": "uniform",
-                "min": 0.04,
-                "max": 0.18,
-            },
-
-            # This is a lower clamp on target traceability during orientation
-            # loss, not a prediction threshold.  Re-open the range after the
-            # architecture change instead of assuming the old low clamp is best.
-            "loss_visibility_floor": {
-                "distribution": "uniform",
-                "min": 0.04,
-                "max": 0.25,
-            },
-
-            # Radius supervision moved from a 1x1 projection to a shallow
-            # task-specific head.  Keep both the train.py default and the old
-            # stronger-radius region in play.
-            "radius_loss_weight": {
-                "distribution": "uniform",
-                "min": 0.10,
-                "max": 0.70,
-            },
-
-            # Bundle-count behavior is one of the outputs most likely to move
-            # after the head change, so do not keep this narrowly centered on
-            # the previous architecture.
-            "bundle_count_loss_weight": {
-                "distribution": "uniform",
-                "min": 0.05,
-                "max": 0.50,
-            },
-
-            # Centerline loss already combines focal, Dice, and clDice terms.
-            # Include neutral weighting again before pushing the new model into
-            # the old centerline-heavy region.
-            "train_centerline_weight": {
-                "distribution": "uniform",
-                "min": 0.80,
-                "max": 1.70,
-            },
+            # Fixed loss weights reduce confounding while comparing head cost.
+            "orientation_loss_weight": {"value": 1.00},
+            "visibility_loss_weight": {"value": 0.35},
+            "orientation_mask_floor": {"value": 0.15},
+            "loss_visibility_floor": {"value": 0.25},
+            "radius_loss_weight": {"value": 0.15},
+            "bundle_count_loss_weight": {"value": 0.15},
+            "train_centerline_weight": {"value": 1.00},
 
             # Keep these fixed for this sweep.
             # Do not add extra degrees of freedom until the main loss-weight region is stable.
@@ -407,9 +421,6 @@ def _build_sweep_config(args: argparse.Namespace) -> dict[str, Any]:
             "early_stop_patience": {"value": 10},
             "min_epochs_before_stop": {"value": 25},
 
-            # Default architecture search is centered on the new shallow model.
-            # Pass --unet_depth_values 3 4 or --aspp_dilation_values 2,4,8 at
-            # launch time for a deliberate legacy-depth comparison.
             "base_filters": {
                 "values": args.base_filters_values,
             },
@@ -418,6 +429,12 @@ def _build_sweep_config(args: argparse.Namespace) -> dict[str, Any]:
             },
             "unet_depth": {
                 "values": args.unet_depth_values,
+            },
+            "head_variant": {
+                "values": args.head_variant_values,
+            },
+            "use_head_refinement": {
+                "values": args.use_head_refinement_values,
             },
         },
     }
@@ -433,10 +450,28 @@ def add_train_sweep_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--base_batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--project", type=str, default="fibras-sted-resunet2d-newmodel-sweep-v1")
-    parser.add_argument("--base_filters_values", type=int, nargs="+", default=[32, 40, 48])
+    parser.add_argument("--project", type=str, default="fibras-sted-resunet2d-newmodel-sweep-v2")
+    parser.add_argument("--base_filters_values", type=int, nargs="+", default=[32, 40])
     parser.add_argument("--unet_depth_values", type=int, nargs="+", default=[3])
-    parser.add_argument("--aspp_dilation_values", type=str, nargs="+", default=["1,2,4", "1,2,3"])
+    parser.add_argument("--aspp_dilation_values", type=str, nargs="+", default=["1,2,4"])
+    parser.add_argument(
+        "--head_variant_values",
+        type=str,
+        nargs="+",
+        default=[
+            f"{DEFAULT_HEAD_TYPE}_8",
+            f"{DEFAULT_HEAD_TYPE}_16",
+            f"{DEFAULT_HEAD_TYPE}_24",
+            LEGACY_HEAD_TYPE,
+            FULL_WIDTH_HEAD_TYPE,
+        ],
+    )
+    parser.add_argument(
+        "--use_head_refinement_values",
+        type=_parse_bool_value,
+        nargs="+",
+        default=[DEFAULT_USE_HEAD_REFINEMENT, False],
+    )
     parser.add_argument("--amp_dtype", type=str, choices=["bf16", "fp16", "off"], default="bf16")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0)
     parser.add_argument("--check_samples", type=int, default=16)

@@ -21,7 +21,15 @@ from src.sted_calibration import (
     parse_sted_filename,
 )
 from src.visualization import AdvancedVisualizer
-from train import checkpoint_aspp_dilations, checkpoint_unet_depth, extract_model_state_dict, format_aspp_dilations
+from train import (
+    checkpoint_aspp_dilations,
+    checkpoint_head_hidden_channels,
+    checkpoint_head_type,
+    checkpoint_unet_depth,
+    checkpoint_use_head_refinement,
+    extract_model_state_dict,
+    format_aspp_dilations,
+)
 
 
 OUTPUT_SUFFIXES = {
@@ -90,6 +98,24 @@ def add_inference_arguments(
         default="",
         help="Optional comma-separated ASPP dilation override. Defaults to checkpoint config, or legacy 2,4,8 for old checkpoints.",
     )
+    parser.add_argument(
+        "--head_type",
+        type=str,
+        default="",
+        help="Optional prediction-head type override. Defaults to checkpoint config.",
+    )
+    parser.add_argument(
+        "--head_hidden_channels",
+        type=int,
+        default=0,
+        help="Optional bottleneck head width override. Defaults to checkpoint config.",
+    )
+    parser.add_argument(
+        "--use_head_refinement",
+        type=str,
+        default="auto",
+        help="Optional head-refinement override: auto, true, or false.",
+    )
     parser.add_argument("--centerline_threshold", type=float, default=0.5)
     parser.add_argument("--tile_size", type=int, default=512)
     parser.add_argument("--tile_overlap", type=int, default=128)
@@ -135,16 +161,25 @@ def load_sted_model(
     device_spec: str = "auto",
     aspp_dilations=None,
     unet_depth=None,
+    head_type=None,
+    head_hidden_channels=None,
+    use_head_refinement=None,
 ):
     device = resolve_device(device_spec)
     checkpoint = torch.load(model_path, map_location=device, weights_only=True)
     resolved_aspp_dilations = checkpoint_aspp_dilations(checkpoint, override=aspp_dilations)
     resolved_unet_depth = checkpoint_unet_depth(checkpoint, override=unet_depth)
+    resolved_head_type = checkpoint_head_type(checkpoint, override=head_type)
+    resolved_head_hidden_channels = checkpoint_head_hidden_channels(checkpoint, override=head_hidden_channels)
+    resolved_use_head_refinement = checkpoint_use_head_refinement(checkpoint, override=use_head_refinement)
     model = STEDResUNet2D(
         in_channels=1,
         base_filters=base_filters,
         aspp_dilations=resolved_aspp_dilations,
         unet_depth=resolved_unet_depth,
+        head_type=resolved_head_type,
+        head_hidden_channels=resolved_head_hidden_channels,
+        use_head_refinement=resolved_use_head_refinement,
     )
     state_dict = extract_model_state_dict(checkpoint)
     try:
@@ -181,6 +216,9 @@ def load_sted_model(
     model.eval()
     print(f"Loaded model ASPP dilations: {format_aspp_dilations(resolved_aspp_dilations)}")
     print(f"Loaded model U-Net depth: {resolved_unet_depth}")
+    print(f"Loaded model head type: {resolved_head_type}")
+    print(f"Loaded model head hidden channels: {resolved_head_hidden_channels}")
+    print(f"Loaded model head refinement: {resolved_use_head_refinement}")
     return model, device
 
 
